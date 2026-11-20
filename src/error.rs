@@ -24,6 +24,7 @@ pub enum CorruptionReason {
     SetWithoutValue,
     DeleteWithValue,
     KeyMismatch,
+    NotASet,
 }
 
 impl Display for CorruptionReason {
@@ -36,6 +37,7 @@ impl Display for CorruptionReason {
             CorruptionReason::SetWithoutValue => write!(f, "set record has an empty value"),
             CorruptionReason::DeleteWithValue => write!(f, "delete record has a value"),
             CorruptionReason::KeyMismatch => write!(f, "stored key does not match index"),
+            CorruptionReason::NotASet => write!(f, "indexed record is not a set"),
         }
     }
 }
@@ -83,6 +85,8 @@ pub enum Error {
         offset: u64,
         reason: UnsupportedReason,
     },
+    /// Another `Store` holds the lock on this directory's log.
+    Locked,
 }
 
 impl Display for Error {
@@ -101,6 +105,7 @@ impl Display for Error {
                 "unsupported record at offset {}: {} (written by a newer version of tally?)",
                 offset, reason
             ),
+            Error::Locked => write!(f, "store is already open elsewhere"),
         }
     }
 }
@@ -196,6 +201,10 @@ mod tests {
                 CorruptionReason::KeyMismatch,
                 "corrupt record at offset 4096: stored key does not match index",
             ),
+            (
+                CorruptionReason::NotASet,
+                "corrupt record at offset 4096: indexed record is not a set",
+            ),
         ];
         for (reason, expected) in cases {
             assert_eq!(
@@ -241,6 +250,11 @@ mod tests {
         assert!(matches!(err, Error::Io(_)));
         assert_eq!(err.to_string(), "I/O error");
         assert_eq!(err.source().unwrap().to_string(), "No space left on device");
+    }
+
+    #[test]
+    fn locked_message() {
+        assert_eq!(Error::Locked.to_string(), "store is already open elsewhere");
     }
 
     #[test]

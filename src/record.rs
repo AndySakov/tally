@@ -167,13 +167,13 @@ pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeEr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::Error;
 
     // Expected bytes computed independently of this crate (Python CRC32C,
     // checked against the standard test vector).
-    const SET_A_HI: [u8; 18] = [
+    pub(crate) const SET_A_HI: [u8; 18] = [
         0xca, 0xa7, 0x41, 0x82, // header_checksum
         0x01, // kind: Set
         0x01, 0x00, // key_len: 1
@@ -183,7 +183,7 @@ mod tests {
         0x68, 0x69, // value: "hi"
     ];
 
-    const DELETE_A: [u8; 16] = [
+    pub(crate) const DELETE_A: [u8; 16] = [
         0x89, 0xd9, 0x75, 0x53, // header_checksum
         0x02, // kind: Delete
         0x01, 0x00, // key_len: 1

@@ -8,7 +8,7 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 - `open` takes a directory. The data file is `tally.log` inside it. A directory leaves room for compaction's second file and a lock file later.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
-- One process, one thread.
+- One process, one thread. `open` takes an exclusive lock (`flock`) on `tally.log`. A second `open` fails with `Locked` until the first `Store` is dropped or its process exits.
 
 ## On-disk format
 
@@ -68,9 +68,13 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 
 A failed `fsync` panics. On Linux, a failed `fsync` can drop the dirty pages, so a retry may report success for data that never reached disk. The only safe state after a failure is the one recovery rebuilds from the file, so tally stops instead of retrying. Postgres makes the same choice.
 
+### Failed write
+
+If the append fails partway (disk full, I/O error), `set` or `delete` truncates the file back to where the record started and returns the I/O error. A partial record left at the tail would put the next append after torn bytes, and the following startup would see mid-file corruption. If the truncate itself fails, tally panics.
+
 ### New files
 
-Creating the data file requires `fsync` on the file and on its parent directory. A newly created store directory likewise requires `fsync` on its own parent. The file name lives in the directory, and without the directory sync the file itself may not survive power loss. Directory sync behaviour differs between Linux and macOS and must be tested on both.
+`open` syncs the data file, the store directory, and the directory's parent on every start, in that order, whether or not it created them. The file name lives in the directory, and without the directory sync the file itself may not survive power loss. Syncing unconditionally makes `open` idempotent: if a previous `open` failed between creating and syncing, the next one completes it. Directory sync behaviour differs between Linux and macOS and must be tested on both.
 
 ## Recovery (startup)
 
@@ -126,8 +130,9 @@ One error enum, marked `#[non_exhaustive]` so variants can be added without brea
 | Corruption    | bad checksum, invalid record, with the file offset | run `repair`                              |
 | Unsupported   | unknown record type, lengths over current limits   | upgrade tally                             |
 | Invalid input | empty key or value, over the limit                 | fix the input                             |
+| Locked        | store already open in another `Store` or process   | close the other one, or wait              |
 
-Bugs (broken internal invariants) panic. Errors are for failures that can happen when the code is correct. The one deliberate exception is a failed `fsync`, which panics (see Durability contract).
+Bugs (broken internal invariants) panic. Errors are for failures that can happen when the code is correct. The deliberate exceptions are a failed `fsync` and a failed truncate after a failed write, which panic (see Durability contract).
 
 ## Testing
 
@@ -156,7 +161,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 
 1. Append-only log and in-memory index. Reopen rebuilds the index.
 2. Crash safety: checksums, recovery rules, kill test, power-cut simulation.
-3. Compaction: rewrite live keys to a new file, atomic swap via rename, `fsync` the directory.
+3. Compaction: rewrite live keys to a new file, atomic swap via rename, `fsync` the directory. Move the lock to a separate lock file first: the swap replaces `tally.log`, and a lock held on the old file does not cover the new one.
 4. Benchmark and README.
 
 ## Deferred ideas

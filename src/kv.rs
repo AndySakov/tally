@@ -32,6 +32,10 @@ impl Key {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub(crate) fn into_bytes(self) -> Box<[u8]> {
+        self.0
+    }
 }
 
 /// A validated value: non-empty and at most `MAX_VALUE_LEN` bytes.
