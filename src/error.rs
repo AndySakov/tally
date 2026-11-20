@@ -19,6 +19,7 @@ impl Display for Field {
 pub enum CorruptionReason {
     HeaderChecksum,
     PayloadChecksum,
+    ZeroType,
     EmptyKey,
     SetWithoutValue,
     DeleteWithValue,
@@ -30,6 +31,7 @@ impl Display for CorruptionReason {
         match self {
             CorruptionReason::HeaderChecksum => write!(f, "header checksum mismatch"),
             CorruptionReason::PayloadChecksum => write!(f, "payload checksum mismatch"),
+            CorruptionReason::ZeroType => write!(f, "record type is zero"),
             CorruptionReason::EmptyKey => write!(f, "key length is zero"),
             CorruptionReason::SetWithoutValue => write!(f, "set record has an empty value"),
             CorruptionReason::DeleteWithValue => write!(f, "delete record has a value"),
@@ -41,7 +43,11 @@ impl Display for CorruptionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedReason {
     UnknownType(u8),
-    OverLimit { field: Field, len: usize, max: usize },
+    OverLimit {
+        field: Field,
+        len: usize,
+        max: usize,
+    },
 }
 
 impl Display for UnsupportedReason {
@@ -49,7 +55,11 @@ impl Display for UnsupportedReason {
         match self {
             UnsupportedReason::UnknownType(byte) => write!(f, "unknown record type {:#04x}", byte),
             UnsupportedReason::OverLimit { field, len, max } => {
-                write!(f, "{} length {} exceeds this version's limit of {}", field, len, max)
+                write!(
+                    f,
+                    "{} length {} exceeds this version's limit of {}",
+                    field, len, max
+                )
             }
         }
     }
@@ -110,6 +120,21 @@ impl From<std::io::Error> for Error {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    Corrupt(CorruptionReason),
+    Unsupported(UnsupportedReason),
+}
+
+impl DecodeError {
+    pub fn at(self, offset: u64) -> Error {
+        match self {
+            DecodeError::Corrupt(reason) => Error::Corruption { offset, reason },
+            DecodeError::Unsupported(reason) => Error::Unsupported { offset, reason },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,34 +142,79 @@ mod tests {
 
     #[test]
     fn empty_message() {
-        assert_eq!(Error::Empty(Field::Key).to_string(), "key must not be empty");
-        assert_eq!(Error::Empty(Field::Value).to_string(), "value must not be empty");
+        assert_eq!(
+            Error::Empty(Field::Key).to_string(),
+            "key must not be empty"
+        );
+        assert_eq!(
+            Error::Empty(Field::Value).to_string(),
+            "value must not be empty"
+        );
     }
 
     #[test]
     fn too_large_message() {
-        let err = Error::TooLarge { field: Field::Value, len: 20_971_520, max: 16_777_216 };
-        assert_eq!(err.to_string(), "value is 20971520 bytes, over the 16777216-byte limit");
+        let err = Error::TooLarge {
+            field: Field::Value,
+            len: 20_971_520,
+            max: 16_777_216,
+        };
+        assert_eq!(
+            err.to_string(),
+            "value is 20971520 bytes, over the 16777216-byte limit"
+        );
     }
 
     #[test]
     fn corruption_messages() {
         let cases = [
-            (CorruptionReason::HeaderChecksum, "corrupt record at offset 4096: header checksum mismatch"),
-            (CorruptionReason::PayloadChecksum, "corrupt record at offset 4096: payload checksum mismatch"),
-            (CorruptionReason::EmptyKey, "corrupt record at offset 4096: key length is zero"),
-            (CorruptionReason::SetWithoutValue, "corrupt record at offset 4096: set record has an empty value"),
-            (CorruptionReason::DeleteWithValue, "corrupt record at offset 4096: delete record has a value"),
-            (CorruptionReason::KeyMismatch, "corrupt record at offset 4096: stored key does not match index"),
+            (
+                CorruptionReason::HeaderChecksum,
+                "corrupt record at offset 4096: header checksum mismatch",
+            ),
+            (
+                CorruptionReason::PayloadChecksum,
+                "corrupt record at offset 4096: payload checksum mismatch",
+            ),
+            (
+                CorruptionReason::ZeroType,
+                "corrupt record at offset 4096: record type is zero",
+            ),
+            (
+                CorruptionReason::EmptyKey,
+                "corrupt record at offset 4096: key length is zero",
+            ),
+            (
+                CorruptionReason::SetWithoutValue,
+                "corrupt record at offset 4096: set record has an empty value",
+            ),
+            (
+                CorruptionReason::DeleteWithValue,
+                "corrupt record at offset 4096: delete record has a value",
+            ),
+            (
+                CorruptionReason::KeyMismatch,
+                "corrupt record at offset 4096: stored key does not match index",
+            ),
         ];
         for (reason, expected) in cases {
-            assert_eq!(Error::Corruption { offset: 4096, reason }.to_string(), expected);
+            assert_eq!(
+                Error::Corruption {
+                    offset: 4096,
+                    reason
+                }
+                .to_string(),
+                expected
+            );
         }
     }
 
     #[test]
     fn unsupported_messages() {
-        let unknown = Error::Unsupported { offset: 4096, reason: UnsupportedReason::UnknownType(7) };
+        let unknown = Error::Unsupported {
+            offset: 4096,
+            reason: UnsupportedReason::UnknownType(7),
+        };
         assert_eq!(
             unknown.to_string(),
             "unsupported record at offset 4096: unknown record type 0x07 (written by a newer version of tally?)"
@@ -152,7 +222,11 @@ mod tests {
 
         let over = Error::Unsupported {
             offset: 0,
-            reason: UnsupportedReason::OverLimit { field: Field::Key, len: 2048, max: 1024 },
+            reason: UnsupportedReason::OverLimit {
+                field: Field::Key,
+                len: 2048,
+                max: 1024,
+            },
         };
         assert_eq!(
             over.to_string(),
@@ -162,7 +236,8 @@ mod tests {
 
     #[test]
     fn io_converts_and_exposes_source() {
-        let err: Error = std::io::Error::new(std::io::ErrorKind::StorageFull, "No space left on device").into();
+        let err: Error =
+            std::io::Error::new(std::io::ErrorKind::StorageFull, "No space left on device").into();
         assert!(matches!(err, Error::Io(_)));
         assert_eq!(err.to_string(), "I/O error");
         assert_eq!(err.source().unwrap().to_string(), "No space left on device");
@@ -171,6 +246,13 @@ mod tests {
     #[test]
     fn non_io_errors_have_no_source() {
         assert!(Error::Empty(Field::Key).source().is_none());
-        assert!(Error::Corruption { offset: 0, reason: CorruptionReason::HeaderChecksum }.source().is_none());
+        assert!(
+            Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::HeaderChecksum
+            }
+            .source()
+            .is_none()
+        );
     }
 }

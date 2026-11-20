@@ -14,19 +14,19 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 
 One append-only data file. Every record is a 15-byte prefix followed by the payload.
 
-| Offset         | Size        | Field         | Notes                            |
-| -------------- | ----------- | ------------- | -------------------------------- |
-| 0              | 4           | `header_crc`  | CRC32C of bytes 4..15            |
-| 4              | 1           | `type`        | `0` invalid, `1` Set, `2` Delete |
-| 5              | 2           | `key_len`     | u16                              |
-| 7              | 4           | `value_len`   | u32                              |
-| 11             | 4           | `payload_crc` | CRC32C of key + value            |
-| 15             | `key_len`   | key           |                                  |
-| 15 + `key_len` | `value_len` | value         | empty for Delete                 |
+| Offset         | Size        | Field              | Notes                            |
+| -------------- | ----------- | ------------------ | -------------------------------- |
+| 0              | 4           | `header_checksum`  | CRC32C of bytes 4..15            |
+| 4              | 1           | `type`             | `0` invalid, `1` Set, `2` Delete |
+| 5              | 2           | `key_len`          | u16                              |
+| 7              | 4           | `value_len`        | u32                              |
+| 11             | 4           | `payload_checksum` | CRC32C of key + value            |
+| 15             | `key_len`   | key                |                                  |
+| 15 + `key_len` | `value_len` | value              | empty for Delete                 |
 
 - All integers are little-endian.
 - The checksum is CRC32C (Castagnoli). The variant is part of the format.
-- `header_crc` covers `payload_crc`, so the payload checksum is itself protected.
+- `header_checksum` covers `payload_checksum`, so the payload checksum is itself protected.
 - The header has its own checksum so lengths can be trusted before they are used. A single record checksum cannot tell a torn tail from a mid-file record with a corrupted length, and treating the second as the first would silently drop acknowledged records.
 - Type `0` is invalid so a zero-filled region can never parse as a record.
 
@@ -34,6 +34,7 @@ One append-only data file. Every record is a 15-byte prefix followed by the payl
 
 A record whose header checksum passes is still invalid if any of these hold:
 
+- `type == 0`
 - `key_len == 0`
 - Set with `value_len == 0`
 - Delete with `value_len != 0`
@@ -57,7 +58,7 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 
 ### Write path
 
-1. Build the full record in memory: payload, then `payload_crc`, then the prefix, then `header_crc`.
+1. Build the full record in memory: payload, then `payload_checksum`, then the prefix, then `header_checksum`.
 2. Append it with a single write to the end of the file.
 3. `fsync` the file.
 4. Update the index.
@@ -77,10 +78,10 @@ State: `pos = 0`, `len = file length`. Loop:
 
 1. `pos == len`: clean end, stop.
 2. Fewer than 15 bytes remain: torn header. Truncate at `pos`.
-3. Read the prefix. If `header_crc` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
+3. Read the prefix. If `header_checksum` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
 4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version). Validity violations: fail with corruption.
 5. Fewer than `15 + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
-6. Read the payload. If `payload_crc` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
+6. Read the payload. If `payload_checksum` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
 7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key.
 8. `pos += 15 + key_len + value_len`. Repeat.
 

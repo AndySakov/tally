@@ -4,7 +4,7 @@ use crate::{
     error::Error,
 };
 
-fn check_len(field: Field, len: usize) -> Result<(), Error> {
+pub fn check_len(field: Field, len: usize) -> Result<(), Error> {
     let max = match field {
         Field::Key => MAX_KEY_LEN,
         Field::Value => MAX_VALUE_LEN,
