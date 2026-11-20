@@ -8,21 +8,21 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 - `open` takes a directory. The data file is `tally.log` inside it. A directory leaves room for compaction's second file and a lock file later.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
-- One process, one thread. Concurrency arrives with the network server (project 2).
+- One process, one thread.
 
 ## On-disk format
 
 One append-only data file. Every record is a 15-byte prefix followed by the payload.
 
-| Offset | Size | Field | Notes |
-|---|---|---|---|
-| 0 | 4 | `header_crc` | CRC32C of bytes 4..15 |
-| 4 | 1 | `type` | `0` invalid, `1` Set, `2` Delete |
-| 5 | 2 | `key_len` | u16 |
-| 7 | 4 | `value_len` | u32 |
-| 11 | 4 | `payload_crc` | CRC32C of key + value |
-| 15 | `key_len` | key | |
-| 15 + `key_len` | `value_len` | value | empty for Delete |
+| Offset         | Size        | Field         | Notes                            |
+| -------------- | ----------- | ------------- | -------------------------------- |
+| 0              | 4           | `header_crc`  | CRC32C of bytes 4..15            |
+| 4              | 1           | `type`        | `0` invalid, `1` Set, `2` Delete |
+| 5              | 2           | `key_len`     | u16                              |
+| 7              | 4           | `value_len`   | u32                              |
+| 11             | 4           | `payload_crc` | CRC32C of key + value            |
+| 15             | `key_len`   | key           |                                  |
+| 15 + `key_len` | `value_len` | value         | empty for Delete                 |
 
 - All integers are little-endian.
 - The checksum is CRC32C (Castagnoli). The variant is part of the format.
@@ -42,9 +42,9 @@ A record whose header checksum passes is still invalid if any of these hold:
 
 Policy constants in code, not part of the format. The format allows keys up to 64 KiB and values up to 4 GiB, so the limits can be raised later without migrating files.
 
-| | Max | Why |
-|---|---|---|
-| Key | 1 KiB | Every key lives in the in-memory index |
+|       | Max    | Why                                                        |
+| ----- | ------ | ---------------------------------------------------------- |
+| Key   | 1 KiB  | Every key lives in the in-memory index                     |
 | Value | 16 MiB | Caps the allocation of a single `get` and of startup reads |
 
 Keys and values are newtypes (`Key`, `Value`) built with `TryFrom<&[u8]>`. Construction fails on empty input or input over the limit, so `set` cannot receive invalid input.
@@ -119,12 +119,12 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 
 One error enum, marked `#[non_exhaustive]` so variants can be added without breaking callers. Grouped by what the caller can do:
 
-| Category | Examples | Caller action |
-|---|---|---|
-| I/O | disk full, permission denied | environment problem; may retry or give up |
-| Corruption | bad checksum, invalid record, with the file offset | run `repair` |
-| Unsupported | unknown record type, lengths over current limits | upgrade tally |
-| Invalid input | empty key or value, over the limit | fix the input |
+| Category      | Examples                                           | Caller action                             |
+| ------------- | -------------------------------------------------- | ----------------------------------------- |
+| I/O           | disk full, permission denied                       | environment problem; may retry or give up |
+| Corruption    | bad checksum, invalid record, with the file offset | run `repair`                              |
+| Unsupported   | unknown record type, lengths over current limits   | upgrade tally                             |
+| Invalid input | empty key or value, over the limit                 | fix the input                             |
 
 Bugs (broken internal invariants) panic. Errors are for failures that can happen when the code is correct. The one deliberate exception is a failed `fsync`, which panics (see Durability contract).
 
@@ -145,11 +145,11 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 
 Core logic (format, recovery, index, crash tests) is hand-written. Commodity and security-sensitive pieces come from crates.
 
-| Crate | Why |
-|---|---|
-| `crc32c` | CRC32C with hardware acceleration |
-| `tempfile` (dev) | isolated directories for tests |
-| `criterion` (bench, later) | benchmarks |
+| Crate                      | Why                               |
+| -------------------------- | --------------------------------- |
+| `crc32c`                   | CRC32C with hardware acceleration |
+| `tempfile` (dev)           | isolated directories for tests    |
+| `criterion` (bench, later) | benchmarks                        |
 
 ## Milestones
 
