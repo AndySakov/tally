@@ -58,14 +58,6 @@ impl Header {
     pub fn record_len(self) -> u64 {
         (HEADER_LEN + self.payload_len()) as u64
     }
-
-    pub fn kind(self) -> Kind {
-        self.kind
-    }
-
-    pub fn value_len(self) -> u32 {
-        self.value_len
-    }
 }
 
 /// Appends the encoded record to `buf`. Does not clear `buf` first.
@@ -85,7 +77,7 @@ pub fn encode(record: &Record, buf: &mut Vec<u8>) {
     );
     header_bytes[7..11].copy_from_slice(
         &u32::try_from(value_len)
-            .expect("key guarantees len fits u16")
+            .expect("Value guarantees len fits u32")
             .to_le_bytes(),
     );
 
@@ -153,23 +145,28 @@ pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, DecodeError> {
 /// Panics if `payload.len() != header.payload_len()`: that means the
 /// caller read the wrong number of bytes, which is a bug, not bad data.
 pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeError> {
-    let key = decode_key(header, payload)?;
-    let boundary = header.key_len as usize;
-    match header.kind {
-        Kind::Set => Ok(Record::Set {
+    match decode_index_op(header, payload)? {
+        IndexOp::Set { key, .. } => Ok(Record::Set {
             key,
-            value: Value::try_from(&payload[boundary..])
+            value: Value::try_from(&payload[header.key_len as usize..])
                 .expect("decode_header validated value_len"),
         }),
-        Kind::Delete => Ok(Record::Delete { key }),
+        IndexOp::Delete { key } => Ok(Record::Delete { key }),
     }
 }
 
-/// Checks the payload CRC and returns only the key, without copying the
-/// value. For rebuilding the index, which needs the key and `value_len`.
+/// What a record does to the index, without the value bytes.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IndexOp {
+    Set { key: Key, value_len: u32 },
+    Delete { key: Key },
+}
+
+/// Checks the payload CRC and returns what the record does to the index,
+/// without copying the value.
 ///
 /// Panics if `payload.len() != header.payload_len()`, as `decode_payload`.
-pub fn decode_key(header: Header, payload: &[u8]) -> Result<Key, DecodeError> {
+pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, DecodeError> {
     assert_eq!(
         payload.len(),
         header.payload_len(),
@@ -179,7 +176,14 @@ pub fn decode_key(header: Header, payload: &[u8]) -> Result<Key, DecodeError> {
         return Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum));
     }
     let key_bytes = &payload[..header.key_len as usize];
-    Ok(Key::try_from(key_bytes).expect("decode_header validated key_len"))
+    let key = Key::try_from(key_bytes).expect("decode_header validated key_len");
+    Ok(match header.kind {
+        Kind::Set => IndexOp::Set {
+            key,
+            value_len: header.value_len,
+        },
+        Kind::Delete => IndexOp::Delete { key },
+    })
 }
 
 #[cfg(test)]
@@ -475,39 +479,45 @@ pub(crate) mod tests {
         let _ = decode_payload(header, &SET_A_HI[HEADER_LEN..HEADER_LEN + 2]);
     }
 
-    // decode_key
+    // decode_index_op
 
     #[test]
-    fn decode_key_returns_the_key_of_a_set() {
+    fn decode_index_op_of_a_set() {
         let header = decode_header(header_of(&SET_A_HI)).unwrap();
-        assert_eq!(decode_key(header, &SET_A_HI[HEADER_LEN..]), Ok(key(b"a")));
-        assert_eq!(header.kind(), Kind::Set);
-        assert_eq!(header.value_len(), 2);
+        assert_eq!(
+            decode_index_op(header, &SET_A_HI[HEADER_LEN..]),
+            Ok(IndexOp::Set {
+                key: key(b"a"),
+                value_len: 2
+            })
+        );
     }
 
     #[test]
-    fn decode_key_returns_the_key_of_a_delete() {
+    fn decode_index_op_of_a_delete() {
         let header = decode_header(header_of(&DELETE_A)).unwrap();
-        assert_eq!(decode_key(header, &DELETE_A[HEADER_LEN..]), Ok(key(b"a")));
-        assert_eq!(header.kind(), Kind::Delete);
+        assert_eq!(
+            decode_index_op(header, &DELETE_A[HEADER_LEN..]),
+            Ok(IndexOp::Delete { key: key(b"a") })
+        );
     }
 
     #[test]
-    fn decode_key_still_checks_the_value_bytes() {
+    fn decode_index_op_still_checks_the_value_bytes() {
         let header = decode_header(header_of(&SET_A_HI)).unwrap();
         let mut payload = SET_A_HI[HEADER_LEN..].to_vec();
         payload[2] ^= 0x01;
         assert_eq!(
-            decode_key(header, &payload),
+            decode_index_op(header, &payload),
             Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
         );
     }
 
     #[test]
     #[should_panic]
-    fn decode_key_panics_when_the_caller_passes_the_wrong_length() {
+    fn decode_index_op_panics_when_the_caller_passes_the_wrong_length() {
         let header = decode_header(header_of(&SET_A_HI)).unwrap();
-        let _ = decode_key(header, &SET_A_HI[HEADER_LEN..HEADER_LEN + 2]);
+        let _ = decode_index_op(header, &SET_A_HI[HEADER_LEN..HEADER_LEN + 2]);
     }
 
     // round trips

@@ -2,22 +2,29 @@
 //!
 //! - Undamaged: `open` succeeds and every key reads back the value the
 //!   records describe.
-//! - One byte changed: `open` fails. CRC32C catches any change confined to
-//!   32 bits, and the changed byte is covered by one of the two checksums.
+//! - One byte changed: `open` fails with corruption at the start of the
+//!   record holding the byte. CRC32C catches any change confined to 32 bits,
+//!   and the byte is covered by the header checksum if it lies in the first
+//!   15 bytes of its record, or the payload checksum otherwise.
 //! - Truncated at a record boundary: `open` succeeds with the state of the
 //!   records that remain.
-//! - Truncated mid-record: `open` fails. This is milestone 1 behaviour; in
-//!   milestone 2 a torn tail is truncated and `open` must succeed with the
-//!   state of the complete records.
+//! - Truncated mid-record: `open` fails with `UnexpectedEof`.
+//! - Zero bytes appended: fewer than a header fail with `UnexpectedEof`; a
+//!   header or more fail with a header checksum error at the old end.
+//!
+//! The last two are milestone 1 behaviour. In milestone 2 a torn or
+//! zero-filled tail is truncated, and `open` must succeed with the state of
+//! the complete records.
 
 #![no_main]
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use tally::fuzz::{Record, encode};
-use tally::{Key, Store, Value};
+use tally::fuzz::{HEADER_LEN, Record, encode};
+use tally::{CorruptionReason, Error, Key, Store, Value};
 
 #[derive(Arbitrary, Debug)]
 enum Op {
@@ -28,8 +35,9 @@ enum Op {
 #[derive(Arbitrary, Debug)]
 enum Damage {
     None,
-    Truncate { at: u16 },
-    ChangeByte { at: u16, mask: u8 },
+    Truncate { at: u32 },
+    ChangeByte { at: u32, mask: u8 },
+    ZeroTail { len: u8 },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -46,7 +54,11 @@ fn key(k: u8) -> Key {
 
 enum Expect {
     Opens(State),
-    Fails,
+    Torn,
+    Corrupt {
+        offset: u64,
+        reason: CorruptionReason,
+    },
 }
 
 fuzz_target!(|input: Input| {
@@ -86,7 +98,7 @@ fuzz_target!(|input: Input| {
             log.truncate(len);
             match boundaries.iter().position(|&b| b == len) {
                 Some(i) => Expect::Opens(states.swap_remove(i)),
-                None => Expect::Fails,
+                None => Expect::Torn,
             }
         }
         Damage::ChangeByte { at, mask } => {
@@ -95,7 +107,31 @@ fuzz_target!(|input: Input| {
             }
             let i = at as usize % log.len();
             log[i] ^= mask;
-            Expect::Fails
+            let start = *boundaries.iter().rev().find(|&&b| b <= i).unwrap();
+            let reason = if i - start < HEADER_LEN {
+                CorruptionReason::HeaderChecksum
+            } else {
+                CorruptionReason::PayloadChecksum
+            };
+            Expect::Corrupt {
+                offset: start as u64,
+                reason,
+            }
+        }
+        Damage::ZeroTail { len } => {
+            if len == 0 {
+                return;
+            }
+            let end = log.len();
+            log.resize(end + len as usize, 0);
+            if (len as usize) < HEADER_LEN {
+                Expect::Torn
+            } else {
+                Expect::Corrupt {
+                    offset: end as u64,
+                    reason: CorruptionReason::HeaderChecksum,
+                }
+            }
         }
     };
 
@@ -114,6 +150,22 @@ fuzz_target!(|input: Input| {
                 );
             }
         }
-        Expect::Fails => assert!(opened.is_err(), "a damaged log must not open"),
+        Expect::Torn => match opened {
+            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {}
+            other => panic!(
+                "a torn tail must fail with UnexpectedEof, got {:?}",
+                other.err()
+            ),
+        },
+        Expect::Corrupt { offset, reason } => match opened {
+            Err(Error::Corruption {
+                offset: o,
+                reason: r,
+            }) if o == offset && r == reason => {}
+            other => panic!(
+                "expected corruption at {offset} ({reason}), got {:?}",
+                other.err()
+            ),
+        },
     }
 });

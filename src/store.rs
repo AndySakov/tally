@@ -5,7 +5,7 @@ use std::path::Path;
 use std::{collections::HashMap, fs};
 
 use crate::record::{
-    HEADER_LEN, Header, Kind, Record, decode_header, decode_key, decode_payload, encode,
+    HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
 use crate::{CorruptionReason, Error, Key, Value};
 
@@ -110,8 +110,8 @@ impl Store {
 
     /// Returns the value for `key`, or `None` if it isn't live.
     ///
-    /// Reads the whole record in one positioned read and verifies both
-    /// checksums and that the stored key equals `key`. Any failure is a
+    /// Reads the record with two positioned reads (header, then payload) and
+    /// verifies both checksums and that the stored key equals `key`. Any failure is a
     /// corruption error at the record's offset, never `None`.
     pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
         match self.index.get(key.as_bytes()) {
@@ -183,26 +183,19 @@ fn load_index(file: &File, len: u64) -> Result<Index, Error> {
     buffer.seek(SeekFrom::Start(0))?;
 
     while offset < len {
-        if (len - offset) < (HEADER_LEN as u64) {
-            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
-        }
         buffer.read_exact(&mut header_buf)?;
         let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+        // read_exact would also fail, but only after allocating up to 16 MiB.
         if len - offset < header.record_len() {
             return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
         }
         payload_buf.resize(header.payload_len(), 0u8);
         buffer.read_exact(&mut payload_buf)?;
-        let key = decode_key(header, &payload_buf).map_err(|err| err.at(offset))?;
-        match header.kind() {
-            Kind::Set => {
-                let entry = Entry {
-                    offset,
-                    value_len: header.value_len(),
-                };
-                index.insert(key.into_bytes(), entry);
+        match decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))? {
+            IndexOp::Set { key, value_len } => {
+                index.insert(key.into_bytes(), Entry { offset, value_len });
             }
-            Kind::Delete => {
+            IndexOp::Delete { key } => {
                 index.remove(key.as_bytes());
             }
         }
@@ -302,6 +295,85 @@ mod tests {
             Store::open(tmp.path()),
             Err(Error::Corruption {
                 offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+    }
+
+    fn open_log(bytes: &[u8]) -> Result<Store, Error> {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(log_path(tmp.path()), bytes).unwrap();
+        Store::open(tmp.path())
+    }
+
+    fn set_a_hi_then(tail: &[u8]) -> Vec<u8> {
+        [SET_A_HI.as_slice(), tail].concat()
+    }
+
+    #[test]
+    fn open_fails_on_a_torn_header() {
+        let bytes = set_a_hi_then(&DELETE_A[..14]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_torn_payload() {
+        let bytes = set_a_hi_then(&DELETE_A[..15]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_zero_filled_tail_with_its_offset() {
+        let bytes = set_a_hi_then(&[0u8; 16]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_header_checksum_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18] ^= 0x01;
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_length_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 7] ^= 0x01; // second record's value_len: 0 -> 1
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_key_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 15] ^= 0x01; // second record's key: "a" -> "`"
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));

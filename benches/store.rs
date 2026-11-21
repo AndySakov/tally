@@ -132,7 +132,7 @@ fn open(c: &mut Criterion) {
     group.sample_size(samples(10));
 
     let empty = tempfile::tempdir().unwrap();
-    group.bench_function("empty log (three fsyncs)", |b| {
+    group.bench_function("empty log, nothing dirty to sync", |b| {
         b.iter(|| Store::open(empty.path()).unwrap())
     });
 
