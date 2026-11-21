@@ -1,13 +1,17 @@
 use std::fs::File;
-use std::io::{self, ErrorKind};
+use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::{collections::HashMap, fs};
 
-use crate::record::{HEADER_LEN, Header, Record, decode_header, decode_payload, encode};
+use crate::record::{
+    HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
+};
 use crate::{CorruptionReason, Error, Key, Value};
 
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
+
+type Index = HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>;
 
 /// Where a live key's latest Set record sits in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +25,7 @@ pub struct Store {
     file: File,
     /// Length of the log, which is also the offset the next record lands at.
     end: u64,
-    index: HashMap<Box<[u8]>, Entry>,
+    index: Index,
 }
 
 impl Store {
@@ -106,8 +110,8 @@ impl Store {
 
     /// Returns the value for `key`, or `None` if it isn't live.
     ///
-    /// Reads the whole record in one positioned read and verifies both
-    /// checksums and that the stored key equals `key`. Any failure is a
+    /// Reads the record with two positioned reads (header, then payload) and
+    /// verifies both checksums and that the stored key equals `key`. Any failure is a
     /// corruption error at the record's offset, never `None`.
     pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
         match self.index.get(key.as_bytes()) {
@@ -170,29 +174,31 @@ fn load_record(file: &File, offset: u64) -> Result<(Header, Record), Error> {
 
 /// Reads every record in `file` from offset 0 to `len` and returns the index
 /// they describe.
-fn load_index(file: &File, len: u64) -> Result<HashMap<Box<[u8]>, Entry>, Error> {
-    let mut index: HashMap<Box<[u8]>, Entry> = HashMap::new();
+fn load_index(file: &File, len: u64) -> Result<Index, Error> {
+    let mut index = Index::default();
+    let mut header_buf = [0u8; HEADER_LEN];
+    let mut payload_buf = vec![];
     let mut offset: u64 = 0;
+    let mut buffer = BufReader::new(file);
+    buffer.seek(SeekFrom::Start(0))?;
 
     while offset < len {
-        let header = match load_record(file, offset)? {
-            (header, Record::Set { key, value }) => {
-                let key_bytes = key.into_bytes();
-                index.insert(
-                    key_bytes,
-                    Entry {
-                        offset,
-                        value_len: u32::try_from(value.as_bytes().len())
-                            .expect("Value guarantees len fits u32"),
-                    },
-                );
-                header
+        buffer.read_exact(&mut header_buf)?;
+        let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+        // read_exact would also fail, but only after allocating up to 16 MiB.
+        if len - offset < header.record_len() {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+        payload_buf.resize(header.payload_len(), 0u8);
+        buffer.read_exact(&mut payload_buf)?;
+        match decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))? {
+            IndexOp::Set { key, value_len } => {
+                index.insert(key.into_bytes(), Entry { offset, value_len });
             }
-            (header, Record::Delete { key }) => {
+            IndexOp::Delete { key } => {
                 index.remove(key.as_bytes());
-                header
             }
-        };
+        }
         offset += header.record_len();
     }
     Ok(index)
@@ -202,12 +208,20 @@ fn load_index(file: &File, len: u64) -> Result<HashMap<Box<[u8]>, Entry>, Error>
 /// kernel may have dropped the dirty pages, so retrying can report success
 /// for data that never reached disk (DESIGN.md, Failed fsync).
 fn sync(file: &File) {
+    // Fuzzing can't observe durability, and a 5 ms fsync per run would cut
+    // fuzzing throughput a hundredfold.
+    if cfg!(fuzzing) {
+        return;
+    }
     file.sync_all()
         .expect("fsync failed; restart to recover from the log");
 }
 
 /// Makes a create or rename inside `dir` durable.
 fn sync_dir(dir: &Path) -> io::Result<()> {
+    if cfg!(fuzzing) {
+        return Ok(());
+    }
     File::open(dir)?.sync_all()
 }
 
@@ -281,6 +295,85 @@ mod tests {
             Store::open(tmp.path()),
             Err(Error::Corruption {
                 offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+    }
+
+    fn open_log(bytes: &[u8]) -> Result<Store, Error> {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(log_path(tmp.path()), bytes).unwrap();
+        Store::open(tmp.path())
+    }
+
+    fn set_a_hi_then(tail: &[u8]) -> Vec<u8> {
+        [SET_A_HI.as_slice(), tail].concat()
+    }
+
+    #[test]
+    fn open_fails_on_a_torn_header() {
+        let bytes = set_a_hi_then(&DELETE_A[..14]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_torn_payload() {
+        let bytes = set_a_hi_then(&DELETE_A[..15]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_zero_filled_tail_with_its_offset() {
+        let bytes = set_a_hi_then(&[0u8; 16]);
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_header_checksum_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18] ^= 0x01;
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_length_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 7] ^= 0x01; // second record's value_len: 0 -> 1
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::HeaderChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn open_fails_on_a_corrupted_key_with_its_offset() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 15] ^= 0x01; // second record's key: "a" -> "`"
+        assert!(matches!(
+            open_log(&bytes),
+            Err(Error::Corruption {
+                offset: 18,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));

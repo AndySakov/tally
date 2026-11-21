@@ -78,6 +78,8 @@ If the append fails partway (disk full, I/O error), `set` or `delete` truncates 
 
 ## Recovery (startup)
 
+Milestone 2. Until then `open` fails on any record it cannot decode, and a torn tail fails as an I/O `UnexpectedEof` with no offset, although it is damage, not an environment problem. The truncating branches below replace both.
+
 State: `pos = 0`, `len = file length`. Loop:
 
 1. `pos == len`: clean end, stop.
@@ -105,10 +107,12 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 
 ## Index
 
-`HashMap<Box<[u8]>, Entry>` where `Entry { offset: u64, value_len: u32 }`.
+`HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>` where `Entry { offset: u64, value_len: u32 }`.
 
 - `Box<[u8]>` instead of `Vec<u8>`: keys never grow, so the capacity field is waste. Saves 8 bytes per slot.
-- Measured: about 877 MB for 10M keys of 32 bytes (pre-sized map). Growth without pre-sizing peaks higher because old and new tables coexist during resize.
+- foldhash instead of the default SipHash: `open` on 100k records went from 15.5 ms to 12.1 ms and a missing-key `get` from 12.9 ns to 4.8 ns. The `quality` variant costs the same as `fast` within noise.
+- The cost is HashDoS resistance. foldhash defeats only trivial collision attacks and "does not claim to provide HashDoS resistance against interactive attackers" (its README). SipHash does. That is acceptable while keys come from the embedding process. Before keys arrive over the network (the TCP server), switch back to SipHash or put a limit on what one client can insert.
+- Measured with a pre-sized map: about 877 MB for 10M keys of 32 bytes. `open` does not pre-size yet (see Deferred ideas), so it peaks higher: old and new tables coexist during each resize.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction.
 
 ### Reads
@@ -116,7 +120,7 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 `get` always verifies:
 
 1. Look up the key. Missing: return `None` with no I/O.
-2. One positioned read (`read_at`) of the whole record at `offset`.
+2. Read the record at `offset`. The code does two positioned reads, header then payload. One read would do: the index entry holds `value_len`, so the record is `15 + key.len() + value_len` bytes (see Deferred ideas).
 3. Verify both checksums and that the stored key equals the requested key.
 4. Return the value. Any failure returns a corruption error, never `None`.
 
@@ -139,6 +143,10 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 - **Kill test:** run the store as a child process, `kill -9` it at random points, reopen, and check every acknowledged write is present. This cannot detect a missing `fsync`, because the OS page cache survives process death.
 - **Power-cut simulation:** file I/O sits behind a trait. A test implementation tracks written bytes and synced bytes separately. A simulated power cut drops everything not synced.
 - **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
+- **Model test** (`tests/model.rs`): random sequences of set, get, delete and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
+- **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
+- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records, then damaged), and `ops` (the model test, coverage-guided). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
+- **Benchmarks** (`cargo bench`): `set` next to a bare append + `sync_all` baseline, `get` hit and miss, and `open` on an empty log and at 10k and 100k records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
 
@@ -154,8 +162,10 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | Crate                      | Why                               |
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
+| `foldhash`                 | index hasher, faster than SipHash |
 | `tempfile` (dev)           | isolated directories for tests    |
-| `criterion` (bench, later) | benchmarks                        |
+| `proptest` (dev)           | model and codec property tests    |
+| `criterion` (dev)          | benchmarks                        |
 
 ## Milestones
 
@@ -170,4 +180,4 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 - Compaction writes the live key count so the next startup can pre-size the index.
 - Smaller index: a seeded 128-bit hash per key instead of the key itself (about 37% less memory, estimated), with a collision test using a deliberately weak hash.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
-- Faster hasher (`foldhash`) if hashing shows up in profiles.
+- `get` in one positioned read, sized from the index entry.
