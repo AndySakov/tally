@@ -8,25 +8,25 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 - `open` takes a directory. The data file is `tally.log` inside it. A directory leaves room for compaction's second file and a lock file later.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
-- One process, one thread.
+- One process, one thread. `open` takes an exclusive lock (`flock`) on `tally.log`. A second `open` fails with `Locked` until the first `Store` is dropped or its process exits.
 
 ## On-disk format
 
 One append-only data file. Every record is a 15-byte prefix followed by the payload.
 
-| Offset         | Size        | Field         | Notes                            |
-| -------------- | ----------- | ------------- | -------------------------------- |
-| 0              | 4           | `header_crc`  | CRC32C of bytes 4..15            |
-| 4              | 1           | `type`        | `0` invalid, `1` Set, `2` Delete |
-| 5              | 2           | `key_len`     | u16                              |
-| 7              | 4           | `value_len`   | u32                              |
-| 11             | 4           | `payload_crc` | CRC32C of key + value            |
-| 15             | `key_len`   | key           |                                  |
-| 15 + `key_len` | `value_len` | value         | empty for Delete                 |
+| Offset         | Size        | Field              | Notes                            |
+| -------------- | ----------- | ------------------ | -------------------------------- |
+| 0              | 4           | `header_checksum`  | CRC32C of bytes 4..15            |
+| 4              | 1           | `type`             | `0` invalid, `1` Set, `2` Delete |
+| 5              | 2           | `key_len`          | u16                              |
+| 7              | 4           | `value_len`        | u32                              |
+| 11             | 4           | `payload_checksum` | CRC32C of key + value            |
+| 15             | `key_len`   | key                |                                  |
+| 15 + `key_len` | `value_len` | value              | empty for Delete                 |
 
 - All integers are little-endian.
 - The checksum is CRC32C (Castagnoli). The variant is part of the format.
-- `header_crc` covers `payload_crc`, so the payload checksum is itself protected.
+- `header_checksum` covers `payload_checksum`, so the payload checksum is itself protected.
 - The header has its own checksum so lengths can be trusted before they are used. A single record checksum cannot tell a torn tail from a mid-file record with a corrupted length, and treating the second as the first would silently drop acknowledged records.
 - Type `0` is invalid so a zero-filled region can never parse as a record.
 
@@ -34,6 +34,7 @@ One append-only data file. Every record is a 15-byte prefix followed by the payl
 
 A record whose header checksum passes is still invalid if any of these hold:
 
+- `type == 0`
 - `key_len == 0`
 - Set with `value_len == 0`
 - Delete with `value_len != 0`
@@ -57,7 +58,7 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 
 ### Write path
 
-1. Build the full record in memory: payload, then `payload_crc`, then the prefix, then `header_crc`.
+1. Build the full record in memory: payload, then `payload_checksum`, then the prefix, then `header_checksum`.
 2. Append it with a single write to the end of the file.
 3. `fsync` the file.
 4. Update the index.
@@ -67,9 +68,13 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 
 A failed `fsync` panics. On Linux, a failed `fsync` can drop the dirty pages, so a retry may report success for data that never reached disk. The only safe state after a failure is the one recovery rebuilds from the file, so tally stops instead of retrying. Postgres makes the same choice.
 
+### Failed write
+
+If the append fails partway (disk full, I/O error), `set` or `delete` truncates the file back to where the record started and returns the I/O error. A partial record left at the tail would put the next append after torn bytes, and the following startup would see mid-file corruption. If the truncate itself fails, tally panics.
+
 ### New files
 
-Creating the data file requires `fsync` on the file and on its parent directory. A newly created store directory likewise requires `fsync` on its own parent. The file name lives in the directory, and without the directory sync the file itself may not survive power loss. Directory sync behaviour differs between Linux and macOS and must be tested on both.
+`open` syncs the data file, the store directory, and the directory's parent on every start, in that order, whether or not it created them. The file name lives in the directory, and without the directory sync the file itself may not survive power loss. Syncing unconditionally makes `open` idempotent: if a previous `open` failed between creating and syncing, the next one completes it. Directory sync behaviour differs between Linux and macOS and must be tested on both.
 
 ## Recovery (startup)
 
@@ -77,10 +82,10 @@ State: `pos = 0`, `len = file length`. Loop:
 
 1. `pos == len`: clean end, stop.
 2. Fewer than 15 bytes remain: torn header. Truncate at `pos`.
-3. Read the prefix. If `header_crc` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
+3. Read the prefix. If `header_checksum` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
 4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version). Validity violations: fail with corruption.
 5. Fewer than `15 + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
-6. Read the payload. If `payload_crc` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
+6. Read the payload. If `payload_checksum` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
 7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key.
 8. `pos += 15 + key_len + value_len`. Repeat.
 
@@ -125,8 +130,9 @@ One error enum, marked `#[non_exhaustive]` so variants can be added without brea
 | Corruption    | bad checksum, invalid record, with the file offset | run `repair`                              |
 | Unsupported   | unknown record type, lengths over current limits   | upgrade tally                             |
 | Invalid input | empty key or value, over the limit                 | fix the input                             |
+| Locked        | store already open in another `Store` or process   | close the other one, or wait              |
 
-Bugs (broken internal invariants) panic. Errors are for failures that can happen when the code is correct. The one deliberate exception is a failed `fsync`, which panics (see Durability contract).
+Bugs (broken internal invariants) panic. Errors are for failures that can happen when the code is correct. The deliberate exceptions are a failed `fsync` and a failed truncate after a failed write, which panic (see Durability contract).
 
 ## Testing
 
@@ -155,7 +161,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 
 1. Append-only log and in-memory index. Reopen rebuilds the index.
 2. Crash safety: checksums, recovery rules, kill test, power-cut simulation.
-3. Compaction: rewrite live keys to a new file, atomic swap via rename, `fsync` the directory.
+3. Compaction: rewrite live keys to a new file, atomic swap via rename, `fsync` the directory. Move the lock to a separate lock file first: the swap replaces `tally.log`, and a lock held on the old file does not cover the new one.
 4. Benchmark and README.
 
 ## Deferred ideas
