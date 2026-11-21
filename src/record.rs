@@ -58,6 +58,14 @@ impl Header {
     pub fn record_len(self) -> u64 {
         (HEADER_LEN + self.payload_len()) as u64
     }
+
+    pub fn kind(self) -> Kind {
+        self.kind
+    }
+
+    pub fn value_len(self) -> u32 {
+        self.value_len
+    }
 }
 
 /// Appends the encoded record to `buf`. Does not clear `buf` first.
@@ -145,17 +153,8 @@ pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, DecodeError> {
 /// Panics if `payload.len() != header.payload_len()`: that means the
 /// caller read the wrong number of bytes, which is a bug, not bad data.
 pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeError> {
-    assert_eq!(
-        payload.len(),
-        header.payload_len(),
-        "caller passed a payload of the wrong length"
-    );
-    let computed_checksum = crc32c(payload);
-    if header.payload_checksum != computed_checksum {
-        return Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum));
-    }
+    let key = decode_key(header, payload)?;
     let boundary = header.key_len as usize;
-    let key = Key::try_from(&payload[..boundary]).expect("decode_header validated key_len");
     match header.kind {
         Kind::Set => Ok(Record::Set {
             key,
@@ -164,6 +163,23 @@ pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeEr
         }),
         Kind::Delete => Ok(Record::Delete { key }),
     }
+}
+
+/// Checks the payload CRC and returns only the key, without copying the
+/// value. For rebuilding the index, which needs the key and `value_len`.
+///
+/// Panics if `payload.len() != header.payload_len()`, as `decode_payload`.
+pub fn decode_key(header: Header, payload: &[u8]) -> Result<Key, DecodeError> {
+    assert_eq!(
+        payload.len(),
+        header.payload_len(),
+        "caller passed a payload of the wrong length"
+    );
+    if header.payload_checksum != crc32c(payload) {
+        return Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum));
+    }
+    let key_bytes = &payload[..header.key_len as usize];
+    Ok(Key::try_from(key_bytes).expect("decode_header validated key_len"))
 }
 
 #[cfg(test)]
@@ -459,6 +475,41 @@ pub(crate) mod tests {
         let _ = decode_payload(header, &SET_A_HI[HEADER_LEN..HEADER_LEN + 2]);
     }
 
+    // decode_key
+
+    #[test]
+    fn decode_key_returns_the_key_of_a_set() {
+        let header = decode_header(header_of(&SET_A_HI)).unwrap();
+        assert_eq!(decode_key(header, &SET_A_HI[HEADER_LEN..]), Ok(key(b"a")));
+        assert_eq!(header.kind(), Kind::Set);
+        assert_eq!(header.value_len(), 2);
+    }
+
+    #[test]
+    fn decode_key_returns_the_key_of_a_delete() {
+        let header = decode_header(header_of(&DELETE_A)).unwrap();
+        assert_eq!(decode_key(header, &DELETE_A[HEADER_LEN..]), Ok(key(b"a")));
+        assert_eq!(header.kind(), Kind::Delete);
+    }
+
+    #[test]
+    fn decode_key_still_checks_the_value_bytes() {
+        let header = decode_header(header_of(&SET_A_HI)).unwrap();
+        let mut payload = SET_A_HI[HEADER_LEN..].to_vec();
+        payload[2] ^= 0x01;
+        assert_eq!(
+            decode_key(header, &payload),
+            Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn decode_key_panics_when_the_caller_passes_the_wrong_length() {
+        let header = decode_header(header_of(&SET_A_HI)).unwrap();
+        let _ = decode_key(header, &SET_A_HI[HEADER_LEN..HEADER_LEN + 2]);
+    }
+
     // round trips
 
     #[test]
@@ -496,5 +547,94 @@ pub(crate) mod tests {
                 reason: UnsupportedReason::UnknownType(7)
             }
         ));
+    }
+
+    mod props {
+        use proptest::prelude::*;
+        use proptest::sample::Index;
+
+        use super::*;
+
+        fn any_record() -> impl Strategy<Value = Record> {
+            let key_bytes = prop::collection::vec(any::<u8>(), 1..=MAX_KEY_LEN);
+            let value_bytes = prop::collection::vec(any::<u8>(), 1..512);
+            prop_oneof![
+                (key_bytes.clone(), value_bytes).prop_map(|(k, v)| set(&k, &v)),
+                key_bytes.prop_map(|k| Record::Delete { key: key(&k) }),
+            ]
+        }
+
+        fn encoded(record: &Record) -> Vec<u8> {
+            let mut buf = Vec::new();
+            encode(record, &mut buf);
+            buf
+        }
+
+        proptest! {
+            #[test]
+            fn round_trip(record in any_record()) {
+                let buf = encoded(&record);
+                let header = decode_header(header_of(&buf)).unwrap();
+                prop_assert_eq!(header.record_len(), buf.len() as u64);
+                prop_assert_eq!(decode_payload(header, &buf[HEADER_LEN..]), Ok(record));
+            }
+
+            /// CRC32C detects every error confined to 32 consecutive bits, so
+            /// changing any one byte must be caught by the checksum covering it.
+            #[test]
+            fn any_one_byte_change_is_detected(
+                record in any_record(),
+                at in any::<Index>(),
+                mask in 1u8..,
+            ) {
+                let mut buf = encoded(&record);
+                let i = at.index(buf.len());
+                buf[i] ^= mask;
+                let header = decode_header(header_of(&buf));
+                if i < HEADER_LEN {
+                    prop_assert_eq!(header, Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum)));
+                } else {
+                    prop_assert_eq!(
+                        decode_payload(header.unwrap(), &buf[HEADER_LEN..]),
+                        Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
+                    );
+                }
+            }
+
+            /// Restates the record rules independently of `decode_header`.
+            #[test]
+            fn decode_header_accepts_exactly_the_valid_headers(
+                kind in 0u8..5,
+                key_len in prop_oneof![0u16..4, 1020u16..1030, Just(u16::MAX)],
+                value_len in prop_oneof![0u32..4, 16_777_210u32..16_777_220, Just(u32::MAX)],
+                payload_checksum in any::<u32>(),
+            ) {
+                let valid = matches!(kind, 1 | 2)
+                    && key_len != 0
+                    && key_len as usize <= MAX_KEY_LEN
+                    && value_len as usize <= MAX_VALUE_LEN
+                    && (kind != 1 || value_len != 0)
+                    && (kind != 2 || value_len == 0);
+                let bytes = header_bytes(kind, key_len, value_len, payload_checksum);
+                prop_assert_eq!(decode_header(&bytes).is_ok(), valid);
+            }
+
+            /// A valid header with a matching payload checksum always decodes:
+            /// the `expect`s in `decode_payload` can never fire.
+            #[test]
+            fn a_valid_header_and_matching_payload_always_decode(
+                kind in 0u8..4,
+                payload in prop::collection::vec(any::<u8>(), 0..16),
+                split in any::<Index>(),
+            ) {
+                let key_len = split.index(payload.len() + 1);
+                let value_len = payload.len() - key_len;
+                let checksum = crc32c::crc32c(&payload);
+                let bytes = header_bytes(kind, key_len as u16, value_len as u32, checksum);
+                if let Ok(header) = decode_header(&bytes) {
+                    prop_assert!(decode_payload(header, &payload).is_ok());
+                }
+            }
+        }
     }
 }

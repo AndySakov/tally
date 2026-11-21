@@ -105,9 +105,10 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 
 ## Index
 
-`HashMap<Box<[u8]>, Entry>` where `Entry { offset: u64, value_len: u32 }`.
+`HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>` where `Entry { offset: u64, value_len: u32 }`.
 
 - `Box<[u8]>` instead of `Vec<u8>`: keys never grow, so the capacity field is waste. Saves 8 bytes per slot.
+- foldhash instead of the default SipHash: `open` on 100k records went from 15.5 ms to 12.1 ms and a missing-key `get` from 12.9 ns to 4.8 ns. The `quality` variant costs the same as `fast` within noise and resists crafted colliding keys better, which matters once keys arrive over the network.
 - Measured: about 877 MB for 10M keys of 32 bytes (pre-sized map). Growth without pre-sizing peaks higher because old and new tables coexist during resize.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction.
 
@@ -139,6 +140,10 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 - **Kill test:** run the store as a child process, `kill -9` it at random points, reopen, and check every acknowledged write is present. This cannot detect a missing `fsync`, because the OS page cache survives process death.
 - **Power-cut simulation:** file I/O sits behind a trait. A test implementation tracks written bytes and synced bytes separately. A simulated power cut drops everything not synced.
 - **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
+- **Model test** (`tests/model.rs`): random sequences of set, get, delete and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
+- **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
+- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records, then damaged), and `ops` (the model test, coverage-guided). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
+- **Benchmarks** (`cargo bench`): `set` next to a bare append + `sync_all` baseline, `get` hit and miss, and `open` at 10k and 100k records.
 
 ### Done criteria
 
@@ -154,8 +159,10 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | Crate                      | Why                               |
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
+| `foldhash`                 | index hasher, faster than SipHash |
 | `tempfile` (dev)           | isolated directories for tests    |
-| `criterion` (bench, later) | benchmarks                        |
+| `proptest` (dev)           | model and codec property tests    |
+| `criterion` (dev)          | benchmarks                        |
 
 ## Milestones
 
@@ -170,4 +177,3 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 - Compaction writes the live key count so the next startup can pre-size the index.
 - Smaller index: a seeded 128-bit hash per key instead of the key itself (about 37% less memory, estimated), with a collision test using a deliberately weak hash.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
-- Faster hasher (`foldhash`) if hashing shows up in profiles.

@@ -1,13 +1,17 @@
 use std::fs::File;
-use std::io::{self, ErrorKind};
+use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::{collections::HashMap, fs};
 
-use crate::record::{HEADER_LEN, Header, Record, decode_header, decode_payload, encode};
+use crate::record::{
+    HEADER_LEN, Header, Kind, Record, decode_header, decode_key, decode_payload, encode,
+};
 use crate::{CorruptionReason, Error, Key, Value};
 
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
+
+type Index = HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>;
 
 /// Where a live key's latest Set record sits in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,7 +25,7 @@ pub struct Store {
     file: File,
     /// Length of the log, which is also the offset the next record lands at.
     end: u64,
-    index: HashMap<Box<[u8]>, Entry>,
+    index: Index,
 }
 
 impl Store {
@@ -170,29 +174,38 @@ fn load_record(file: &File, offset: u64) -> Result<(Header, Record), Error> {
 
 /// Reads every record in `file` from offset 0 to `len` and returns the index
 /// they describe.
-fn load_index(file: &File, len: u64) -> Result<HashMap<Box<[u8]>, Entry>, Error> {
-    let mut index: HashMap<Box<[u8]>, Entry> = HashMap::new();
+fn load_index(file: &File, len: u64) -> Result<Index, Error> {
+    let mut index = Index::default();
+    let mut header_buf = [0u8; HEADER_LEN];
+    let mut payload_buf = vec![];
     let mut offset: u64 = 0;
+    let mut buffer = BufReader::new(file);
+    buffer.seek(SeekFrom::Start(0))?;
 
     while offset < len {
-        let header = match load_record(file, offset)? {
-            (header, Record::Set { key, value }) => {
-                let key_bytes = key.into_bytes();
-                index.insert(
-                    key_bytes,
-                    Entry {
-                        offset,
-                        value_len: u32::try_from(value.as_bytes().len())
-                            .expect("Value guarantees len fits u32"),
-                    },
-                );
-                header
+        if (len - offset) < (HEADER_LEN as u64) {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+        buffer.read_exact(&mut header_buf)?;
+        let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+        if len - offset < header.record_len() {
+            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+        }
+        payload_buf.resize(header.payload_len(), 0u8);
+        buffer.read_exact(&mut payload_buf)?;
+        let key = decode_key(header, &payload_buf).map_err(|err| err.at(offset))?;
+        match header.kind() {
+            Kind::Set => {
+                let entry = Entry {
+                    offset,
+                    value_len: header.value_len(),
+                };
+                index.insert(key.into_bytes(), entry);
             }
-            (header, Record::Delete { key }) => {
+            Kind::Delete => {
                 index.remove(key.as_bytes());
-                header
             }
-        };
+        }
         offset += header.record_len();
     }
     Ok(index)
@@ -202,12 +215,20 @@ fn load_index(file: &File, len: u64) -> Result<HashMap<Box<[u8]>, Entry>, Error>
 /// kernel may have dropped the dirty pages, so retrying can report success
 /// for data that never reached disk (DESIGN.md, Failed fsync).
 fn sync(file: &File) {
+    // Fuzzing can't observe durability, and a 5 ms fsync per run would cut
+    // fuzzing throughput a hundredfold.
+    if cfg!(fuzzing) {
+        return;
+    }
     file.sync_all()
         .expect("fsync failed; restart to recover from the log");
 }
 
 /// Makes a create or rename inside `dir` durable.
 fn sync_dir(dir: &Path) -> io::Result<()> {
+    if cfg!(fuzzing) {
+        return Ok(());
+    }
     File::open(dir)?.sync_all()
 }
 
