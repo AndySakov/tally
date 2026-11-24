@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs::TryLockError;
 use std::io::{self, BufReader, ErrorKind, Read};
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
@@ -640,7 +642,7 @@ fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Er
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Index::new(), 0)),
         Err(err) => return Err(err.into()),
     };
-    match read_hint(&file, log_len) {
+    match read_hint(&file, log_len, HINT_SIZES, PARALLEL_FROM) {
         Ok(found) => Ok(found),
         Err(hint::Invalid(why)) => {
             log::warn!("ignored the hint file ({why}); reading the whole log instead");
@@ -652,7 +654,22 @@ fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Er
     }
 }
 
-fn read_hint(file: &impl LogFile, log_len: u64) -> Result<(Index, u64), hint::Invalid> {
+/// Hints with fewer entries than this are read on one thread.
+const PARALLEL_FROM: u64 = 100_000;
+const MAX_THREADS: usize = 8;
+const HINT_SIZES: hint::Sizes = hint::Sizes {
+    window_bytes: 16 << 20,
+    chunk_entries: 8192,
+};
+
+/// Reads the index from the hint, a window of `sizes` at a time: on one
+/// thread below `parallel_from` entries, on up to `MAX_THREADS` from there.
+fn read_hint(
+    file: &impl LogFile,
+    log_len: u64,
+    sizes: hint::Sizes,
+    parallel_from: u64,
+) -> Result<(Index, u64), hint::Invalid> {
     let trailer = hint::trailer(file)?;
     if trailer.log_len > log_len {
         return Err(hint::Invalid("the log is shorter than the hint says"));
@@ -662,16 +679,27 @@ fn read_hint(file: &impl LogFile, log_len: u64) -> Result<(Index, u64), hint::In
     let most = log_len / record_len(1, 1);
     let capacity = usize::try_from(trailer.count.min(most)).unwrap_or(usize::MAX);
     let mut index = Index::with_capacity(capacity);
-    hint::read_entries(file, trailer, |key, offset, value_len| {
-        let key_len = entry_key_len(&key);
-        index.insert(
-            key.as_bytes(),
-            Entry {
-                offset,
-                value_len,
-                key_len,
-            },
-        );
+    let threads = if trailer.count < parallel_from {
+        1
+    } else {
+        thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(MAX_THREADS)
+    };
+    hint::read_entries(file, trailer, sizes, |window| {
+        index.fill(threads, window.chunks(), |chunk, filler| {
+            for (key, offset, value_len) in window.entries(chunk) {
+                let key_len = u16::try_from(key.len()).expect("read_entries checked it");
+                filler.push(
+                    key,
+                    Entry {
+                        offset,
+                        value_len,
+                        key_len,
+                    },
+                );
+            }
+        });
     })?;
     if index.len() as u64 != trailer.count {
         return Err(hint::Invalid("a key appears twice"));
@@ -1838,6 +1866,41 @@ mod tests {
             })
         ));
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+    }
+
+    #[test]
+    fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        let mut batch = Batch::new();
+        for i in 0..3000u32 {
+            batch.set(
+                key(format!("k{i}").as_bytes()),
+                value(&vec![b'v'; 1 + i as usize % 7]),
+            );
+        }
+        store.write(batch).unwrap();
+        store.compact().unwrap();
+        drop(store);
+
+        let fs = OsFs;
+        let file = fs.open_existing(&tmp.path().join(HINT_FILE_NAME)).unwrap();
+        let log_len = log_bytes(tmp.path()).len() as u64;
+        let (one, len_one) = read_hint(&file, log_len, HINT_SIZES, u64::MAX).unwrap();
+        let small = hint::Sizes {
+            window_bytes: 4096,
+            chunk_entries: 50,
+        };
+        let (many, len_many) = read_hint(&file, log_len, small, 0).unwrap();
+
+        assert_eq!((len_one, len_many), (log_len, log_len));
+        assert_eq!(many.len(), 3000);
+        for i in 0..3000u32 {
+            let k = format!("k{i}");
+            assert_eq!(many.get(k.as_bytes()), one.get(k.as_bytes()), "{k}");
+        }
+        let store = Store::open(tmp.path()).unwrap();
+        store.verify().unwrap();
     }
 
     #[test]

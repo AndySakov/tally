@@ -116,13 +116,65 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     })
 }
 
-/// Calls `entry(key, offset, value_len)` for each entry, then checks the
-/// checksum and that the entries account for exactly `trailer`. On `Err`,
-/// whatever `entry` saw must be thrown away.
+/// How `read_entries` groups entries: windows of about `window_bytes`, each
+/// cut into chunks of `chunk_entries` that can be read independently.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Sizes {
+    pub window_bytes: usize,
+    pub chunk_entries: usize,
+}
+
+/// Entries whose lengths have been checked, in log order.
+#[derive(Debug, Default)]
+pub(crate) struct Window {
+    bytes: Vec<u8>,
+    chunks: Vec<Chunk>,
+}
+
+/// A run of entries in a `Window`: where its first starts in the window's
+/// bytes, the log offset of its record, and how many there are.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Chunk {
+    start: usize,
+    offset: u64,
+    count: usize,
+}
+
+impl Window {
+    pub(crate) fn chunks(&self) -> &[Chunk] {
+        &self.chunks
+    }
+
+    /// `(key, offset, value_len)` for each entry in `chunk`.
+    pub(crate) fn entries(&self, chunk: &Chunk) -> impl Iterator<Item = (&[u8], u64, u32)> {
+        let mut at = chunk.start;
+        let mut offset = chunk.offset;
+        (0..chunk.count).map(move |_| {
+            let bytes = &self.bytes[at..];
+            let key_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+            let value_len = u32::from_le_bytes(bytes[2..6].try_into().unwrap());
+            let key = &bytes[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + key_len];
+            let entry = (key, offset, value_len);
+            at += ENTRY_HEADER_LEN + key_len;
+            offset += (HEADER_LEN + key_len) as u64 + u64::from(value_len);
+            entry
+        })
+    }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.chunks.clear();
+    }
+}
+
+/// Checks each entry's lengths and passes them to `window` a window at a
+/// time, then checks the checksum and that the entries account for exactly
+/// `trailer`. On `Err`, whatever `window` saw must be thrown away.
 pub(crate) fn read_entries(
     file: &impl LogFile,
     trailer: Trailer,
-    mut entry: impl FnMut(Key, u64, u32),
+    sizes: Sizes,
+    mut window: impl FnMut(&Window),
 ) -> Result<(), Invalid> {
     let size = file.size()?;
     let mut reader = Checksummed {
@@ -141,6 +193,7 @@ pub(crate) fn read_entries(
     let mut count = 0u64;
     let mut header = [0u8; ENTRY_HEADER_LEN];
     let mut key = Vec::new();
+    let mut current = Window::default();
     while at < entries_end {
         if entries_end - at < ENTRY_HEADER_LEN as u64 {
             return Err(Invalid("torn entry"));
@@ -158,7 +211,7 @@ pub(crate) fn read_entries(
         if value_len == 0 || value_len as usize > MAX_VALUE_LEN {
             return Err(Invalid("bad value length"));
         }
-        let key = Key::try_from(&key[..]).map_err(|_| Invalid("bad key length"))?;
+        Key::try_from(&key[..]).map_err(|_| Invalid("bad key length"))?;
         let record_len = (HEADER_LEN + usize::from(key_len)) as u64 + u64::from(value_len);
         if offset
             .checked_add(record_len)
@@ -166,9 +219,25 @@ pub(crate) fn read_entries(
         {
             return Err(Invalid("entries run past the log length"));
         }
-        entry(key, offset, value_len);
+        match current.chunks.last_mut() {
+            Some(chunk) if chunk.count < sizes.chunk_entries => chunk.count += 1,
+            _ => current.chunks.push(Chunk {
+                start: current.bytes.len(),
+                offset,
+                count: 1,
+            }),
+        }
+        current.bytes.extend_from_slice(&header);
+        current.bytes.extend_from_slice(&key);
+        if current.bytes.len() >= sizes.window_bytes {
+            window(&current);
+            current.clear();
+        }
         offset += record_len;
         count += 1;
+    }
+    if !current.chunks.is_empty() {
+        window(&current);
     }
 
     let mut rest = [0u8; 16];
@@ -218,15 +287,46 @@ mod tests {
     }
 
     fn read(bytes: &[u8]) -> Result<Vec<(Vec<u8>, u64, u32)>, Invalid> {
+        read_in(bytes, BIG)
+    }
+
+    const BIG: Sizes = Sizes {
+        window_bytes: 1 << 20,
+        chunk_entries: 1 << 10,
+    };
+
+    /// Each window as a list of chunks, each chunk as its entries.
+    type Windows = Vec<Vec<Vec<(Vec<u8>, u64, u32)>>>;
+
+    fn windows(bytes: &[u8], sizes: Sizes) -> Result<Windows, Invalid> {
         let fs = MemFs::new();
         fs.put(Path::new("/hint"), bytes);
         let file = fs.open_existing(Path::new("/hint")).unwrap();
         let trailer = trailer(&file)?;
         let mut seen = Vec::new();
-        read_entries(&file, trailer, |key, offset, value_len| {
-            seen.push((key.as_bytes().to_vec(), offset, value_len))
+        read_entries(&file, trailer, sizes, |window| {
+            seen.push(
+                window
+                    .chunks()
+                    .iter()
+                    .map(|chunk| {
+                        window
+                            .entries(chunk)
+                            .map(|(key, offset, value_len)| (key.to_vec(), offset, value_len))
+                            .collect()
+                    })
+                    .collect(),
+            )
         })?;
         Ok(seen)
+    }
+
+    fn read_in(bytes: &[u8], sizes: Sizes) -> Result<Vec<(Vec<u8>, u64, u32)>, Invalid> {
+        Ok(windows(bytes, sizes)?
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect())
     }
 
     #[test]
@@ -248,6 +348,29 @@ mod tests {
             read(&bytes),
             Ok(vec![(b"a".to_vec(), 0, 2), (b"bc".to_vec(), 18, 1)])
         );
+    }
+
+    #[test]
+    fn entries_are_cut_into_windows_and_chunks_in_log_order() {
+        // Entries of 7, 8, 7, 8 and 7 bytes; windows close at 15 bytes.
+        let bytes = write(
+            &[(b"a", 2), (b"bc", 1), (b"d", 1), (b"ef", 3), (b"g", 1)],
+            18 + 18 + 17 + 20 + 17,
+        );
+        let sizes = Sizes {
+            window_bytes: 15,
+            chunk_entries: 1,
+        };
+        let e = |key: &[u8], offset, value_len| (key.to_vec(), offset, value_len);
+        assert_eq!(
+            windows(&bytes, sizes),
+            Ok(vec![
+                vec![vec![e(b"a", 0, 2)], vec![e(b"bc", 18, 1)]],
+                vec![vec![e(b"d", 36, 1)], vec![e(b"ef", 53, 3)]],
+                vec![vec![e(b"g", 73, 1)]],
+            ])
+        );
+        assert_eq!(read_in(&bytes, sizes), read(&bytes));
     }
 
     #[test]

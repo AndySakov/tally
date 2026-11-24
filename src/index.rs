@@ -6,10 +6,17 @@
 //! same slot, and no key is allocated. Two keys sharing a hash would share
 //! an entry. `get` checks the key stored in the record, so that would show
 //! up as a corruption error, never as another key's value.
+//!
+//! The map is split into 64 shards by the top bits of the hash, so `fill`
+//! can insert from several threads at once, and growing the map moves one
+//! shard at a time instead of the whole index.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use siphasher::sip128::SipHasher13;
 
@@ -21,9 +28,22 @@ pub(crate) struct Entry {
     pub key_len: u16,
 }
 
+const SHARD_BITS: u32 = 6;
+const SHARDS: usize = 1 << SHARD_BITS;
+/// Entries a `Filler` holds per shard before taking the shard's lock.
+const FLUSH_AT: usize = 256;
+
+type Map = HashMap<u128, Entry, BuildHasherDefault<LowBits>>;
+
 pub(crate) struct Index {
-    map: HashMap<u128, Entry, BuildHasherDefault<LowBits>>,
+    shards: Vec<Map>,
     hasher: KeyHasher,
+}
+
+/// The top bits: each shard's map places entries by the low bits, which
+/// would all be equal within a shard chosen by them.
+fn shard_of(hash: u128) -> usize {
+    (hash >> (128 - SHARD_BITS)) as usize
 }
 
 enum KeyHasher {
@@ -52,8 +72,11 @@ impl Index {
         // std's RandomState is keyed from the OS's randomness; what it
         // hashes to is as unpredictable as its key.
         let seed = RandomState::new();
+        let per_shard = capacity.div_ceil(SHARDS);
         Index {
-            map: HashMap::with_capacity_and_hasher(capacity, Default::default()),
+            shards: (0..SHARDS)
+                .map(|_| HashMap::with_capacity_and_hasher(per_shard, Default::default()))
+                .collect(),
             hasher: KeyHasher::Sip(SipHasher13::new_with_keys(
                 seed.hash_one(0u8),
                 seed.hash_one(1u8),
@@ -64,43 +87,112 @@ impl Index {
     #[cfg(test)]
     pub(crate) fn weak() -> Index {
         Index {
-            map: HashMap::default(),
+            shards: (0..SHARDS).map(|_| Map::default()).collect(),
             hasher: KeyHasher::Weak,
         }
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<&Entry> {
-        self.map.get(&self.hasher.hash(key))
+        let hash = self.hasher.hash(key);
+        self.shards[shard_of(hash)].get(&hash)
     }
 
     pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
-        self.map.get_mut(&self.hasher.hash(key))
+        let hash = self.hasher.hash(key);
+        self.shards[shard_of(hash)].get_mut(&hash)
     }
 
     pub(crate) fn contains(&self, key: &[u8]) -> bool {
-        self.map.contains_key(&self.hasher.hash(key))
+        self.get(key).is_some()
     }
 
     /// Points `key` at `entry`, returning the entry it replaced.
     pub(crate) fn insert(&mut self, key: &[u8], entry: Entry) -> Option<Entry> {
-        self.map.insert(self.hasher.hash(key), entry)
+        let hash = self.hasher.hash(key);
+        self.shards[shard_of(hash)].insert(hash, entry)
     }
 
     pub(crate) fn remove(&mut self, key: &[u8]) -> Option<Entry> {
-        self.map.remove(&self.hasher.hash(key))
+        let hash = self.hasher.hash(key);
+        self.shards[shard_of(hash)].remove(&hash)
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.map.len()
+        self.shards.iter().map(Map::len).sum()
     }
 
     pub(crate) fn values(&self) -> impl Iterator<Item = &Entry> {
-        self.map.values()
+        self.shards.iter().flat_map(Map::values)
     }
 
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
-        self.map.capacity()
+        self.shards.iter().map(Map::capacity).sum()
+    }
+
+    /// Runs `job` on every element of `jobs`, spread over `threads` threads
+    /// (the calling thread is one of them), inserting what each pushes into
+    /// its `Filler`. For keys no two jobs share: if two do, which entry wins
+    /// is not defined.
+    pub(crate) fn fill<J: Sync>(
+        &mut self,
+        threads: usize,
+        jobs: &[J],
+        job: impl Fn(&J, &mut Filler<'_>) + Sync,
+    ) {
+        let shards: Vec<Mutex<Map>> = self.shards.drain(..).map(Mutex::new).collect();
+        let next = AtomicUsize::new(0);
+        let work = || {
+            let mut filler = Filler {
+                hasher: &self.hasher,
+                shards: &shards,
+                pending: vec![Vec::new(); SHARDS],
+            };
+            while let Some(j) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                job(j, &mut filler);
+            }
+            filler.flush_all();
+        };
+        thread::scope(|scope| {
+            for _ in 1..threads.min(jobs.len()) {
+                scope.spawn(work);
+            }
+            work();
+        });
+        self.shards = shards
+            .into_iter()
+            .map(|shard| shard.into_inner().expect("no filler panicked"))
+            .collect();
+    }
+}
+
+/// Where one `fill` thread puts entries. Holds a few per shard so it takes
+/// each shard's lock once per batch, not once per entry.
+pub(crate) struct Filler<'a> {
+    hasher: &'a KeyHasher,
+    shards: &'a [Mutex<Map>],
+    pending: Vec<Vec<(u128, Entry)>>,
+}
+
+impl Filler<'_> {
+    pub(crate) fn push(&mut self, key: &[u8], entry: Entry) {
+        let hash = self.hasher.hash(key);
+        let shard = shard_of(hash);
+        self.pending[shard].push((hash, entry));
+        if self.pending[shard].len() >= FLUSH_AT {
+            self.flush(shard);
+        }
+    }
+
+    fn flush(&mut self, shard: usize) {
+        let mut map = self.shards[shard].lock().expect("no filler panicked");
+        map.extend(self.pending[shard].drain(..));
+    }
+
+    fn flush_all(&mut self) {
+        for shard in 0..SHARDS {
+            self.flush(shard);
+        }
     }
 }
 
@@ -157,6 +249,38 @@ mod tests {
     #[test]
     fn with_capacity_reserves_up_front() {
         assert!(Index::with_capacity(1000).capacity() >= 1000);
+    }
+
+    #[test]
+    fn fill_on_many_threads_builds_the_index_inserts_would() {
+        let keys: Vec<Vec<u8>> = (0..10_000u32).map(|i| i.to_le_bytes().to_vec()).collect();
+        let jobs: Vec<&[Vec<u8>]> = keys.chunks(37).collect();
+        let mut filled = Index::new();
+        filled.fill(4, &jobs, |chunk, filler| {
+            for key in *chunk {
+                filler.push(
+                    key,
+                    entry(u64::from_le_bytes([
+                        key[0], key[1], key[2], key[3], 0, 0, 0, 0,
+                    ])),
+                );
+            }
+        });
+
+        assert_eq!(filled.len(), 10_000);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(filled.get(key), Some(&entry(i as u64)), "key {i}");
+        }
+        assert_eq!(filled.get(&10_000u32.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn fill_with_no_jobs_leaves_the_index_as_it_was() {
+        let mut index = Index::new();
+        index.insert(b"a", entry(0));
+        index.fill(4, &[] as &[u8], |_, _| unreachable!());
+        assert_eq!(index.get(b"a"), Some(&entry(0)));
+        assert_eq!(index.len(), 1);
     }
 
     #[test]
