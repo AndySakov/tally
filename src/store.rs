@@ -1,13 +1,13 @@
 use std::fs::File;
 use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::{collections::HashMap, fs};
 
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
-use crate::{CorruptionReason, Error, Key, Value};
+use crate::{CorruptionReason, DecodeError, Error, Key, Value};
 
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 
@@ -18,6 +18,18 @@ type Index = HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>;
 struct Entry {
     offset: u64,
     value_len: u32,
+}
+
+/// What `Store::repair` moved out of the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repaired {
+    /// Offset of the first bad record, where the log now ends.
+    pub offset: u64,
+    /// Bytes moved out of the log: everything from `offset` to the old end.
+    pub dropped: u64,
+    /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
+    /// store directory.
+    pub side_file: PathBuf,
 }
 
 /// An open store: the log file plus an in-memory index of every live key.
@@ -35,8 +47,9 @@ impl Store {
     /// Creating either one requires an fsync of its parent directory (see
     /// DESIGN.md, New files).
     ///
-    /// Milestone 1: any record that fails to decode fails `open` with its
-    /// offset. Truncating a torn tail comes in milestone 2.
+    /// A torn or zero-filled tail is truncated, fsynced and logged as a
+    /// warning before `open` returns. Any other bad record fails `open` with
+    /// its offset; `repair` handles those (DESIGN.md, Recovery).
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
         let dir = dir.as_ref();
         let file_path = dir.join(LOG_FILE_NAME);
@@ -64,12 +77,58 @@ impl Store {
             }
         }
         let len = file.metadata()?.len();
-        let index = load_index(&file, len)?;
-        Ok(Store {
-            file,
-            end: len,
-            index,
-        })
+        let (index, end) = load_index(&file, len)?;
+        if end < len {
+            file.set_len(end)?;
+            sync(&file);
+            log::warn!(
+                "truncated a torn tail at offset {end}: dropped {} bytes",
+                len - end
+            );
+        }
+        Ok(Store { file, end, index })
+    }
+
+    /// Makes a log that `open` refuses openable again, without opening it.
+    ///
+    /// Returns `None` if `open` would succeed (a torn tail is left for
+    /// `open` to truncate). On a corrupt record, saves every byte from it to
+    /// the end of the log in a side file, fsyncs the side file and the
+    /// directory, then truncates the log at the record and fsyncs it.
+    /// Unsupported records are an error, not something to repair: a newer
+    /// tally can read them. Fails with `Locked` while a `Store` is open.
+    pub fn repair(dir: impl AsRef<Path>) -> Result<Option<Repaired>, Error> {
+        let dir = dir.as_ref();
+        let file_path = dir.join(LOG_FILE_NAME);
+        let file = File::options().read(true).append(true).open(&file_path)?;
+        if let Err(err) = file.try_lock() {
+            match err {
+                fs::TryLockError::Error(error) => return Err(Error::Io(error)),
+                fs::TryLockError::WouldBlock => return Err(Error::Locked),
+            }
+        }
+        let len = file.metadata()?.len();
+        let offset = match load_index(&file, len) {
+            Ok(_) => return Ok(None),
+            Err(Error::Corruption { offset, .. }) => offset,
+            Err(err) => return Err(err),
+        };
+
+        let side_file = dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"));
+        let mut side = File::create(&side_file)?;
+        let mut tail = &file;
+        tail.seek(SeekFrom::Start(offset))?;
+        io::copy(&mut tail.take(len - offset), &mut side)?;
+        sync(&side);
+        sync_dir(dir)?;
+
+        file.set_len(offset)?;
+        sync(&file);
+        Ok(Some(Repaired {
+            offset,
+            dropped: len - offset,
+            side_file,
+        }))
     }
 
     fn append(&mut self, record: &Record) -> Result<u64, Error> {
@@ -174,7 +233,7 @@ fn load_record(file: &File, offset: u64) -> Result<(Header, Record), Error> {
 
 /// Reads every record in `file` from offset 0 to `len` and returns the index
 /// they describe.
-fn load_index(file: &File, len: u64) -> Result<Index, Error> {
+fn load_index(file: &File, len: u64) -> Result<(Index, u64), Error> {
     let mut index = Index::default();
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = vec![];
@@ -183,15 +242,34 @@ fn load_index(file: &File, len: u64) -> Result<Index, Error> {
     buffer.seek(SeekFrom::Start(0))?;
 
     while offset < len {
+        if len - offset < HEADER_LEN as u64 {
+            return Ok((index, offset));
+        }
         buffer.read_exact(&mut header_buf)?;
-        let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
-        // read_exact would also fail, but only after allocating up to 16 MiB.
+        let header = match decode_header(&header_buf) {
+            Ok(header) => header,
+            Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum))
+                if all_zero(&header_buf) && rest_is_zero(&mut buffer)? =>
+            {
+                return Ok((index, offset));
+            }
+            Err(err) => return Err(err.at(offset)),
+        };
         if len - offset < header.record_len() {
-            return Err(io::Error::from(ErrorKind::UnexpectedEof).into());
+            return Ok((index, offset));
         }
         payload_buf.resize(header.payload_len(), 0u8);
         buffer.read_exact(&mut payload_buf)?;
-        match decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))? {
+        let op = match decode_index_op(header, &payload_buf) {
+            Ok(op) => op,
+            Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
+                if all_zero(&payload_buf) && rest_is_zero(&mut buffer)? =>
+            {
+                return Ok((index, offset));
+            }
+            Err(err) => return Err(err.at(offset)),
+        };
+        match op {
             IndexOp::Set { key, value_len } => {
                 index.insert(key.into_bytes(), Entry { offset, value_len });
             }
@@ -201,7 +279,26 @@ fn load_index(file: &File, len: u64) -> Result<Index, Error> {
         }
         offset += header.record_len();
     }
-    Ok(index)
+    Ok((index, offset))
+}
+
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|&b| b == 0)
+}
+
+/// Reads `reader` to the end in chunks and reports whether every byte was
+/// zero. A preallocated log can be gigabytes of zeros, so nothing is kept.
+fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(n) if !all_zero(&chunk[..n]) => return Ok(false),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Flushes `file` to disk. Panics on failure: after a failed fsync the
@@ -234,7 +331,7 @@ mod tests {
     use super::*;
     use crate::record::tests::{DELETE_A, SET_A_HI};
     use crate::record::{Record, encode};
-    use crate::{CorruptionReason, Error};
+    use crate::{CorruptionReason, Error, UnsupportedReason};
 
     fn key(bytes: &[u8]) -> Key {
         Key::try_from(bytes).unwrap()
@@ -300,83 +397,260 @@ mod tests {
         ));
     }
 
-    fn open_log(bytes: &[u8]) -> Result<Store, Error> {
+    /// A store directory whose log holds exactly `bytes`.
+    fn store_with_log(bytes: &[u8]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(log_path(tmp.path()), bytes).unwrap();
-        Store::open(tmp.path())
+        tmp
     }
 
     fn set_a_hi_then(tail: &[u8]) -> Vec<u8> {
         [SET_A_HI.as_slice(), tail].concat()
     }
 
+    /// DELETE_A's header with its payload (the key) zeroed: the header
+    /// reached the disk but the payload did not.
+    fn delete_a_with_a_zero_payload() -> Vec<u8> {
+        let mut bytes = DELETE_A.to_vec();
+        bytes[HEADER_LEN] = 0;
+        bytes
+    }
+
+    // recovery: torn and zero-filled tails are truncated
+
     #[test]
-    fn open_fails_on_a_torn_header() {
-        let bytes = set_a_hi_then(&DELETE_A[..14]);
-        assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
-        ));
+    fn open_truncates_a_torn_header() {
+        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..14]));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
     }
 
     #[test]
-    fn open_fails_on_a_torn_payload() {
-        let bytes = set_a_hi_then(&DELETE_A[..15]);
-        assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof
-        ));
+    fn open_truncates_a_torn_payload() {
+        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..15]));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
     }
 
     #[test]
-    fn open_fails_on_a_zero_filled_tail_with_its_offset() {
-        let bytes = set_a_hi_then(&[0u8; 16]);
-        assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Corruption {
-                offset: 18,
-                reason: CorruptionReason::HeaderChecksum
-            })
-        ));
+    fn open_truncates_a_zero_filled_tail_shorter_than_a_header() {
+        let tmp = store_with_log(&set_a_hi_then(&[0u8; 5]));
+        Store::open(tmp.path()).unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn open_truncates_a_zero_filled_tail() {
+        let tmp = store_with_log(&set_a_hi_then(&[0u8; 4096]));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn open_truncates_a_log_that_is_all_zeros() {
+        let tmp = store_with_log(&[0u8; 4096]);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(log_bytes(tmp.path()), b"");
+    }
+
+    #[test]
+    fn open_truncates_a_record_whose_payload_is_zeros() {
+        let tmp = store_with_log(&set_a_hi_then(&delete_a_with_a_zero_payload()));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn writes_after_recovery_land_where_the_tail_was_cut() {
+        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..14]));
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.delete(key(b"a")).unwrap();
+        drop(store);
+        assert_eq!(log_bytes(tmp.path()), set_a_hi_then(&DELETE_A));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+    }
+
+    #[test]
+    fn recovery_is_idempotent() {
+        let tmp = store_with_log(&set_a_hi_then(&[0u8; 32]));
+        drop(Store::open(tmp.path()).unwrap());
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    // recovery: anything else fails open and leaves the log alone
+
+    fn assert_open_fails_untouched(bytes: &[u8], offset: u64, reason: CorruptionReason) {
+        let tmp = store_with_log(bytes);
+        let err = Store::open(tmp.path()).err().expect("open must fail");
+        assert!(
+            matches!(err, Error::Corruption { offset: o, reason: r } if o == offset && r == reason),
+            "expected corruption at {offset} ({reason}), got {err:?}"
+        );
+        assert_eq!(log_bytes(tmp.path()), bytes);
+    }
+
+    #[test]
+    fn open_fails_on_a_zero_filled_region_before_a_valid_record() {
+        let bytes = [SET_A_HI.as_slice(), &[0u8; 16], DELETE_A.as_slice()].concat();
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
+    }
+
+    #[test]
+    fn open_fails_on_a_zero_payload_before_a_valid_record() {
+        let bytes = [
+            SET_A_HI.as_slice(),
+            &delete_a_with_a_zero_payload(),
+            DELETE_A.as_slice(),
+        ]
+        .concat();
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::PayloadChecksum);
+    }
+
+    #[test]
+    fn open_fails_on_a_garbage_tail_with_its_offset() {
+        assert_open_fails_untouched(
+            &set_a_hi_then(&[0xab; 16]),
+            18,
+            CorruptionReason::HeaderChecksum,
+        );
     }
 
     #[test]
     fn open_fails_on_a_corrupted_header_checksum_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
         bytes[18] ^= 0x01;
-        assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Corruption {
-                offset: 18,
-                reason: CorruptionReason::HeaderChecksum
-            })
-        ));
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_length_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
         bytes[18 + 7] ^= 0x01; // second record's value_len: 0 -> 1
-        assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Corruption {
-                offset: 18,
-                reason: CorruptionReason::HeaderChecksum
-            })
-        ));
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_key_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
         bytes[18 + 15] ^= 0x01; // second record's key: "a" -> "`"
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::PayloadChecksum);
+    }
+
+    #[test]
+    fn open_fails_on_an_unsupported_tail_record_and_leaves_it() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 4] = 9; // second record's type: unknown
+        fix_header_checksum(&mut bytes[18..18 + HEADER_LEN]);
+        let tmp = store_with_log(&bytes);
         assert!(matches!(
-            open_log(&bytes),
-            Err(Error::Corruption {
+            Store::open(tmp.path()),
+            Err(Error::Unsupported {
                 offset: 18,
-                reason: CorruptionReason::PayloadChecksum
+                reason: UnsupportedReason::UnknownType(9)
             })
         ));
+        assert_eq!(log_bytes(tmp.path()), bytes);
+    }
+
+    fn fix_header_checksum(header: &mut [u8]) {
+        let checksum = crc32c::crc32c(&header[4..HEADER_LEN]);
+        header[..4].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    // repair
+
+    fn side_file(dir: &Path, offset: u64) -> PathBuf {
+        dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"))
+    }
+
+    /// SET_A_HI, then a Delete of "a" with its key corrupted, then a Set of
+    /// "b": the bad record at 18 hides the valid one after it.
+    fn log_with_a_corrupt_middle() -> Vec<u8> {
+        let mut delete = DELETE_A.to_vec();
+        delete[HEADER_LEN] ^= 0x01;
+        let mut set_b = Vec::new();
+        encode(
+            &Record::Set {
+                key: key(b"b"),
+                value: value(b"2"),
+            },
+            &mut set_b,
+        );
+        [SET_A_HI.as_slice(), &delete, &set_b].concat()
+    }
+
+    #[test]
+    fn repair_of_an_intact_log_does_nothing() {
+        let bytes = set_a_hi_then(&DELETE_A);
+        let tmp = store_with_log(&bytes);
+        assert_eq!(Store::repair(tmp.path()).unwrap(), None);
+        assert_eq!(log_bytes(tmp.path()), bytes);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn repair_leaves_a_torn_tail_for_open() {
+        let bytes = set_a_hi_then(&DELETE_A[..14]);
+        let tmp = store_with_log(&bytes);
+        assert_eq!(Store::repair(tmp.path()).unwrap(), None);
+        assert_eq!(log_bytes(tmp.path()), bytes);
+    }
+
+    #[test]
+    fn repair_moves_the_corrupt_record_and_everything_after_it_to_a_side_file() {
+        let bytes = log_with_a_corrupt_middle();
+        let tmp = store_with_log(&bytes);
+        assert_eq!(
+            Store::repair(tmp.path()).unwrap(),
+            Some(Repaired {
+                offset: 18,
+                dropped: 33,
+                side_file: side_file(tmp.path(), 18),
+            })
+        );
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+    }
+
+    #[test]
+    fn repair_is_idempotent() {
+        let bytes = log_with_a_corrupt_middle();
+        let tmp = store_with_log(&bytes);
+        Store::repair(tmp.path()).unwrap();
+        assert_eq!(Store::repair(tmp.path()).unwrap(), None);
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+    }
+
+    #[test]
+    fn repair_refuses_an_unsupported_record() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[18 + 4] = 9;
+        fix_header_checksum(&mut bytes[18..18 + HEADER_LEN]);
+        let tmp = store_with_log(&bytes);
+        assert!(matches!(
+            Store::repair(tmp.path()),
+            Err(Error::Unsupported { offset: 18, .. })
+        ));
+        assert_eq!(log_bytes(tmp.path()), bytes);
+    }
+
+    #[test]
+    fn repair_is_locked_out_while_the_store_is_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _store = Store::open(tmp.path()).unwrap();
+        assert!(matches!(Store::repair(tmp.path()), Err(Error::Locked)));
     }
 
     // set and get
