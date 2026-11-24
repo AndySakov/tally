@@ -2,24 +2,18 @@
 //!
 //! - Undamaged: `open` succeeds and every key reads back the value the
 //!   records describe.
-//! - One byte changed: `open` fails with corruption at the start of the
-//!   record holding the byte. CRC32C catches any change confined to 32 bits,
-//!   and the byte is covered by the header checksum if it lies in the first
-//!   15 bytes of its record, or the payload checksum otherwise.
-//! - Truncated at a record boundary: `open` succeeds with the state of the
-//!   records that remain.
-//! - Truncated mid-record: `open` fails with `UnexpectedEof`.
-//! - Zero bytes appended: fewer than a header fail with `UnexpectedEof`; a
-//!   header or more fail with a header checksum error at the old end.
-//!
-//! The last two are milestone 1 behaviour. In milestone 2 a torn or
-//! zero-filled tail is truncated, and `open` must succeed with the state of
-//! the complete records.
+//! - Truncated anywhere, or zero bytes appended: `open` succeeds with the
+//!   state of the complete records and truncates the log after the last one.
+//! - One byte changed: the record holding it fails its header checksum (if
+//!   the byte is in its first 15 bytes) or its payload checksum. CRC32C
+//!   catches any change confined to 32 bits. If every byte that checksum
+//!   covers, through to the end of the log, is zero, the record is a torn
+//!   tail and is truncated; otherwise `open` fails with corruption at the
+//!   start of the record and leaves the log alone.
 
 #![no_main]
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
@@ -53,8 +47,8 @@ fn key(k: u8) -> Key {
 }
 
 enum Expect {
-    Opens(State),
-    Torn,
+    /// `open` succeeds with this state and leaves the log `len` bytes long.
+    Opens { state: State, len: usize },
     Corrupt {
         offset: u64,
         reason: CorruptionReason,
@@ -92,13 +86,17 @@ fuzz_target!(|input: Input| {
     }
 
     let expect = match input.damage {
-        Damage::None => Expect::Opens(state),
+        Damage::None => Expect::Opens {
+            state,
+            len: log.len(),
+        },
         Damage::Truncate { at } => {
             let len = at as usize % (log.len() + 1);
             log.truncate(len);
-            match boundaries.iter().position(|&b| b == len) {
-                Some(i) => Expect::Opens(states.swap_remove(i)),
-                None => Expect::Torn,
+            let i = boundaries.iter().rposition(|&b| b <= len).unwrap();
+            Expect::Opens {
+                state: states.swap_remove(i),
+                len: boundaries[i],
             }
         }
         Damage::ChangeByte { at, mask } => {
@@ -107,65 +105,69 @@ fuzz_target!(|input: Input| {
             }
             let i = at as usize % log.len();
             log[i] ^= mask;
-            let start = *boundaries.iter().rev().find(|&&b| b <= i).unwrap();
-            let reason = if i - start < HEADER_LEN {
-                CorruptionReason::HeaderChecksum
+            let r = boundaries.iter().rposition(|&b| b <= i).unwrap();
+            let start = boundaries[r];
+            let (covered_from, reason) = if i - start < HEADER_LEN {
+                (start, CorruptionReason::HeaderChecksum)
             } else {
-                CorruptionReason::PayloadChecksum
+                (start + HEADER_LEN, CorruptionReason::PayloadChecksum)
             };
-            Expect::Corrupt {
-                offset: start as u64,
-                reason,
+            if log[covered_from..].iter().all(|&b| b == 0) {
+                Expect::Opens {
+                    state: states.swap_remove(r),
+                    len: start,
+                }
+            } else {
+                Expect::Corrupt {
+                    offset: start as u64,
+                    reason,
+                }
             }
         }
         Damage::ZeroTail { len } => {
-            if len == 0 {
-                return;
-            }
             let end = log.len();
             log.resize(end + len as usize, 0);
-            if (len as usize) < HEADER_LEN {
-                Expect::Torn
-            } else {
-                Expect::Corrupt {
-                    offset: end as u64,
-                    reason: CorruptionReason::HeaderChecksum,
-                }
-            }
+            Expect::Opens { state, len: end }
         }
     };
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("tally.log"), &log).unwrap();
+    let path = dir.path().join("tally.log");
+    std::fs::write(&path, &log).unwrap();
     let opened = Store::open(dir.path());
 
     match expect {
-        Expect::Opens(state) => {
-            let store = opened.expect("an intact log must open");
+        Expect::Opens { state, len } => {
+            let store = opened.expect("a log with only a torn tail must open");
             for k in 0..=u8::MAX {
-                let got = store.get(&key(k)).expect("an intact log must read back");
+                let got = store.get(&key(k)).expect("a recovered log must read back");
                 assert_eq!(
                     got.as_ref().map(Value::as_bytes),
                     state.get(&k).map(Vec::as_slice)
                 );
             }
+            let on_disk = std::fs::metadata(&path).unwrap().len();
+            assert_eq!(
+                on_disk, len as u64,
+                "open must truncate after the last record"
+            );
         }
-        Expect::Torn => match opened {
-            Err(Error::Io(e)) if e.kind() == ErrorKind::UnexpectedEof => {}
-            other => panic!(
-                "a torn tail must fail with UnexpectedEof, got {:?}",
-                other.err()
-            ),
-        },
-        Expect::Corrupt { offset, reason } => match opened {
-            Err(Error::Corruption {
-                offset: o,
-                reason: r,
-            }) if o == offset && r == reason => {}
-            other => panic!(
-                "expected corruption at {offset} ({reason}), got {:?}",
-                other.err()
-            ),
-        },
+        Expect::Corrupt { offset, reason } => {
+            match opened {
+                Err(Error::Corruption {
+                    offset: o,
+                    reason: r,
+                }) if o == offset && r == reason => {}
+                other => panic!(
+                    "expected corruption at {offset} ({reason}), got {:?}",
+                    other.err()
+                ),
+            }
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                log,
+                "a failed open must not touch the log"
+            );
+        }
     }
 });

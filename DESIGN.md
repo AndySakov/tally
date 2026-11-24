@@ -78,8 +78,6 @@ If the append fails partway (disk full, I/O error), `set` or `delete` truncates 
 
 ## Recovery (startup)
 
-Milestone 2. Until then `open` fails on any record it cannot decode, and a torn tail fails as an I/O `UnexpectedEof` with no offset, although it is damage, not an environment problem. The truncating branches below replace both.
-
 State: `pos = 0`, `len = file length`. Loop:
 
 1. `pos == len`: clean end, stop.
@@ -91,17 +89,23 @@ State: `pos = 0`, `len = file length`. Loop:
 7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key.
 8. `pos += 15 + key_len + value_len`. Repeat.
 
-After the loop, if a truncation happened: truncate the file to `pos`, `fsync`, and log the offset and number of bytes dropped. This must complete before the first new write. Otherwise the next append lands after the torn bytes, and the following startup sees mid-file corruption.
+After the loop, if a truncation happened: truncate the file to `pos`, `fsync`, and log a warning (`log` crate) with the offset and number of bytes dropped: `truncated a torn tail at offset 18: dropped 14 bytes`. The caller sees it only if it installs a logger. This must complete before the first new write. Otherwise the next append lands after the torn bytes, and the following startup sees mid-file corruption.
 
 Recovery is idempotent: a crash during recovery followed by a rerun yields the same result.
 
 ### Repair
 
-`open` never discards data outside the cases above. A separate `repair` command handles the rest:
+`open` never discards data outside the cases above. `Store::repair(dir) -> Result<Option<Repaired>, Error>` handles the rest:
 
-1. Copy the bytes from the bad record to EOF into a side file (`tally.log.corrupt-<offset>`).
-2. Truncate at the bad record and `fsync`.
-3. Report what was dropped.
+1. Take the same exclusive lock as `open`. While a `Store` is open, repair fails with `Locked`.
+2. Scan the log as `open` does. If `open` would succeed, return `None` and change nothing: a torn tail is left for `open` to truncate.
+3. An unsupported record is returned as the error, not repaired. A newer tally can read it, so dropping it would lose data.
+4. On a corrupt record at `offset`: write the bytes from `offset` to EOF to `tally.log.corrupt-<offset>` in the store directory, `fsync` it, and `fsync` the directory. Only then truncate the log at `offset` and `fsync` it. The side file is durable before any byte leaves the log.
+5. Return `Repaired { offset, dropped, side_file }`.
+
+Repair is idempotent. A crash before the truncate leaves the log as it was, and the rerun rewrites the same side file. After the truncate the log is clean, so a rerun returns `None`.
+
+Open question: if `tally.log.corrupt-<offset>` already exists from an earlier repair at the same offset (the log was cut there, new records were written, and the new record at that offset went bad too), overwriting it loses the earlier bytes. Refusing when it exists with different contents is the safe choice.
 
 Possible later improvement: when the record after the bad one parses cleanly, drop only the bad record.
 
@@ -163,6 +167,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
 | `foldhash`                 | index hasher, faster than SipHash |
+| `log`                      | the recovery warning; the caller picks the logger |
 | `tempfile` (dev)           | isolated directories for tests    |
 | `proptest` (dev)           | model and codec property tests    |
 | `criterion` (dev)          | benchmarks                        |
