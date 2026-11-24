@@ -17,5 +17,9 @@ tempfile = "3.27.0"
 name = "store"
 harness = false
 
+[[test]]
+name = "kill"
+harness = false
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

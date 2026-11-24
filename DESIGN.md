@@ -144,7 +144,7 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 
 ## Testing
 
-- **Kill test:** run the store as a child process, `kill -9` it at random points, reopen, and check every acknowledged write is present. This cannot detect a missing `fsync`, because the OS page cache survives process death.
+- **Kill test** (`tests/kill.rs`): the test binary runs itself as a child that applies a seeded sequence of set, delete and reopen, printing an ack after each `Ok`. The parent `kill -9`s it after a random delay, three times on the same directory without opening it in between, so kills also land in the next child's `open` and recovery. Then the parent opens the store and checks that `open` succeeds, that the state is that of every acknowledged operation with each round's in-flight operation applied or not, and that a write after recovery survives a reopen. `TALLY_KILL_RUNS` (default 20) and `TALLY_KILL_SEED`; CI runs 1,000 on Linux. This cannot detect a missing `fsync`, because the OS page cache survives process death.
 - **Power-cut simulation:** file I/O sits behind a trait. A test implementation tracks written bytes and synced bytes separately. A simulated power cut drops everything not synced.
 - **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
 - **Model test** (`tests/model.rs`): random sequences of set, get, delete and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
