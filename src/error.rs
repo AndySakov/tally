@@ -16,6 +16,7 @@ impl Display for Field {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CorruptionReason {
     HeaderChecksum,
     PayloadChecksum,
@@ -25,6 +26,9 @@ pub enum CorruptionReason {
     DeleteWithValue,
     KeyMismatch,
     NotASet,
+    /// Found by `Store::verify`: reading the whole log gives a different
+    /// index from the one in memory, or the log ends before the store's end.
+    IndexMismatch,
 }
 
 impl Display for CorruptionReason {
@@ -38,6 +42,7 @@ impl Display for CorruptionReason {
             CorruptionReason::DeleteWithValue => write!(f, "delete record has a value"),
             CorruptionReason::KeyMismatch => write!(f, "stored key does not match index"),
             CorruptionReason::NotASet => write!(f, "indexed record is not a set"),
+            CorruptionReason::IndexMismatch => write!(f, "index does not match the log"),
         }
     }
 }
@@ -213,6 +218,10 @@ mod tests {
             (
                 CorruptionReason::NotASet,
                 "corrupt record at offset 4096: indexed record is not a set",
+            ),
+            (
+                CorruptionReason::IndexMismatch,
+                "corrupt record at offset 4096: index does not match the log",
             ),
         ];
         for (reason, expected) in cases {
