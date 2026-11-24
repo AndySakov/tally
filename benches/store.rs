@@ -147,5 +147,25 @@ fn open(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, set, get, open);
+/// The pause a `set` or `delete` takes when it triggers compaction: every
+/// live record read back, rewritten, fsynced, renamed and the directory
+/// fsynced.
+fn compact(c: &mut Criterion) {
+    let mut group = c.benchmark_group("compact");
+    group.sample_size(samples(10));
+    for n in [10_000u64, 100_000] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), n, 100);
+        let mut store = Store::open(tmp.path()).unwrap();
+        group.throughput(Throughput::Elements(n));
+        group.bench_with_input(
+            BenchmarkId::new("live records, 100B values", n),
+            &n,
+            |b, _| b.iter(|| store.compact().unwrap()),
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, set, get, open, compact);
 criterion_main!(benches);

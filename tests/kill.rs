@@ -2,7 +2,7 @@
 //! random delay, and checks that no acknowledged write was lost.
 //!
 //! The test binary is its own child: with `TALLY_KILL_CHILD` set it runs a
-//! seeded sequence of set, delete and reopen against a store and prints
+//! seeded sequence of set, delete, reopen and compact against a store and prints
 //! `ack <i>` after each one returns `Ok`. The parent regenerates the same
 //! sequence from the seed, so it knows what every ack means.
 //!
@@ -29,7 +29,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tally::{Key, Store, Value};
+use tally::{AutoCompact, Key, Options, Store, Value};
 
 const CHILD_DIR: &str = "TALLY_KILL_CHILD";
 const CHILD_SEED: &str = "TALLY_KILL_CHILD_SEED";
@@ -45,6 +45,7 @@ enum Op {
     Set(u8, Vec<u8>),
     Delete(u8),
     Reopen,
+    Compact,
 }
 
 /// splitmix64: small, seedable, and good enough to pick test operations.
@@ -70,14 +71,15 @@ fn ops(seed: u64) -> impl Iterator<Item = Op> {
     let mut rng = Rng(seed);
     (0..MAX_OPS).map(move |i| {
         let k = rng.below(KEY_SPACE) as u8;
-        match rng.below(10) {
-            0..=5 => {
+        match rng.below(20) {
+            0..=11 => {
                 let len = 1 + rng.below(4096) as usize;
                 let tag = format!("{seed:x}-{i}-");
                 Op::Set(k, tag.bytes().cycle().take(len).collect())
             }
-            6..=8 => Op::Delete(k),
-            _ => Op::Reopen,
+            12..=17 => Op::Delete(k),
+            18 => Op::Reopen,
+            _ => Op::Compact,
         }
     })
 }
@@ -90,7 +92,7 @@ fn apply(state: &mut State, op: &Op) {
         Op::Delete(k) => {
             state.remove(k);
         }
-        Op::Reopen => {}
+        Op::Reopen | Op::Compact => {}
     }
 }
 
@@ -109,8 +111,16 @@ fn read_state(store: &Store) -> State {
         .collect()
 }
 
+/// Compacts whenever half the log is dead, so kills also land inside
+/// automatic compactions, during writes and during `open`.
+fn open(dir: &Path) -> Result<Store, tally::Error> {
+    let mut options = Options::default();
+    options.auto_compact = AutoCompact::new(50, 0);
+    Store::open_with(dir, options)
+}
+
 fn child(dir: &Path, seed: u64) {
-    let mut store = Store::open(dir).unwrap_or_else(|err| fail("open", err));
+    let mut store = open(dir).unwrap_or_else(|err| fail("open", err));
     println!("opened");
     for (i, op) in ops(seed).enumerate() {
         let what = format!("op {i}");
@@ -121,8 +131,9 @@ fn child(dir: &Path, seed: u64) {
             Op::Delete(k) => store.delete(key(k)).unwrap_or_else(|err| fail(&what, err)),
             Op::Reopen => {
                 drop(store);
-                store = Store::open(dir).unwrap_or_else(|err| fail(&what, err));
+                store = open(dir).unwrap_or_else(|err| fail(&what, err));
             }
+            Op::Compact => store.compact().unwrap_or_else(|err| fail(&what, err)),
         }
         println!("ack {i}");
     }

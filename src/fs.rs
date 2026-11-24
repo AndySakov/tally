@@ -30,7 +30,12 @@ pub trait Fs: sealed::Sealed {
     /// Opens an existing `path` for reading and appending.
     fn open_existing(&self, path: &Path) -> io::Result<Self::File>;
 
-    /// Makes the creation of names inside the directory `path` durable.
+    /// Atomically points the name `to` at the file `from` names, replacing
+    /// whatever `to` named. Durable only after `sync_dir` on the directory.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Makes every name created, replaced or renamed away inside the
+    /// directory `path` durable.
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 }
 
@@ -86,6 +91,10 @@ impl Fs for OsFs {
             .append(true)
             .open(path)
             .map(OsFile)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
     }
 
     fn sync_dir(&self, path: &Path) -> io::Result<()> {

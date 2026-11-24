@@ -22,6 +22,7 @@ enum Op {
     Get(u8),
     Delete(u8),
     Reopen,
+    Compact,
 }
 
 fn key_bytes(k: u8) -> [u8; 2] {
@@ -71,6 +72,13 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::Reopen => {
                 drop(store);
                 store = Store::open(dir.path()).unwrap();
+            }
+            Op::Compact => {
+                store.compact().unwrap();
+                expected_len = model
+                    .iter()
+                    .map(|(&k, v)| (HEADER_LEN + key_bytes(k).len() + v.len()) as u64)
+                    .sum();
             }
         }
         assert_eq!(log_len(dir.path()), expected_len);

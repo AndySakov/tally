@@ -333,21 +333,33 @@ impl Fs for MemFs {
         Ok(self.file(ino))
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.step();
+        let mut state = self.0.borrow_mut();
+        let disk = &mut state.disk;
+        let ino = disk.files.remove(from).ok_or(ErrorKind::NotFound)?;
+        disk.files.insert(to.to_path_buf(), ino);
+        Ok(())
+    }
+
+    /// The directory's durable entries become exactly its current ones, so
+    /// creations, replacements and renames away all land together.
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.step();
         let mut state = self.0.borrow_mut();
         let disk = &mut state.disk;
         disk.has_dir(path)?;
         let in_dir = |p: &Path| p.parent() == Some(path);
-        let dirs: Vec<PathBuf> = disk.dirs.iter().filter(|d| in_dir(d)).cloned().collect();
-        disk.durable_dirs.extend(dirs);
-        let files: Vec<(PathBuf, usize)> = disk
-            .files
-            .iter()
-            .filter(|(p, _)| in_dir(p))
-            .map(|(p, &ino)| (p.clone(), ino))
-            .collect();
-        disk.durable_files.extend(files);
+        disk.durable_dirs.retain(|d| !in_dir(d));
+        disk.durable_dirs
+            .extend(disk.dirs.iter().filter(|d| in_dir(d)).cloned());
+        disk.durable_files.retain(|p, _| !in_dir(p));
+        disk.durable_files.extend(
+            disk.files
+                .iter()
+                .filter(|(p, _)| in_dir(p))
+                .map(|(p, &ino)| (p.clone(), ino)),
+        );
         Ok(())
     }
 }
