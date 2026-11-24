@@ -132,26 +132,33 @@ impl Index {
 
     /// Runs `job` on every element of `jobs`, spread over `threads` threads
     /// (the calling thread is one of them), inserting what each pushes into
-    /// its `Filler`. For keys no two jobs share: if two do, which entry wins
-    /// is not defined.
+    /// its `Filler`, over any entry already there. For keys no two jobs
+    /// share: if two do, which entry wins is not defined. Returns how many
+    /// inserts replaced an entry at `floor` or later, so a caller filling
+    /// from `floor` on can tell a key it pushed twice.
     pub(crate) fn fill<J: Sync>(
         &mut self,
         threads: usize,
         jobs: &[J],
+        floor: u64,
         job: impl Fn(&J, &mut Filler<'_>) + Sync,
-    ) {
+    ) -> usize {
         let shards: Vec<Mutex<Map>> = self.shards.drain(..).map(Mutex::new).collect();
         let next = AtomicUsize::new(0);
+        let replaced = AtomicUsize::new(0);
         let work = || {
             let mut filler = Filler {
                 hasher: &self.hasher,
                 shards: &shards,
                 pending: vec![Vec::new(); SHARDS],
+                floor,
+                replaced: 0,
             };
             while let Some(j) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                 job(j, &mut filler);
             }
             filler.flush_all();
+            replaced.fetch_add(filler.replaced, Ordering::Relaxed);
         };
         thread::scope(|scope| {
             for _ in 1..threads.min(jobs.len()) {
@@ -163,6 +170,7 @@ impl Index {
             .into_iter()
             .map(|shard| shard.into_inner().expect("no filler panicked"))
             .collect();
+        replaced.into_inner()
     }
 }
 
@@ -172,6 +180,8 @@ pub(crate) struct Filler<'a> {
     hasher: &'a KeyHasher,
     shards: &'a [Mutex<Map>],
     pending: Vec<Vec<(u128, Entry)>>,
+    floor: u64,
+    replaced: usize,
 }
 
 impl Filler<'_> {
@@ -186,7 +196,14 @@ impl Filler<'_> {
 
     fn flush(&mut self, shard: usize) {
         let mut map = self.shards[shard].lock().expect("no filler panicked");
-        map.extend(self.pending[shard].drain(..));
+        for (hash, entry) in self.pending[shard].drain(..) {
+            if map
+                .insert(hash, entry)
+                .is_some_and(|old| old.offset >= self.floor)
+            {
+                self.replaced += 1;
+            }
+        }
     }
 
     fn flush_all(&mut self) {
@@ -256,7 +273,10 @@ mod tests {
         let keys: Vec<Vec<u8>> = (0..10_000u32).map(|i| i.to_le_bytes().to_vec()).collect();
         let jobs: Vec<&[Vec<u8>]> = keys.chunks(37).collect();
         let mut filled = Index::new();
-        filled.fill(4, &jobs, |chunk, filler| {
+        filled.insert(&keys[5], entry(1 << 40));
+        filled.insert(&keys[6], entry(99));
+        filled.insert(b"older", entry(3));
+        let replaced = filled.fill(4, &jobs, 100, |chunk, filler| {
             for key in *chunk {
                 filler.push(
                     key,
@@ -267,7 +287,9 @@ mod tests {
             }
         });
 
-        assert_eq!(filled.len(), 10_000);
+        assert_eq!(replaced, 1, "keys[6] was below the floor");
+        assert_eq!(filled.len(), 10_001);
+        assert_eq!(filled.get(b"older"), Some(&entry(3)));
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(filled.get(key), Some(&entry(i as u64)), "key {i}");
         }
@@ -278,7 +300,7 @@ mod tests {
     fn fill_with_no_jobs_leaves_the_index_as_it_was() {
         let mut index = Index::new();
         index.insert(b"a", entry(0));
-        index.fill(4, &[] as &[u8], |_, _| unreachable!());
+        assert_eq!(index.fill(4, &[] as &[u8], 0, |_, _| unreachable!()), 0);
         assert_eq!(index.get(b"a"), Some(&entry(0)));
         assert_eq!(index.len(), 1);
     }

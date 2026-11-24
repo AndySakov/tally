@@ -11,7 +11,7 @@ use std::path::Path;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use tally::fuzz::HEADER_LEN;
-use tally::{Batch, Key, Store, Value};
+use tally::{Batch, Key, Options, Store, Value};
 
 /// Few distinct keys, so overwrites and deletes hit live keys often.
 const KEY_SPACE: u8 = 8;
@@ -27,6 +27,14 @@ enum Op {
     Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
+/// Small segments, so writes roll into new ones and reads and reopens
+/// cross several.
+fn options() -> Options {
+    let mut options = Options::default();
+    options.segment_bytes = 100;
+    options
+}
+
 fn key_bytes(k: u8) -> [u8; 2] {
     [b'k', k]
 }
@@ -35,13 +43,23 @@ fn key(k: u8) -> Key {
     Key::try_from(&key_bytes(k)[..]).unwrap()
 }
 
+/// Bytes across the log's segment files, `tally.<20 digits>.log`.
 fn log_len(dir: &Path) -> u64 {
-    std::fs::metadata(dir.join("tally.log")).unwrap().len()
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
+        })
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
 }
 
 fuzz_target!(|ops: Vec<Op>| {
     let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open(dir.path()).unwrap();
+    let mut store = Store::open_with(dir.path(), options()).unwrap();
     let mut model: HashMap<u8, Vec<u8>> = HashMap::new();
     let mut expected_len = 0u64;
 
@@ -73,7 +91,7 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::Reopen => {
                 drop(store);
-                store = Store::open(dir.path()).unwrap();
+                store = Store::open_with(dir.path(), options()).unwrap();
             }
             Op::Batch(ops) => {
                 let mut batch = Batch::new();
@@ -114,7 +132,7 @@ fuzz_target!(|ops: Vec<Op>| {
     }
 
     drop(store);
-    let store = Store::open(dir.path()).unwrap();
+    let store = Store::open_with(dir.path(), options()).unwrap();
     for k in 0..KEY_SPACE {
         let got = store.get(&key(k)).unwrap();
         assert_eq!(

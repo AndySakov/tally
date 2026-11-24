@@ -353,6 +353,18 @@ impl Fs for MemFs {
             .ok_or(ErrorKind::NotFound.into())
     }
 
+    fn list(&self, path: &Path) -> io::Result<Vec<String>> {
+        let state = self.0.borrow();
+        state.disk.has_dir(path)?;
+        Ok(state
+            .disk
+            .files
+            .keys()
+            .filter(|file| file.parent() == Some(path))
+            .filter_map(|file| Some(file.file_name()?.to_str()?.to_owned()))
+            .collect())
+    }
+
     /// The directory's durable entries become exactly its current ones, so
     /// creations, replacements, renames away and removals all land together.
     fn sync_dir(&self, path: &Path) -> io::Result<()> {

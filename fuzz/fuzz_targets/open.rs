@@ -180,8 +180,9 @@ fuzz_target!(|input: Input| {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tally.log");
-    std::fs::write(&path, &log).unwrap();
+    std::fs::write(dir.path().join("tally.log"), &log).unwrap();
+    // `open` makes a log from before segments the segment at 0.
+    let path = dir.path().join("tally.00000000000000000000.log");
     let opened = Store::open(dir.path());
 
     match expect {

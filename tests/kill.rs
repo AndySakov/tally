@@ -132,10 +132,13 @@ fn read_state(store: &Store) -> State {
 }
 
 /// Compacts whenever half the log is dead, so kills also land inside
-/// automatic compactions, during writes and during `open`.
+/// automatic compactions, during writes and during `open`. Segments of
+/// 16 KiB, a few values each, so compactions clean some segments and keep
+/// others.
 fn open(dir: &Path) -> Result<Store, tally::Error> {
     let mut options = Options::default();
     options.auto_compact = AutoCompact::new(50, 0);
+    options.segment_bytes = 16 << 10;
     Store::open_with(dir, options)
 }
 
