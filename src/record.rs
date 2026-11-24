@@ -11,10 +11,24 @@ const _: () = assert!(
     "HEADER_LEN must match the field layout"
 );
 
+/// The payload of a Batch record: the byte length of the records after it
+/// that belong to the batch.
+pub const BATCH_PAYLOAD_LEN: u32 = 8;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Record {
-    Set { key: Key, value: Value },
-    Delete { key: Key },
+    Set {
+        key: Key,
+        value: Value,
+    },
+    Delete {
+        key: Key,
+    },
+    /// Starts a batch: the next `body_len` bytes are its Set and Delete
+    /// records, applied all together or not at all.
+    Batch {
+        body_len: u64,
+    },
 }
 
 #[repr(u8)]
@@ -22,6 +36,7 @@ pub enum Record {
 pub enum Kind {
     Set = 1,
     Delete = 2,
+    Batch = 3,
 }
 
 impl TryFrom<u8> for Kind {
@@ -32,6 +47,7 @@ impl TryFrom<u8> for Kind {
             0 => Err(DecodeError::Corrupt(CorruptionReason::ZeroType)),
             1 => Ok(Kind::Set),
             2 => Ok(Kind::Delete),
+            3 => Ok(Kind::Batch),
             byte => Err(DecodeError::Unsupported(UnsupportedReason::UnknownType(
                 byte,
             ))),
@@ -63,9 +79,14 @@ impl Header {
 /// Appends the encoded record to `buf`. Does not clear `buf` first.
 pub fn encode(record: &Record, buf: &mut Vec<u8>) {
     let mut header_bytes: [u8; HEADER_LEN] = [0u8; HEADER_LEN];
+    let body_len;
     let (kind, key_bytes, value_bytes): (Kind, &[u8], &[u8]) = match record {
         Record::Set { key, value } => (Kind::Set, key.as_bytes(), value.as_bytes()),
         Record::Delete { key } => (Kind::Delete, key.as_bytes(), &[]),
+        Record::Batch { body_len: len } => {
+            body_len = len.to_le_bytes();
+            (Kind::Batch, &[], &body_len)
+        }
     };
     let key_len = key_bytes.len();
     let value_len = value_bytes.len();
@@ -104,6 +125,18 @@ pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, DecodeError> {
     }
     let kind = Kind::try_from(bytes[4])?;
     let key_len = u16::from_le_bytes(bytes[5..7].try_into().unwrap());
+    if kind == Kind::Batch {
+        let value_len = u32::from_le_bytes(bytes[7..11].try_into().unwrap());
+        if key_len != 0 || value_len != BATCH_PAYLOAD_LEN {
+            return Err(DecodeError::Corrupt(CorruptionReason::BadBatch));
+        }
+        return Ok(Header {
+            kind,
+            key_len,
+            value_len,
+            payload_checksum: u32::from_le_bytes(bytes[11..15].try_into().unwrap()),
+        });
+    }
     if key_len == 0 {
         return Err(DecodeError::Corrupt(CorruptionReason::EmptyKey));
     }
@@ -152,6 +185,7 @@ pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeEr
                 .expect("decode_header validated value_len"),
         }),
         IndexOp::Delete { key } => Ok(Record::Delete { key }),
+        IndexOp::Batch { body_len } => Ok(Record::Batch { body_len }),
     }
 }
 
@@ -160,6 +194,7 @@ pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeEr
 pub enum IndexOp {
     Set { key: Key, value_len: u32 },
     Delete { key: Key },
+    Batch { body_len: u64 },
 }
 
 /// Checks the payload CRC and returns what the record does to the index,
@@ -175,6 +210,10 @@ pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, Decode
     if header.payload_checksum != crc32c(payload) {
         return Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum));
     }
+    if header.kind == Kind::Batch {
+        let body_len = u64::from_le_bytes(payload.try_into().expect("decode_header checked it"));
+        return Ok(IndexOp::Batch { body_len });
+    }
     let key_bytes = &payload[..header.key_len as usize];
     let key = Key::try_from(key_bytes).expect("decode_header validated key_len");
     Ok(match header.kind {
@@ -183,6 +222,7 @@ pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, Decode
             value_len: header.value_len,
         },
         Kind::Delete => IndexOp::Delete { key },
+        Kind::Batch => unreachable!("returned above"),
     })
 }
 
@@ -212,8 +252,47 @@ pub(crate) mod tests {
         0x61, // key: "a"
     ];
 
+    /// A Batch record whose body is 34 bytes: SET_A_HI then DELETE_A.
+    pub(crate) const BATCH_34: [u8; 23] = [
+        0x4c, 0x3a, 0x23, 0x67, // header_checksum
+        0x03, // kind: Batch
+        0x00, 0x00, // key_len: 0
+        0x08, 0x00, 0x00, 0x00, // value_len: 8
+        0x5d, 0x2d, 0x50, 0x13, // payload_checksum
+        0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // body_len: 34
+    ];
+
     fn key(bytes: &[u8]) -> Key {
         Key::try_from(bytes).unwrap()
+    }
+
+    #[test]
+    fn encode_a_batch_record() {
+        let mut buf = Vec::new();
+        encode(&Record::Batch { body_len: 34 }, &mut buf);
+        assert_eq!(buf, BATCH_34);
+    }
+
+    #[test]
+    fn decode_a_batch_record() {
+        let header = decode_header(header_of(&BATCH_34)).unwrap();
+        assert_eq!(header.record_len(), 23);
+        assert_eq!(
+            decode_payload(header, &BATCH_34[HEADER_LEN..]),
+            Ok(Record::Batch { body_len: 34 })
+        );
+    }
+
+    #[test]
+    fn a_batch_header_needs_no_key_and_an_8_byte_payload() {
+        for (key_len, value_len) in [(1, 8), (0, 7), (0, 9), (0, 0)] {
+            assert_eq!(
+                decode_header(&header_bytes(3, key_len, value_len, 0)),
+                Err(DecodeError::Corrupt(CorruptionReason::BadBatch)),
+                "key_len {key_len}, value_len {value_len}"
+            );
+        }
+        assert!(decode_header(&header_bytes(3, 0, 8, 0)).is_ok());
     }
 
     fn value(bytes: &[u8]) -> Value {
@@ -616,10 +695,11 @@ pub(crate) mod tests {
             fn decode_header_accepts_exactly_the_valid_headers(
                 kind in 0u8..5,
                 key_len in prop_oneof![0u16..4, 1020u16..1030, Just(u16::MAX)],
-                value_len in prop_oneof![0u32..4, 16_777_210u32..16_777_220, Just(u32::MAX)],
+                value_len in prop_oneof![0u32..4, Just(8), 16_777_210u32..16_777_220, Just(u32::MAX)],
                 payload_checksum in any::<u32>(),
             ) {
-                let valid = matches!(kind, 1 | 2)
+                let batch = kind == 3 && key_len == 0 && value_len == 8;
+                let valid = batch || matches!(kind, 1 | 2)
                     && key_len != 0
                     && key_len as usize <= MAX_KEY_LEN
                     && value_len as usize <= MAX_VALUE_LEN

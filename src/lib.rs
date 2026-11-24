@@ -1,3 +1,4 @@
+mod batch;
 mod constants;
 mod error;
 pub mod fs;
@@ -12,6 +13,7 @@ mod power_cut;
 mod record;
 mod store;
 
+pub use batch::Batch;
 pub use constants::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub(crate) use error::DecodeError;
 pub use error::{CorruptionReason, Error, Field, UnsupportedReason};

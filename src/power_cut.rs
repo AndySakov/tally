@@ -14,7 +14,7 @@ use crate::hint::HINT_FILE_NAME;
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::record::{Record, encode};
 use crate::store::LOG_FILE_NAME;
-use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
+use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
 
@@ -34,6 +34,8 @@ enum Op {
     Delete(u8),
     Reopen,
     Compact,
+    /// Sets (`Some`) and deletes (`None`), as one batch.
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
 fn key(k: u8) -> Key {
@@ -49,6 +51,12 @@ fn workload() -> Vec<Op> {
         Delete(2),
         Delete(3),
         Compact,
+        Batch(vec![
+            (5, Some(b"five".to_vec())),
+            (1, None),
+            (6, Some(vec![b'z'; 200])),
+            (5, Some(b"FIVE".to_vec())),
+        ]),
         Reopen,
         Set(3, b"three".to_vec()),
         Delete(1),
@@ -57,6 +65,7 @@ fn workload() -> Vec<Op> {
         Compact,
         Compact,
         Set(4, vec![b'y'; 40]),
+        Batch(vec![(6, None), (4, Some(b"four".to_vec())), (2, None)]),
     ]
 }
 
@@ -67,6 +76,14 @@ fn apply(state: &mut State, op: &Op) {
         }
         Op::Delete(k) => {
             state.remove(k);
+        }
+        Op::Batch(ops) => {
+            for (k, v) in ops {
+                match v {
+                    Some(v) => state.insert(*k, v.clone()),
+                    None => state.remove(k),
+                };
+            }
         }
         Op::Reopen | Op::Compact => {}
     }
@@ -111,6 +128,16 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
                 store = Store::open_in(fs.clone(), dir, options()).unwrap();
             }
             Op::Compact => store.compact().unwrap(),
+            Op::Batch(ops) => {
+                let mut batch = Batch::new();
+                for (k, v) in ops {
+                    match v {
+                        Some(v) => batch.set(key(*k), Value::try_from(&v[..]).unwrap()),
+                        None => batch.delete(key(*k)),
+                    };
+                }
+                store.write(batch).unwrap();
+            }
         }
         apply(&mut state, &op);
         states.push(state.clone());

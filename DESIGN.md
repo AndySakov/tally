@@ -4,7 +4,7 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 
 ## Scope (v1)
 
-- API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `compact()`, `verify()`.
+- API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `write(batch)`, `compact()`, `verify()`.
 - `open` takes a directory. It holds `tally.log` (the data), `tally.lock`, `tally.hint` after a compaction, and, during one, `tally.log.compact` and `tally.hint.compact`.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
@@ -17,7 +17,7 @@ One append-only data file. Every record is a 15-byte prefix followed by the payl
 | Offset         | Size        | Field              | Notes                            |
 | -------------- | ----------- | ------------------ | -------------------------------- |
 | 0              | 4           | `header_checksum`  | CRC32C of bytes 4..15            |
-| 4              | 1           | `type`             | `0` invalid, `1` Set, `2` Delete |
+| 4              | 1           | `type`             | `0` invalid, `1` Set, `2` Delete, `3` Batch |
 | 5              | 2           | `key_len`          | u16                              |
 | 7              | 4           | `value_len`        | u32                              |
 | 11             | 4           | `payload_checksum` | CRC32C of key + value            |
@@ -29,15 +29,17 @@ One append-only data file. Every record is a 15-byte prefix followed by the payl
 - `header_checksum` covers `payload_checksum`, so the payload checksum is itself protected.
 - The header has its own checksum so lengths can be trusted before they are used. A single record checksum cannot tell a torn tail from a mid-file record with a corrupted length, and treating the second as the first would silently drop acknowledged records.
 - Type `0` is invalid so a zero-filled region can never parse as a record.
+- A Batch record has no key and an 8-byte "value", `body_len` (u64): the byte length of the Set and Delete records that follow it and belong to the batch. Those records are ordinary records with their own checksums, so `get` reads one the same way whether or not it was written in a batch. A version without Batch fails on one with `Unsupported` (unknown type 3) instead of misreading it.
 
 ### Record validity
 
 A record whose header checksum passes is still invalid if any of these hold:
 
 - `type == 0`
-- `key_len == 0`
+- `key_len == 0`, for Set and Delete
 - Set with `value_len == 0`
 - Delete with `value_len != 0`
+- Batch with `key_len != 0` or `value_len != 8` (`BadBatch`)
 
 ## Limits
 
@@ -76,6 +78,14 @@ If the append fails partway (disk full, I/O error), `set` or `delete` truncates 
 
 `open` syncs the data file, the store directory, and the directory's parent on every start, in that order, whether or not it created them. The file name lives in the directory, and without the directory sync the file itself may not survive power loss. Syncing unconditionally makes `open` idempotent: if a previous `open` failed between creating and syncing, the next one completes it. Directory sync behaviour differs between Linux and macOS and must be tested on both.
 
+## Batches
+
+`Batch` collects sets and deletes in order; `write(batch)` makes all of them durable with one append and one fsync, and recovery applies all of them or none (see Recovery). It is how a single thread gets group commit: the cost of a write is its fsync, so sharing one fsync across a batch divides it. 1 KiB values on an M1 Pro: 212 writes/s one at a time, 2,019/s in batches of 10, 18,663/s in batches of 100, and 100,810/s in batches of 1,000.
+
+- Operations apply in order, so a delete sees the batch's own earlier sets. A delete of a key that isn't live at that point writes nothing, as `delete` does, and a batch that writes nothing writes no Batch record either.
+- The 23-byte Batch record counts as dead bytes from the start. Compaction copies the live Set records out of batches like any others; the compacted log has no batches.
+- The whole batch is encoded in memory before the write, so its size is bounded by memory, not by the format (`body_len` is a u64).
+
 ## Recovery (startup)
 
 If `tally.hint` is usable (see Hint file), the index starts from it and `pos` from the log length it covers. Otherwise the index starts empty. State: `pos` as above (0 without a hint), `len = file length`. Loop:
@@ -86,8 +96,16 @@ If `tally.hint` is usable (see Hint file), the index starts from it and `pos` fr
 4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version). Validity violations: fail with corruption.
 5. Fewer than `15 + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
 6. Read the payload. If `payload_checksum` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
-7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key.
+7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key. A Batch is handled as described below.
 8. `pos += 15 + key_len + value_len`. Repeat.
+
+A Batch record at `pos` is followed by `body_len` bytes of records, and the batch is all or nothing:
+
+- If fewer than `body_len` bytes follow, the batch is a torn tail: truncate at `pos`.
+- Otherwise read its records with the same rules. Their operations are held back until the whole body has been read and checked. A torn or zero-filled record inside it is a torn tail from `pos`.
+- A Batch inside the body, or a record that runs past the body's end, is corruption (`BadBatch`) at `pos`.
+- Any other error inside the body is reported at `pos`, not at the record, so `repair` moves the whole batch to the side file and never leaves part of one in the log.
+- Once the body checks out, apply its operations in order and continue at `pos + 23 + body_len`.
 
 After the loop, if a truncation happened: truncate the file to `pos`, `fsync`, and log a warning (`log` crate) with the offset and number of bytes dropped: `truncated a torn tail at offset 18: dropped 14 bytes`. The caller sees it only if it installs a logger. This must complete before the first new write. Otherwise the next append lands after the torn bytes, and the following startup sees mid-file corruption.
 
@@ -209,13 +227,13 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 
 ## Testing
 
-- **Kill test** (`tests/kill.rs`): the test binary runs itself as a child that applies a seeded sequence of set, delete, reopen and compact, with automatic compaction at 50% dead and no size floor, printing an ack after each `Ok`. The parent `kill -9`s it after a random delay, three times on the same directory without opening it in between, so kills also land in the next child's `open` and recovery. Then the parent opens the store and checks that `open` succeeds, that the state is that of every acknowledged operation with each round's in-flight operation applied or not, and that a write after recovery survives a reopen. `TALLY_KILL_RUNS` (default 20) and `TALLY_KILL_SEED`; CI runs 1,000 on Linux. This cannot detect a missing `fsync`, because the OS page cache survives process death.
-- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions and runs with automatic compaction at 50% dead and no size floor, and the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn or as zeros, and only directory entries made durable by a directory sync surviving (with everything under a lost directory). A directory sync makes the directory's entries exactly what they are now, so a rename and the name it replaced land together. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file) and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests, with two exceptions, both from the hint file. The hint's own fsync: a torn hint fails its checksum and `open` reads the whole log, so correctness never rests on it, and it is kept so that no 32-bit checksum ever has to vouch for one. The directory fsync between removing the old hint and renaming the new log: the fake makes a directory's unsynced changes durable all at once, so it cannot produce the rename without the removal. A separate test (`a_removed_hint_stays_removed_after_a_power_cut`) checks that `open`'s removal of a rejected hint survives a cut.
+- **Kill test** (`tests/kill.rs`): the test binary runs itself as a child that applies a seeded sequence of set, delete, reopen, compact and batch, with automatic compaction at 50% dead and no size floor, printing an ack after each `Ok`. The parent `kill -9`s it after a random delay, three times on the same directory without opening it in between, so kills also land in the next child's `open` and recovery. Then the parent opens the store and checks that `open` succeeds, that the state is that of every acknowledged operation with each round's in-flight operation applied or not, and that a write after recovery survives a reopen. `TALLY_KILL_RUNS` (default 20) and `TALLY_KILL_SEED`; CI runs 1,000 on Linux. This cannot detect a missing `fsync`, because the OS page cache survives process death.
+- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions and batches and runs with automatic compaction at 50% dead and no size floor, and the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn or as zeros, and only directory entries made durable by a directory sync surviving (with everything under a lost directory). A directory sync makes the directory's entries exactly what they are now, so a rename and the name it replaced land together. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file) and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests, with two exceptions, both from the hint file. The hint's own fsync: a torn hint fails its checksum and `open` reads the whole log, so correctness never rests on it, and it is kept so that no 32-bit checksum ever has to vouch for one. The directory fsync between removing the old hint and renaming the new log: the fake makes a directory's unsynced changes durable all at once, so it cannot produce the rename without the removal. A separate test (`a_removed_hint_stays_removed_after_a_power_cut`) checks that `open`'s removal of a rejected hint survives a cut.
 - **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
-- **Model test** (`tests/model.rs`): random sequences of set, get, delete and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
+- **Model test** (`tests/model.rs`): random sequences of set, get, delete, batch and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
 - **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
-- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records, then damaged), `ops` (the model test, coverage-guided), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
-- **Benchmarks** (`cargo bench`): `set` next to a bare append + `sync_all` baseline, `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
+- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records and batches, then damaged), `ops` (the model test, coverage-guided), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
+- **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `set` next to a bare append + `sync_all` baseline, `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
 
@@ -246,6 +264,6 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 
 ## Deferred ideas
 
-- `Interval` sync policy with group commit, once there are concurrent writers.
+- Group commit across concurrent writers (sharing one fsync between callers, as `write` does within a batch), once there are any.
 - Background compaction, once the TCP server brings concurrency.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.

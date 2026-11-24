@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use proptest::prelude::*;
-use tally::{Key, Store, Value};
+use tally::{Batch, Key, Store, Value};
 
 const HEADER_LEN: u64 = 15;
 
@@ -22,6 +22,8 @@ enum Op {
     Get(u8),
     Delete(u8),
     Reopen,
+    /// Sets (`Some`) and deletes (`None`) written as one batch.
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
 fn op() -> impl Strategy<Value = Op> {
@@ -30,8 +32,13 @@ fn op() -> impl Strategy<Value = Op> {
         4 => (key.clone(), prop::collection::vec(any::<u8>(), 1..64))
             .prop_map(|(k, v)| Op::Set(k, v)),
         3 => key.clone().prop_map(Op::Get),
-        2 => key.prop_map(Op::Delete),
+        2 => key.clone().prop_map(Op::Delete),
         1 => Just(Op::Reopen),
+        2 => prop::collection::vec(
+            (key, prop::option::of(prop::collection::vec(any::<u8>(), 1..64))),
+            0..6
+        )
+        .prop_map(Op::Batch),
     ]
 }
 
@@ -87,6 +94,29 @@ proptest! {
                 Op::Reopen => {
                     drop(store);
                     store = Store::open(tmp.path()).unwrap();
+                }
+                Op::Batch(ops) => {
+                    let mut batch = Batch::new();
+                    let mut written = 0u64;
+                    for (k, v) in ops {
+                        match v {
+                            Some(v) => {
+                                batch.set(key(k), Value::try_from(&v[..]).unwrap());
+                                written += HEADER_LEN + key_bytes(k).len() as u64 + v.len() as u64;
+                                model.insert(k, v);
+                            }
+                            None => {
+                                batch.delete(key(k));
+                                if model.remove(&k).is_some() {
+                                    written += HEADER_LEN + key_bytes(k).len() as u64;
+                                }
+                            }
+                        }
+                    }
+                    store.write(batch).unwrap();
+                    if written > 0 {
+                        expected_len += HEADER_LEN + 8 + written;
+                    }
                 }
             }
             prop_assert_eq!(log_len(tmp.path()), expected_len);
