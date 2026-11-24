@@ -114,12 +114,12 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 `compact()` rewrites the log with only the latest record of each live key:
 
 1. Open `tally.log.compact` and truncate it, discarding anything a crashed compaction left.
-2. Read the log in one buffered pass from the first live record to the end, checking every record's checksums, and copy the bytes of each record the index still points at. A corrupt record, live or dead, stops compaction with its offset; nothing has changed yet. One sequential pass beats two positioned reads per live record even counting the dead bytes it reads past: 30 ms against 183 ms for 100k live records.
+2. Read the log in one buffered pass from the first live record to the end, checking every record's checksums, and copy the bytes of each record the index still points at. Each copied record's index entry is pointed at its new offset as it is copied, and its old offset is kept, 8 bytes per live key, so a failure can point them back. Compaction never holds a second index: at 10M live keys that took peak memory from 1.84 GB to 1.38 GB. A corrupt record, live or dead, stops compaction with its offset; nothing on disk has changed yet. One sequential pass beats two positioned reads per live record even counting the dead bytes it reads past: 30 ms against 183 ms for 100k live records.
 3. `fsync` the new file.
 4. Rename it over `tally.log`. The store now reads and appends to the new file.
 5. `fsync` the directory. A failure here panics, as for any failed fsync: the rename may not be durable, and writes after it go to the new file.
 
-Before the rename the old log is untouched, so any failure or crash leaves the store as it was. After a crash between the rename and the directory fsync, either name survives, and both hold the same live state. Running it twice writes the same log.
+Before the rename the old log is untouched, so any failure or crash leaves the store as it was; after a failure the moved entries are pointed back at it, rereading each key from the old log, and a failed reread panics so a restart rebuilds the index. After a crash between the rename and the directory fsync, either name survives, and both hold the same live state. Running it twice writes the same log.
 
 ### When it runs
 
