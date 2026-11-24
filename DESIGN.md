@@ -142,7 +142,7 @@ On `open`, a hint is used only if its magic, version and checksum hold, every ke
 
 The cost is that `open` no longer checks the checksums of records the hint covers. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan. This is the Bitcask trade.
 
-At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan. The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
 
 ### When it runs
 
@@ -153,7 +153,7 @@ At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and p
 The trigger is checked:
 
 - **On `open`**, after recovery. The scan already happened, so the check is free. Startup pays for at most one rewrite.
-- **After each `set` or `delete` that writes.** That call takes the compaction's time: 30 ms for 100k live records of 100 bytes on an M1 Pro (`cargo bench -- compact`), plus reading past the dead ones.
+- **After each `set` or `delete` that writes.** That call takes the compaction's time: 38 ms for 100k live records of 100 bytes on an M1 Pro (`cargo bench -- compact`), plus reading past the dead ones. About 12 ms of that is the hint's fsync and the directory fsync that removes the old hint, each a `F_FULLFSYNC` on macOS.
 
 Not on drop: `Drop` cannot return errors, and a kill skips it anyway. Not in the background: that needs concurrent reads and writes, which arrive with the TCP server.
 
@@ -170,12 +170,14 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 
 ## Index
 
-`HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>` where `Entry { offset: u64, value_len: u32 }`.
+`src/index.rs`: `HashMap<u128, Entry>` where `Entry { offset: u64, value_len: u32, key_len: u16 }` (16 bytes, `key_len` filling what was padding). Keys are not stored: each is replaced by its 128-bit SipHash-1-3 under a key drawn at random for every `open`, from std's `RandomState`, which is seeded from the OS. The map hashes that `u128` by taking its low 64 bits.
 
-- `Box<[u8]>` instead of `Vec<u8>`: keys never grow, so the capacity field is waste. Saves 8 bytes per slot.
-- foldhash instead of the default SipHash: `open` on 100k records went from 15.5 ms to 12.1 ms and a missing-key `get` from 12.9 ns to 4.8 ns. The `quality` variant costs the same as `fast` within noise.
-- The cost is HashDoS resistance. foldhash defeats only trivial collision attacks and "does not claim to provide HashDoS resistance against interactive attackers" (its README). SipHash does. That is acceptable while keys come from the embedding process. Before keys arrive over the network (the TCP server), switch back to SipHash or put a limit on what one client can insert.
-- Measured with a pre-sized map: about 877 MB for 10M keys of 32 bytes. `open` pre-sizes from the hint's count. Without a hint it grows the map as it reads, and peaks higher because old and new tables coexist during each resize: 1.23 GB against 718 MB for 10M keys of 16 bytes.
+- No allocation per key, and 32 bytes per slot whatever the key's length. At 10M keys of 16 bytes, building the index alone went from 78 to 58 ns per key and from 681 to 528 MB, and `open` from the hint from 718 to 557 MB at peak. The saving grows with key length.
+- The keyed hash also restores HashDoS resistance, which foldhash (the hasher before) did not claim: without the key, no one can choose keys that land in the same slot. That was a prerequisite for keys arriving over the network.
+- The cost is a missing-key `get`, which now hashes 128 bits: 4.8 ns before, 10.9 ns now. A hit is dominated by the read and checksum, 1.26 µs.
+- Two keys with the same 128-bit hash would share one entry: a `set` of the second would silently replace the first. The chance is about n²/2¹²⁹, 2 × 10⁻²⁴ at 40M live keys, and no one can aim for it without the random key. `get` checks the key stored in the record, so a collision shows up as `KeyMismatch`, never as another key's value; a test with a deliberately weak hash (a key's length) checks that.
+- `key_len` lets `open` count dead bytes without the keys.
+- `open` pre-sizes from the hint's count. Without a hint it grows the map as it reads, and peaks higher because old and new tables coexist during each resize: 1.11 GB against 557 MB for 10M keys of 16 bytes.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction, and counts as dead bytes.
 
 ### Reads
@@ -225,7 +227,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | Crate                      | Why                               |
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
-| `foldhash`                 | index hasher, faster than SipHash |
+| `siphasher`                | 128-bit SipHash-1-3 for the index |
 | `log`                      | the recovery warning; the caller picks the logger |
 | `tempfile` (dev)           | isolated directories for tests    |
 | `proptest` (dev)           | model and codec property tests    |
@@ -242,6 +244,5 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 
 - `Interval` sync policy with group commit, once there are concurrent writers.
 - Background compaction, once the TCP server brings concurrency.
-- Smaller index: a seeded 128-bit hash per key instead of the key itself (about 37% less memory, estimated), with a collision test using a deliberately weak hash.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
 - `get` in one positioned read, sized from the index entry.
