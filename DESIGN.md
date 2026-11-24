@@ -105,7 +105,7 @@ Recovery is idempotent: a crash during recovery followed by a rerun yields the s
 
 Repair is idempotent. A crash before the truncate leaves the log as it was, and the rerun rewrites the same side file. After the truncate the log is clean, so a rerun returns `None`.
 
-Open question: if `tally.log.corrupt-<offset>` already exists from an earlier repair at the same offset (the log was cut there, new records were written, and the new record at that offset went bad too), overwriting it loses the earlier bytes. Refusing when it exists with different contents is the safe choice.
+If the side file already exists, repair rewrites it only when its bytes are a prefix of what it would move, which is what a crashed run leaves. Anything else means an earlier repair at the same offset saved bytes the log no longer has (the log was cut there, new records were written, and the one at that offset went bad too). Repair then fails with `SideFileExists(path)` and changes nothing: moving the file aside is the operator's call, not something to do silently.
 
 Possible later improvement: when the record after the bad one parses cleanly, drop only the bad record.
 

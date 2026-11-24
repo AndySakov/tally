@@ -65,6 +65,11 @@ impl Store {
     /// directory, then truncates the log at the record and fsyncs it.
     /// Unsupported records are an error, not something to repair: a newer
     /// tally can read them. Fails with `Locked` while a `Store` is open.
+    ///
+    /// If the side file already exists and is the start of what would be
+    /// moved, a crashed earlier run left it, and it is rewritten. Otherwise
+    /// it holds bytes from an earlier repair that the log no longer has, and
+    /// `repair` fails with `SideFileExists` without changing anything.
     pub fn repair(dir: impl AsRef<Path>) -> Result<Option<Repaired>, Error> {
         Self::repair_in(&OsFs, dir.as_ref())
     }
@@ -112,7 +117,16 @@ impl<F: Fs> Store<F> {
         };
 
         let side_file = dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"));
-        let side = fs.open_or_create(&side_file)?;
+        let side = match fs.open_existing(&side_file) {
+            Ok(existing) => {
+                if !starts_tail(&existing, &file, offset, len)? {
+                    return Err(Error::SideFileExists(side_file));
+                }
+                existing
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => fs.open_or_create(&side_file)?,
+            Err(err) => return Err(err.into()),
+        };
         side.set_len(0)?;
         copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
         sync(&side);
@@ -213,6 +227,36 @@ impl<F: Fs> Store<F> {
             }
         };
         Ok(())
+    }
+}
+
+/// Whether `side` holds a prefix of `file`'s bytes from `offset` to `len`,
+/// as a repair that crashed partway through copying them leaves it.
+fn starts_tail(
+    side: &impl LogFile,
+    file: &impl LogFile,
+    offset: u64,
+    len: u64,
+) -> io::Result<bool> {
+    let side_len = side.size()?;
+    if side_len > len - offset {
+        return Ok(false);
+    }
+    let mut ours = side.reader_at(0).take(side_len);
+    let mut theirs = file.reader_at(offset).take(side_len);
+    let mut a = vec![0u8; 64 * 1024];
+    let mut b = vec![0u8; 64 * 1024];
+    loop {
+        let n = match ours.read(&mut a) {
+            Ok(0) => return Ok(true),
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        theirs.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Ok(false);
+        }
     }
 }
 
@@ -638,6 +682,49 @@ mod tests {
         assert_eq!(Store::repair(tmp.path()).unwrap(), None);
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
         assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+    }
+
+    #[test]
+    fn repair_rewrites_a_side_file_a_crashed_repair_left() {
+        let bytes = log_with_a_corrupt_middle();
+        for left in [&bytes[18..18], &bytes[18..25], &bytes[18..]] {
+            let tmp = store_with_log(&bytes);
+            fs::write(side_file(tmp.path(), 18), left).unwrap();
+            assert_eq!(
+                Store::repair(tmp.path()).unwrap(),
+                Some(Repaired {
+                    offset: 18,
+                    dropped: 33,
+                    side_file: side_file(tmp.path(), 18),
+                }),
+                "side file left with {} bytes",
+                left.len()
+            );
+            assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+            assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+        }
+    }
+
+    #[test]
+    fn repair_refuses_to_overwrite_bytes_an_earlier_repair_saved() {
+        let bytes = log_with_a_corrupt_middle();
+        let longer = [&bytes[18..], b"!"].concat();
+        let changed_first_byte = [&[bytes[18] ^ 1][..], &bytes[19..]].concat();
+        for earlier in [
+            &b"saved by an earlier repair"[..],
+            &longer,
+            &changed_first_byte,
+        ] {
+            let tmp = store_with_log(&bytes);
+            let path = side_file(tmp.path(), 18);
+            fs::write(&path, earlier).unwrap();
+            assert!(matches!(
+                Store::repair(tmp.path()),
+                Err(Error::SideFileExists(p)) if p == path
+            ));
+            assert_eq!(log_bytes(tmp.path()), bytes);
+            assert_eq!(fs::read(&path).unwrap(), earlier);
+        }
     }
 
     #[test]

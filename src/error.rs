@@ -87,6 +87,10 @@ pub enum Error {
     },
     /// Another `Store` holds the lock on this directory's log.
     Locked,
+    /// `repair` would write this side file, but it already holds bytes that
+    /// are not the start of what `repair` would move: an earlier repair at
+    /// the same offset saved them, and the log no longer has them.
+    SideFileExists(std::path::PathBuf),
 }
 
 impl Display for Error {
@@ -106,6 +110,11 @@ impl Display for Error {
                 offset, reason
             ),
             Error::Locked => write!(f, "store is already open elsewhere"),
+            Error::SideFileExists(path) => write!(
+                f,
+                "{} already holds bytes from an earlier repair; move it aside and rerun repair",
+                path.display()
+            ),
         }
     }
 }
@@ -255,6 +264,11 @@ mod tests {
     #[test]
     fn locked_message() {
         assert_eq!(Error::Locked.to_string(), "store is already open elsewhere");
+        assert_eq!(
+            Error::SideFileExists("/db/tally.log.corrupt-18".into()).to_string(),
+            "/db/tally.log.corrupt-18 already holds bytes from an earlier repair; \
+             move it aside and rerun repair"
+        );
     }
 
     #[test]
