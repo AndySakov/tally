@@ -13,17 +13,26 @@ use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::record::{Record, encode};
 use crate::store::LOG_FILE_NAME;
-use crate::{Key, Repaired, Store, Value};
+use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
 
 type State = BTreeMap<u8, Vec<u8>>;
+
+/// Compacts whenever half the log is dead, however small, so the workload
+/// compacts inside writes and recovery as well as when asked.
+fn options() -> Options {
+    Options {
+        auto_compact: AutoCompact::new(50, 0),
+    }
+}
 
 #[derive(Debug, Clone)]
 enum Op {
     Set(u8, Vec<u8>),
     Delete(u8),
     Reopen,
+    Compact,
 }
 
 fn key(k: u8) -> Key {
@@ -38,11 +47,14 @@ fn workload() -> Vec<Op> {
         Set(1, b"uno".to_vec()),
         Delete(2),
         Delete(3),
+        Compact,
         Reopen,
         Set(3, b"three".to_vec()),
         Delete(1),
         Set(2, b"two again".to_vec()),
         Reopen,
+        Compact,
+        Compact,
         Set(4, vec![b'y'; 40]),
     ]
 }
@@ -55,7 +67,7 @@ fn apply(state: &mut State, op: &Op) {
         Op::Delete(k) => {
             state.remove(k);
         }
-        Op::Reopen => {}
+        Op::Reopen | Op::Compact => {}
     }
 }
 
@@ -72,8 +84,8 @@ fn read_state(store: &Store<MemFs>) -> State {
 
 /// Runs the workload with power cut before `step`. Returns the disk at the
 /// cut and the states it may hold: every operation finished before the cut,
-/// with the one in progress either applied or not. `None` once `step` is
-/// past the end of the workload.
+/// with the one in progress either applied or not. One past the last step
+/// is a cut after the workload finished. `None` beyond that.
 fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let fs = MemFs::new();
     fs.cut_before(step);
@@ -83,7 +95,7 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let mut states = vec![State::new()];
     let mut ends = vec![0];
 
-    let mut store = Store::open_in(&fs, dir).unwrap();
+    let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
     states.push(State::new());
     ends.push(fs.steps());
     let mut state = State::new();
@@ -95,14 +107,18 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
             Op::Delete(k) => store.delete(key(*k)).unwrap(),
             Op::Reopen => {
                 drop(store);
-                store = Store::open_in(&fs, dir).unwrap();
+                store = Store::open_in(fs.clone(), dir, options()).unwrap();
             }
+            Op::Compact => store.compact().unwrap(),
         }
         apply(&mut state, &op);
         states.push(state.clone());
         ends.push(fs.steps());
     }
 
+    if step == fs.steps() + 1 {
+        return Some((fs.disk(), vec![state]));
+    }
     let snapshot = fs.snapshot()?;
     let in_flight = ends.iter().position(|&end| end >= step).unwrap();
     let mut candidates = vec![states[in_flight - 1].clone()];
@@ -127,11 +143,11 @@ fn check_recovery(
     let mut checked = 1;
     if depth > 0 {
         let fs = MemFs::after(snapshot, cut);
-        drop(Store::open_in(&fs, dir));
+        drop(Store::open_in(fs.clone(), dir, options()));
         for step in 1..=fs.steps() {
             let fs = MemFs::after(snapshot, cut);
             fs.cut_before(step);
-            drop(Store::open_in(&fs, dir));
+            drop(Store::open_in(fs.clone(), dir, options()));
             let inner = fs.snapshot().unwrap();
             for inner_cut in inner.cuts() {
                 let context = format!("{context}, recovery cut before step {step} {inner_cut:?}");
@@ -141,7 +157,7 @@ fn check_recovery(
     }
 
     let fs = MemFs::after(snapshot, cut);
-    let mut store = Store::open_in(&fs, dir)
+    let mut store = Store::open_in(fs.clone(), dir, options())
         .unwrap_or_else(|err| panic!("{context}: open after the cut failed: {err}"));
     let observed = read_state(&store);
     assert!(
@@ -155,7 +171,7 @@ fn check_recovery(
     drop(store);
     let mut expected = observed;
     expected.insert(7, b"after".to_vec());
-    let reopened = Store::open_in(&fs, dir).unwrap();
+    let reopened = Store::open_in(fs.clone(), dir, options()).unwrap();
     assert_eq!(
         read_state(&reopened),
         expected,
@@ -258,7 +274,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
             }
             assert_eq!(fs.read(&log_path).unwrap(), kept, "{context}");
             assert_eq!(fs.read(&side_path).unwrap(), moved, "{context}");
-            let store = Store::open_in(&fs, dir).unwrap();
+            let store = Store::open_in(fs.clone(), dir, options()).unwrap();
             assert_eq!(
                 store.get(&Key::try_from(&b"a"[..]).unwrap()).unwrap(),
                 Some(Value::try_from(&b"hi"[..]).unwrap()),
@@ -276,7 +292,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
 fn what_open_reads_survives_a_power_cut() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(&fs, dir).unwrap();
+    let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
     store
         .set(key(1), Value::try_from(&b"synced"[..]).unwrap())
         .unwrap();
@@ -295,7 +311,7 @@ fn what_open_reads_survives_a_power_cut() {
     log.write_all_at(&unsynced, end).unwrap();
     drop(log);
 
-    let store = Store::open_in(&fs, dir).unwrap();
+    let store = Store::open_in(fs.clone(), dir, options()).unwrap();
     let served = read_state(&store);
     assert_eq!(
         served,
@@ -306,7 +322,7 @@ fn what_open_reads_survives_a_power_cut() {
     let disk = fs.disk();
     for cut in disk.cuts() {
         let after = MemFs::after(&disk, cut);
-        let store = Store::open_in(&after, dir).unwrap();
+        let store = Store::open_in(after.clone(), dir, options()).unwrap();
         assert_eq!(read_state(&store), served, "{cut:?}");
     }
 }
