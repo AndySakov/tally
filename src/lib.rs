@@ -2,6 +2,7 @@ mod constants;
 mod error;
 pub mod fs;
 mod hint;
+mod index;
 mod kv;
 #[cfg(test)]
 mod mem_fs;
