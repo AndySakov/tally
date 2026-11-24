@@ -1,9 +1,9 @@
-use std::fs::File;
-use std::io::{self, BufReader, ErrorKind, Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
+use std::collections::HashMap;
+use std::fs::TryLockError;
+use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
-use std::{collections::HashMap, fs};
 
+use crate::fs::{Fs, LogFile, OsFs};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
@@ -33,8 +33,11 @@ pub struct Repaired {
 }
 
 /// An open store: the log file plus an in-memory index of every live key.
-pub struct Store {
-    file: File,
+///
+/// `F` is the file system. It is always [`OsFs`] outside tally's own tests,
+/// which swap in an in-memory disk to simulate power cuts.
+pub struct Store<F: Fs = OsFs> {
+    file: F::File,
     /// Length of the log, which is also the offset the next record lands at.
     end: u64,
     index: Index,
@@ -51,9 +54,26 @@ impl Store {
     /// warning before `open` returns. Any other bad record fails `open` with
     /// its offset; `repair` handles those (DESIGN.md, Recovery).
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
-        let dir = dir.as_ref();
+        Self::open_in(&OsFs, dir.as_ref())
+    }
+
+    /// Makes a log that `open` refuses openable again, without opening it.
+    ///
+    /// Returns `None` if `open` would succeed (a torn tail is left for
+    /// `open` to truncate). On a corrupt record, saves every byte from it to
+    /// the end of the log in a side file, fsyncs the side file and the
+    /// directory, then truncates the log at the record and fsyncs it.
+    /// Unsupported records are an error, not something to repair: a newer
+    /// tally can read them. Fails with `Locked` while a `Store` is open.
+    pub fn repair(dir: impl AsRef<Path>) -> Result<Option<Repaired>, Error> {
+        Self::repair_in(&OsFs, dir.as_ref())
+    }
+}
+
+impl<F: Fs> Store<F> {
+    pub(crate) fn open_in(fs: &F, dir: &Path) -> Result<Self, Error> {
         let file_path = dir.join(LOG_FILE_NAME);
-        match fs::create_dir(dir) {
+        match fs.create_dir(dir) {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e.into()),
@@ -62,21 +82,12 @@ impl Store {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
-        let file = File::options()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&file_path)?;
+        let file = fs.open_or_create(&file_path)?;
         sync(&file);
-        sync_dir(dir)?;
-        sync_dir(parent)?;
-        if let Err(err) = file.try_lock() {
-            match err {
-                fs::TryLockError::Error(error) => return Err(Error::Io(error)),
-                fs::TryLockError::WouldBlock => return Err(Error::Locked),
-            }
-        }
-        let len = file.metadata()?.len();
+        fs.sync_dir(dir)?;
+        fs.sync_dir(parent)?;
+        lock(&file)?;
+        let len = file.size()?;
         let (index, end) = load_index(&file, len)?;
         if end < len {
             file.set_len(end)?;
@@ -89,25 +100,11 @@ impl Store {
         Ok(Store { file, end, index })
     }
 
-    /// Makes a log that `open` refuses openable again, without opening it.
-    ///
-    /// Returns `None` if `open` would succeed (a torn tail is left for
-    /// `open` to truncate). On a corrupt record, saves every byte from it to
-    /// the end of the log in a side file, fsyncs the side file and the
-    /// directory, then truncates the log at the record and fsyncs it.
-    /// Unsupported records are an error, not something to repair: a newer
-    /// tally can read them. Fails with `Locked` while a `Store` is open.
-    pub fn repair(dir: impl AsRef<Path>) -> Result<Option<Repaired>, Error> {
-        let dir = dir.as_ref();
+    pub(crate) fn repair_in(fs: &F, dir: &Path) -> Result<Option<Repaired>, Error> {
         let file_path = dir.join(LOG_FILE_NAME);
-        let file = File::options().read(true).append(true).open(&file_path)?;
-        if let Err(err) = file.try_lock() {
-            match err {
-                fs::TryLockError::Error(error) => return Err(Error::Io(error)),
-                fs::TryLockError::WouldBlock => return Err(Error::Locked),
-            }
-        }
-        let len = file.metadata()?.len();
+        let file = fs.open_existing(&file_path)?;
+        lock(&file)?;
+        let len = file.size()?;
         let offset = match load_index(&file, len) {
             Ok(_) => return Ok(None),
             Err(Error::Corruption { offset, .. }) => offset,
@@ -115,12 +112,11 @@ impl Store {
         };
 
         let side_file = dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"));
-        let mut side = File::create(&side_file)?;
-        let mut tail = &file;
-        tail.seek(SeekFrom::Start(offset))?;
-        io::copy(&mut tail.take(len - offset), &mut side)?;
+        let side = fs.open_or_create(&side_file)?;
+        side.set_len(0)?;
+        copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
         sync(&side);
-        sync_dir(dir)?;
+        fs.sync_dir(dir)?;
 
         file.set_len(offset)?;
         sync(&file);
@@ -220,7 +216,32 @@ impl Store {
     }
 }
 
-fn load_record(file: &File, offset: u64) -> Result<(Header, Record), Error> {
+fn lock(file: &impl LogFile) -> Result<(), Error> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(TryLockError::WouldBlock) => Err(Error::Locked),
+        Err(TryLockError::Error(err)) => Err(Error::Io(err)),
+    }
+}
+
+/// Appends everything `reader` yields to `file`, in chunks.
+fn copy_to_end(mut reader: impl Read, file: &impl LogFile) -> io::Result<()> {
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut end = file.size()?;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                file.write_all_at(&chunk[..n], end)?;
+                end += n as u64;
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Error> {
     let mut header_buf = [0u8; HEADER_LEN];
     file.read_exact_at(&mut header_buf, offset)?;
     let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
@@ -233,13 +254,12 @@ fn load_record(file: &File, offset: u64) -> Result<(Header, Record), Error> {
 
 /// Reads every record in `file` from offset 0 to `len` and returns the index
 /// they describe.
-fn load_index(file: &File, len: u64) -> Result<(Index, u64), Error> {
+fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
     let mut index = Index::default();
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = vec![];
     let mut offset: u64 = 0;
-    let mut buffer = BufReader::new(file);
-    buffer.seek(SeekFrom::Start(0))?;
+    let mut buffer = BufReader::new(file.reader_at(0));
 
     while offset < len {
         if len - offset < HEADER_LEN as u64 {
@@ -304,22 +324,9 @@ fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
 /// Flushes `file` to disk. Panics on failure: after a failed fsync the
 /// kernel may have dropped the dirty pages, so retrying can report success
 /// for data that never reached disk (DESIGN.md, Failed fsync).
-fn sync(file: &File) {
-    // Fuzzing can't observe durability, and a 5 ms fsync per run would cut
-    // fuzzing throughput a hundredfold.
-    if cfg!(fuzzing) {
-        return;
-    }
-    file.sync_all()
+fn sync(file: &impl LogFile) {
+    file.sync()
         .expect("fsync failed; restart to recover from the log");
-}
-
-/// Makes a create or rename inside `dir` durable.
-fn sync_dir(dir: &Path) -> io::Result<()> {
-    if cfg!(fuzzing) {
-        return Ok(());
-    }
-    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

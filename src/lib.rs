@@ -1,6 +1,11 @@
 mod constants;
 mod error;
+pub mod fs;
 mod kv;
+#[cfg(test)]
+mod mem_fs;
+#[cfg(test)]
+mod power_cut;
 mod record;
 mod store;
 
