@@ -4,6 +4,7 @@ use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use crate::fs::{Fs, LogFile, OsFs};
+use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
@@ -58,7 +59,10 @@ pub struct Store<F: Fs = OsFs> {
 
 impl Store {
     /// Opens the store in `dir`, creating the directory and `tally.log` if
-    /// they don't exist, and rebuilds the index by reading every record.
+    /// they don't exist, and rebuilds the index: from `tally.hint` and the
+    /// records written after it if the last compaction left a usable one,
+    /// otherwise by reading every record. A hint that can't be used is
+    /// logged as a warning and removed (DESIGN.md, Hint file).
     /// Takes an exclusive lock on `tally.lock`: a second `open` of the same
     /// directory fails with `Locked` until this `Store` is dropped.
     ///
@@ -66,8 +70,10 @@ impl Store {
     /// DESIGN.md, New files).
     ///
     /// A torn or zero-filled tail is truncated, fsynced and logged as a
-    /// warning before `open` returns. Any other bad record fails `open` with
-    /// its offset; `repair` handles those (DESIGN.md, Recovery).
+    /// warning before `open` returns. Any other bad record `open` reads fails
+    /// it with its offset; `repair` handles those (DESIGN.md, Recovery).
+    /// Records the hint covers aren't read, so damage to them shows up in
+    /// `get` instead.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
         Self::open_with(dir, Options::default())
     }
@@ -119,7 +125,8 @@ impl<F: Fs> Store<F> {
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let len = file.size()?;
-        let (index, end) = load_index(&file, len)?;
+        let (mut index, hinted) = load_hint(&fs, dir, len)?;
+        let end = scan(&file, &mut index, hinted, len)?;
         if end < len {
             file.set_len(end)?;
             sync(&file);
@@ -171,6 +178,7 @@ impl<F: Fs> Store<F> {
         side.set_len(0)?;
         copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
         sync(&side);
+        remove_if_present(fs, &dir.join(HINT_FILE_NAME))?;
         fs.sync_dir(dir)?;
 
         file.set_len(offset)?;
@@ -195,10 +203,16 @@ impl<F: Fs> Store<F> {
     /// the directory fsync after the rename fails, as for any failed fsync.
     pub fn compact(&mut self) -> Result<(), Error> {
         let compact_path = self.dir.join(COMPACT_FILE_NAME);
+        let hint_path = self.dir.join(HINT_FILE_NAME);
         let mut moved = Vec::with_capacity(self.index.len());
         let copied = self
             .copy_live(&compact_path, &mut moved)
             .and_then(|copied| {
+                // The old hint describes the old log, so it must be gone for
+                // good before the new log takes its name.
+                if remove_if_present(&self.fs, &hint_path)? {
+                    self.fs.sync_dir(&self.dir)?;
+                }
                 self.fs
                     .rename(&compact_path, &self.dir.join(LOG_FILE_NAME))?;
                 Ok(copied)
@@ -216,10 +230,18 @@ impl<F: Fs> Store<F> {
         self.fs
             .sync_dir(&self.dir)
             .expect("directory fsync failed after compaction; restart to recover from the log");
+        // Not synced: if the name is lost, the next open scans the whole log.
+        if let Err(err) = self
+            .fs
+            .rename(&self.dir.join(COMPACT_HINT_FILE_NAME), &hint_path)
+        {
+            log::warn!("compacted, but could not put the hint file in place: {err}");
+        }
         Ok(())
     }
 
-    /// Writes each live record to a fresh `compact_path` and fsyncs it,
+    /// Writes each live record to a fresh `compact_path`, and its key and
+    /// value length to a fresh `tally.hint.compact`, and fsyncs both,
     /// pointing its index entry at the new offset as it goes and pushing the
     /// old offset to `moved`, so a failure can put them back. One buffered
     /// pass from the first live record: reading the dead records in between
@@ -231,6 +253,11 @@ impl<F: Fs> Store<F> {
     ) -> Result<(F::File, u64), Error> {
         let new = self.fs.open_or_create(compact_path)?;
         new.set_len(0)?;
+        let hint_file = self
+            .fs
+            .open_or_create(&self.dir.join(COMPACT_HINT_FILE_NAME))?;
+        hint_file.set_len(0)?;
+        let mut hint = hint::Writer::new(&hint_file);
         let first = self
             .index
             .values()
@@ -249,12 +276,13 @@ impl<F: Fs> Store<F> {
             payload_buf.resize(header.payload_len(), 0);
             reader.read_exact(&mut payload_buf)?;
             let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
-            if let IndexOp::Set { key, .. } = op
+            if let IndexOp::Set { key, value_len } = op
                 && let Some(entry) = self.index.get_mut(key.as_bytes())
                 && entry.offset == offset
             {
                 entry.offset = written + buffer.len() as u64;
                 moved.push(offset);
+                hint.push(key.as_bytes(), value_len)?;
                 buffer.extend_from_slice(&header_buf);
                 buffer.extend_from_slice(&payload_buf);
                 if buffer.len() >= COMPACT_BUFFER {
@@ -270,6 +298,8 @@ impl<F: Fs> Store<F> {
         new.write_all_at(&buffer, written)?;
         written += buffer.len() as u64;
         sync(&new);
+        hint.finish(written)?;
+        sync(&hint_file);
         Ok((new, written))
     }
 
@@ -486,14 +516,62 @@ fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Err
 /// they describe.
 fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
     let mut index = Index::default();
+    let end = scan(file, &mut index, 0, len)?;
+    Ok((index, end))
+}
+
+/// The index `tally.hint` gives and the log length it covers, or an empty
+/// index and 0 without one. A hint that can't be used is logged, removed
+/// for good, and treated as missing.
+fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Error> {
+    let path = dir.join(HINT_FILE_NAME);
+    let file = match fs.open_existing(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Index::default(), 0)),
+        Err(err) => return Err(err.into()),
+    };
+    match read_hint(&file, log_len) {
+        Ok(found) => Ok(found),
+        Err(hint::Invalid(why)) => {
+            log::warn!("ignored the hint file ({why}); reading the whole log instead");
+            drop(file);
+            fs.remove(&path)?;
+            fs.sync_dir(dir)?;
+            Ok((Index::default(), 0))
+        }
+    }
+}
+
+fn read_hint(file: &impl LogFile, log_len: u64) -> Result<(Index, u64), hint::Invalid> {
+    let trailer = hint::trailer(file)?;
+    if trailer.log_len > log_len {
+        return Err(hint::Invalid("the log is shorter than the hint says"));
+    }
+    // The count is unchecked until every entry is read: never reserve more
+    // than the log could hold.
+    let most = log_len / record_len(1, 1);
+    let capacity = usize::try_from(trailer.count.min(most)).unwrap_or(usize::MAX);
+    let mut index = Index::with_capacity_and_hasher(capacity, Default::default());
+    hint::read_entries(file, trailer, |key, offset, value_len| {
+        index.insert(key.into_bytes(), Entry { offset, value_len });
+    })?;
+    if index.len() as u64 != trailer.count {
+        return Err(hint::Invalid("a key appears twice"));
+    }
+    Ok((index, trailer.log_len))
+}
+
+/// Applies the records from `start` to `len` to `index`. Returns where the
+/// valid records end: `len`, or the start of a torn or zero-filled tail.
+fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<u64, Error> {
     let mut header_buf = [0u8; HEADER_LEN];
     let mut payload_buf = vec![];
-    let mut offset: u64 = 0;
-    let mut buffer = BufReader::new(file.reader_at(0));
+    let mut offset: u64 = start;
+    let mut buffer = BufReader::new(file.reader_at(start));
 
     while offset < len {
         if len - offset < HEADER_LEN as u64 {
-            return Ok((index, offset));
+            return Ok(offset);
         }
         buffer.read_exact(&mut header_buf)?;
         let header = match decode_header(&header_buf) {
@@ -501,12 +579,12 @@ fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
             Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum))
                 if all_zero(&header_buf) && rest_is_zero(&mut buffer)? =>
             {
-                return Ok((index, offset));
+                return Ok(offset);
             }
             Err(err) => return Err(err.at(offset)),
         };
         if len - offset < header.record_len() {
-            return Ok((index, offset));
+            return Ok(offset);
         }
         payload_buf.resize(header.payload_len(), 0u8);
         buffer.read_exact(&mut payload_buf)?;
@@ -515,7 +593,7 @@ fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
             Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
                 if all_zero(&payload_buf) && rest_is_zero(&mut buffer)? =>
             {
-                return Ok((index, offset));
+                return Ok(offset);
             }
             Err(err) => return Err(err.at(offset)),
         };
@@ -529,7 +607,16 @@ fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
         }
         offset += header.record_len();
     }
-    Ok((index, offset))
+    Ok(offset)
+}
+
+/// Removes `path`. Returns whether it was there.
+fn remove_if_present(fs: &impl Fs, path: &Path) -> io::Result<bool> {
+    match fs.remove(path) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn all_zero(bytes: &[u8]) -> bool {
@@ -1219,12 +1306,124 @@ mod tests {
     }
 
     #[test]
-    fn compact_leaves_only_the_log_and_the_lock_file() {
+    fn compact_leaves_the_log_its_hint_and_the_lock_file() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
+        assert_eq!(
+            file_names(tmp.path()),
+            ["tally.hint", "tally.lock", "tally.log"]
+        );
+    }
+
+    // hint file
+
+    fn hint_path(dir: &Path) -> PathBuf {
+        dir.join(HINT_FILE_NAME)
+    }
+
+    /// a=hi at 0 and b=2 at 18, compacted, so `tally.hint` covers both.
+    fn compacted_a_and_b(dir: &Path) {
+        let mut store = Store::open(dir).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.compact().unwrap();
+    }
+
+    #[test]
+    fn open_after_compact_reads_keys_from_the_hint_not_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        write_log_at(tmp.path(), 16, b"X");
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(matches!(
+            store.get(&key(b"a")),
+            Err(Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+    }
+
+    #[test]
+    fn records_written_after_the_hint_are_read_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        store.set(key(b"b"), value(b"22")).unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"22")));
+        assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+        assert_eq!(store.dead, 18 + 16 + 17);
+    }
+
+    #[test]
+    fn a_damaged_hint_is_removed_and_the_whole_log_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let mut hint = fs::read(hint_path(tmp.path())).unwrap();
+        hint[6] ^= 0x01;
+        fs::write(hint_path(tmp.path()), hint).unwrap();
+
+        let store = Store::open(tmp.path()).unwrap();
         assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+    }
+
+    #[test]
+    fn a_hint_for_more_log_than_there_is_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let log = log_bytes(tmp.path());
+        fs::write(log_path(tmp.path()), &log[..18]).unwrap();
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+    }
+
+    #[test]
+    fn repair_removes_the_hint_before_truncating() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        write_log_at(tmp.path(), 33, b"X");
+
+        let repaired = Store::repair(tmp.path()).unwrap().unwrap();
+        assert_eq!(repaired.offset, 18);
+        assert!(!hint_path(tmp.path()).exists());
+        let mut store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+        store.set(key(b"c"), value(b"3")).unwrap();
+        drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+    }
+
+    #[test]
+    fn a_second_compaction_replaces_the_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.delete(key(b"a")).unwrap();
+        store.compact().unwrap();
+        drop(store);
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(store.dead, 0);
     }
 
     #[test]

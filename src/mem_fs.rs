@@ -342,8 +342,19 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        self.step();
+        let mut state = self.0.borrow_mut();
+        state
+            .disk
+            .files
+            .remove(path)
+            .map(|_| ())
+            .ok_or(ErrorKind::NotFound.into())
+    }
+
     /// The directory's durable entries become exactly its current ones, so
-    /// creations, replacements and renames away all land together.
+    /// creations, replacements, renames away and removals all land together.
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.step();
         let mut state = self.0.borrow_mut();

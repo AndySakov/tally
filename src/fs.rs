@@ -34,7 +34,11 @@ pub trait Fs: sealed::Sealed {
     /// whatever `to` named. Durable only after `sync_dir` on the directory.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Makes every name created, replaced or renamed away inside the
+    /// Removes the name `path`. Durable only after `sync_dir` on its
+    /// directory.
+    fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// Makes every name created, replaced, renamed away or removed inside the
     /// directory `path` durable.
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 }
@@ -95,6 +99,10 @@ impl Fs for OsFs {
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
