@@ -4,12 +4,15 @@ use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use crate::fs::{Fs, LogFile, OsFs};
+use crate::options::{AutoCompact, Options};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
 use crate::{CorruptionReason, DecodeError, Error, Key, Value};
 
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
+pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
+pub(crate) const COMPACT_FILE_NAME: &str = "tally.log.compact";
 
 type Index = HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>;
 
@@ -37,15 +40,27 @@ pub struct Repaired {
 /// `F` is the file system. It is always [`OsFs`] outside tally's own tests,
 /// which swap in an in-memory disk to simulate power cuts.
 pub struct Store<F: Fs = OsFs> {
+    fs: F,
+    dir: PathBuf,
+    /// Holds the exclusive lock for as long as the store is open. A separate
+    /// file, because compaction replaces `tally.log`.
+    _lock: F::File,
     file: F::File,
     /// Length of the log, which is also the offset the next record lands at.
     end: u64,
+    /// Bytes of the log no live key points at: overwritten values, deleted
+    /// values and Delete records.
+    dead: u64,
+    /// `None` once an automatic compaction has failed, until the next open.
+    auto_compact: Option<AutoCompact>,
     index: Index,
 }
 
 impl Store {
     /// Opens the store in `dir`, creating the directory and `tally.log` if
     /// they don't exist, and rebuilds the index by reading every record.
+    /// Takes an exclusive lock on `tally.lock`: a second `open` of the same
+    /// directory fails with `Locked` until this `Store` is dropped.
     ///
     /// Creating either one requires an fsync of its parent directory (see
     /// DESIGN.md, New files).
@@ -54,7 +69,17 @@ impl Store {
     /// warning before `open` returns. Any other bad record fails `open` with
     /// its offset; `repair` handles those (DESIGN.md, Recovery).
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
-        Self::open_in(&OsFs, dir.as_ref())
+        Self::open_with(dir, Options::default())
+    }
+
+    /// `open`, with `options` in place of the defaults.
+    ///
+    /// With `auto_compact` set, compacts before returning if the log is due
+    /// (see [`AutoCompact`]). A failed automatic compaction leaves the log as
+    /// it was, logs a warning and turns automatic compaction off until the
+    /// next open; `open` still succeeds.
+    pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Store, Error> {
+        Self::open_in(OsFs, dir.as_ref(), options)
     }
 
     /// Makes a log that `open` refuses openable again, without opening it.
@@ -71,7 +96,7 @@ impl Store {
 }
 
 impl<F: Fs> Store<F> {
-    pub(crate) fn open_in(fs: &F, dir: &Path) -> Result<Self, Error> {
+    pub(crate) fn open_in(fs: F, dir: &Path, options: Options) -> Result<Self, Error> {
         let file_path = dir.join(LOG_FILE_NAME);
         match fs.create_dir(dir) {
             Ok(_) => {}
@@ -82,11 +107,12 @@ impl<F: Fs> Store<F> {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),
         };
+        let lock_file = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
+        lock(&lock_file)?;
         let file = fs.open_or_create(&file_path)?;
         sync(&file);
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
-        lock(&file)?;
         let len = file.size()?;
         let (index, end) = load_index(&file, len)?;
         if end < len {
@@ -97,13 +123,28 @@ impl<F: Fs> Store<F> {
                 len - end
             );
         }
-        Ok(Store { file, end, index })
+        let live: u64 = index
+            .iter()
+            .map(|(key, entry)| record_len(key.len(), entry.value_len))
+            .sum();
+        let mut store = Store {
+            fs,
+            dir: dir.to_path_buf(),
+            _lock: lock_file,
+            file,
+            end,
+            dead: end - live,
+            auto_compact: options.auto_compact,
+            index,
+        };
+        store.compact_if_due();
+        Ok(store)
     }
 
     pub(crate) fn repair_in(fs: &F, dir: &Path) -> Result<Option<Repaired>, Error> {
-        let file_path = dir.join(LOG_FILE_NAME);
-        let file = fs.open_existing(&file_path)?;
-        lock(&file)?;
+        let _lock = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
+        lock(&_lock)?;
+        let file = fs.open_existing(&dir.join(LOG_FILE_NAME))?;
         let len = file.size()?;
         let offset = match load_index(&file, len) {
             Ok(_) => return Ok(None),
@@ -127,6 +168,98 @@ impl<F: Fs> Store<F> {
         }))
     }
 
+    /// Rewrites the log with only the latest record of each live key, so
+    /// overwritten values and Delete records stop taking space.
+    ///
+    /// Writes the live records to `tally.log.compact`, fsyncs it, renames it
+    /// over `tally.log` and fsyncs the directory (DESIGN.md, Compaction).
+    /// Until the rename the old log is untouched, so any failure before it
+    /// returns the error and leaves the store as it was. Reads the log in one
+    /// pass from the first live record and checks every record it reads, so
+    /// a corrupt record stops compaction with its offset rather than being
+    /// copied. Panics if
+    /// the directory fsync after the rename fails, as for any failed fsync.
+    pub fn compact(&mut self) -> Result<(), Error> {
+        let compact_path = self.dir.join(COMPACT_FILE_NAME);
+        let new = self.fs.open_or_create(&compact_path)?;
+        new.set_len(0)?;
+
+        // One buffered pass from the first live record to the end, copying
+        // each record the index still points at. Reading the dead records in
+        // between costs less than two positioned reads per live one.
+        let first = self
+            .index
+            .values()
+            .map(|e| e.offset)
+            .min()
+            .unwrap_or(self.end);
+        let mut reader = BufReader::with_capacity(COMPACT_BUFFER, self.file.reader_at(first));
+        let mut index = Index::with_capacity_and_hasher(self.index.len(), Default::default());
+        let mut header_buf = [0u8; HEADER_LEN];
+        let mut payload_buf = Vec::new();
+        let mut buffer = Vec::new();
+        let mut written = 0u64;
+        let mut offset = first;
+        while offset < self.end {
+            reader.read_exact(&mut header_buf)?;
+            let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+            payload_buf.resize(header.payload_len(), 0);
+            reader.read_exact(&mut payload_buf)?;
+            let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
+            if let IndexOp::Set { key, value_len } = op
+                && self.index.get(key.as_bytes()).map(|e| e.offset) == Some(offset)
+            {
+                let new_offset = written + buffer.len() as u64;
+                buffer.extend_from_slice(&header_buf);
+                buffer.extend_from_slice(&payload_buf);
+                index.insert(
+                    key.into_bytes(),
+                    Entry {
+                        offset: new_offset,
+                        value_len,
+                    },
+                );
+                if buffer.len() >= COMPACT_BUFFER {
+                    new.write_all_at(&buffer, written)?;
+                    written += buffer.len() as u64;
+                    buffer.clear();
+                }
+            }
+            offset += header.record_len();
+        }
+        assert_eq!(index.len(), self.index.len(), "every live key is copied");
+        drop(reader);
+        new.write_all_at(&buffer, written)?;
+        written += buffer.len() as u64;
+        sync(&new);
+
+        self.fs
+            .rename(&compact_path, &self.dir.join(LOG_FILE_NAME))?;
+        self.file = new;
+        self.end = written;
+        self.dead = 0;
+        self.index = index;
+        self.fs
+            .sync_dir(&self.dir)
+            .expect("directory fsync failed after compaction; restart to recover from the log");
+        Ok(())
+    }
+
+    /// Compacts if automatic compaction is on and due. The caller's write
+    /// has already succeeded, so a failure is logged, not returned.
+    fn compact_if_due(&mut self) {
+        let Some(auto) = self.auto_compact else {
+            return;
+        };
+        if !auto.is_due(self.dead, self.end) {
+            return;
+        }
+        if let Err(err) = self.compact() {
+            self.auto_compact = None;
+            log::warn!("automatic compaction failed, off until the next open: {err}");
+        }
+    }
+
     fn append(&mut self, record: &Record) -> Result<u64, Error> {
         let offset = self.end;
         let mut buffer: Vec<u8> = vec![];
@@ -140,7 +273,8 @@ impl<F: Fs> Store<F> {
         Ok(offset)
     }
 
-    /// Appends a Set record, fsyncs, then points the index at it.
+    /// Appends a Set record, fsyncs, then points the index at it. Then
+    /// compacts if automatic compaction is due, as `open_with` describes.
     ///
     /// If the write fails partway through, truncates the log back to `end`
     /// and returns the I/O error. Panics if that truncate fails, or if the
@@ -149,7 +283,8 @@ impl<F: Fs> Store<F> {
         let record = Record::Set { key, value };
         let offset = self.append(&record)?;
         if let Record::Set { key, value } = record {
-            self.index.insert(
+            let key_len = key.as_bytes().len();
+            let old = self.index.insert(
                 key.into_bytes(),
                 Entry {
                     offset,
@@ -157,9 +292,13 @@ impl<F: Fs> Store<F> {
                         .expect("Value guarantees len fits u32"),
                 },
             );
+            if let Some(old) = old {
+                self.dead += record_len(key_len, old.value_len);
+            }
         } else {
             unreachable!();
         }
+        self.compact_if_due();
         Ok(())
     }
 
@@ -199,22 +338,37 @@ impl<F: Fs> Store<F> {
     }
 
     /// Appends a Delete record, fsyncs, then removes the key from the index.
+    /// Then compacts if automatic compaction is due, as in `set`.
     ///
     /// Deleting a key that isn't live is a no-op: nothing is written and it
     /// returns `Ok`. Failed writes are handled as in `set`.
     pub fn delete(&mut self, key: Key) -> Result<(), Error> {
         if self.index.contains_key(key.as_bytes()) {
             let record = Record::Delete { key };
-            self.append(&record)?;
+            let offset = self.append(&record)?;
             if let Record::Delete { key } = record {
-                self.index.remove(&key.into_bytes());
+                let key_len = key.as_bytes().len();
+                let old = self
+                    .index
+                    .remove(&key.into_bytes())
+                    .expect("checked live above");
+                self.dead += record_len(key_len, old.value_len) + (self.end - offset);
             } else {
                 unreachable!();
             }
+            self.compact_if_due();
         };
         Ok(())
     }
 }
+
+/// Length on disk of a Set record with these lengths.
+fn record_len(key_len: usize, value_len: u32) -> u64 {
+    (HEADER_LEN + key_len) as u64 + u64::from(value_len)
+}
+
+/// How much `compact` buffers before each write.
+const COMPACT_BUFFER: usize = 1 << 20;
 
 fn lock(file: &impl LogFile) -> Result<(), Error> {
     match file.try_lock() {
@@ -600,7 +754,7 @@ mod tests {
         let tmp = store_with_log(&bytes);
         assert_eq!(Store::repair(tmp.path()).unwrap(), None);
         assert_eq!(log_bytes(tmp.path()), bytes);
-        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 1);
+        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
     }
 
     #[test]
@@ -848,5 +1002,286 @@ mod tests {
                 reason: CorruptionReason::NotASet
             })
         ));
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn encoded(records: &[Record]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            encode(record, &mut bytes);
+        }
+        bytes
+    }
+
+    fn set_record(k: &[u8], v: &[u8]) -> Record {
+        Record::Set {
+            key: key(k),
+            value: value(v),
+        }
+    }
+
+    #[test]
+    fn compact_keeps_only_the_latest_value_of_each_live_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.delete(key(b"b")).unwrap();
+        assert_eq!(log_bytes(tmp.path()).len(), 85);
+
+        store.compact().unwrap();
+
+        let expected = encoded(&[set_record(b"c", b"3"), set_record(b"a", b"hi")]);
+        assert_eq!(expected[17..], SET_A_HI);
+        assert_eq!(log_bytes(tmp.path()), expected);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+        assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+        drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+        assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+    }
+
+    #[test]
+    fn writes_after_compact_land_in_the_new_log_and_survive_a_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"old")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        drop(store);
+
+        let mut expected = SET_A_HI.to_vec();
+        expected.extend(encoded(&[set_record(b"b", b"2")]));
+        expected.extend(DELETE_A);
+        assert_eq!(log_bytes(tmp.path()), expected);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+    }
+
+    #[test]
+    fn compact_of_an_empty_store_leaves_an_empty_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        store.compact().unwrap();
+        assert_eq!(log_bytes(tmp.path()), b"");
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn compact_twice_writes_the_same_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        let once = log_bytes(tmp.path());
+        store.compact().unwrap();
+        assert_eq!(log_bytes(tmp.path()), once);
+        assert_eq!(once, SET_A_HI);
+    }
+
+    #[test]
+    fn compact_leaves_only_the_log_and_the_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+    }
+
+    #[test]
+    fn compact_stops_at_a_corrupt_dead_record_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        write_log_at(tmp.path(), 33, b"X");
+        let before = log_bytes(tmp.path());
+
+        assert!(matches!(
+            store.compact(),
+            Err(Error::Corruption {
+                offset: 17,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(log_bytes(tmp.path()), before);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+    }
+
+    #[test]
+    fn compact_overwrites_a_compact_file_left_by_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(COMPACT_FILE_NAME), [0xAB; 100]).unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn the_lock_still_holds_after_compact_replaces_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        assert!(matches!(Store::open(tmp.path()), Err(Error::Locked)));
+        assert!(matches!(Store::repair(tmp.path()), Err(Error::Locked)));
+        drop(store);
+        Store::open(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn compact_stops_at_a_corrupt_live_record_and_leaves_the_log_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.delete(key(b"b")).unwrap();
+        write_log_at(tmp.path(), 17, b"X");
+        let before = log_bytes(tmp.path());
+
+        assert!(matches!(
+            store.compact(),
+            Err(Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(log_bytes(tmp.path()), before);
+        store.set(key(b"c"), value(b"3")).unwrap();
+        assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+    }
+
+    fn auto(dead_percent: u8, min_log_bytes: u64) -> Options {
+        Options {
+            auto_compact: AutoCompact::new(dead_percent, min_log_bytes),
+        }
+    }
+
+    #[test]
+    fn a_write_that_leaves_half_the_log_dead_compacts_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"a"), value(b"3")).unwrap();
+        assert_eq!(log_bytes(tmp.path()).len(), 51, "17 of 51 dead");
+
+        store.set(key(b"b"), value(b"4")).unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[set_record(b"a", b"3"), set_record(b"b", b"4")])
+        );
+
+        store.set(key(b"a"), value(b"5")).unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()).len(),
+            51,
+            "compaction left nothing dead, so 17 of 51 now"
+        );
+    }
+
+    #[test]
+    fn a_delete_counts_its_own_record_as_dead_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+    }
+
+    #[test]
+    fn a_log_below_the_minimum_size_is_not_compacted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), auto(50, 35)).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"a"), value(b"2")).unwrap();
+        assert_eq!(log_bytes(tmp.path()).len(), 34);
+        store.set(key(b"a"), value(b"3")).unwrap();
+        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
+    }
+
+    #[test]
+    fn without_auto_compact_the_log_only_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = Options { auto_compact: None };
+        let mut store = Store::open_with(tmp.path(), options).unwrap();
+        for v in [b"1", b"2", b"3"] {
+            store.set(key(b"a"), value(v)).unwrap();
+        }
+        store.delete(key(b"a")).unwrap();
+        drop(store);
+        Store::open_with(tmp.path(), options).unwrap();
+        assert_eq!(log_bytes(tmp.path()).len(), 67);
+    }
+
+    #[test]
+    fn open_compacts_a_log_that_is_due() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+    }
+
+    #[test]
+    fn open_counts_the_dead_bytes_already_in_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"a"), value(b"3")).unwrap();
+        drop(store);
+
+        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        assert_eq!(log_bytes(tmp.path()).len(), 51, "17 of 51 dead");
+        store.set(key(b"b"), value(b"4")).unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[set_record(b"a", b"3"), set_record(b"b", b"4")])
+        );
+    }
+
+    #[test]
+    fn a_failed_automatic_compaction_keeps_the_write_and_stays_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        write_log_at(tmp.path(), 17, b"X");
+        store.set(key(b"b"), value(b"3")).unwrap();
+        store.set(key(b"b"), value(b"4")).unwrap();
+        assert_eq!(store.auto_compact, AutoCompact::new(50, 0), "34 of 69 dead");
+
+        store.set(key(b"b"), value(b"5")).unwrap();
+        assert_eq!(store.auto_compact, None);
+        assert_eq!(log_bytes(tmp.path()).len(), 86);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"5")));
     }
 }
