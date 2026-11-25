@@ -368,7 +368,10 @@ impl<F: Fs> Store<F> {
         let mut written = 0u64;
         let mut expected = 0usize;
         for input in inputs.iter().filter(|s| chosen.contains(&s.base)) {
-            let mut reader = BufReader::with_capacity(COMPACT_BUFFER, input.reader_at(input.base));
+            let mut reader = BufReader::with_capacity(
+                hint::buffer_for(input.len, COMPACT_BUFFER),
+                input.reader_at(input.base),
+            );
             let mut offset = input.base;
             while offset < input.end() {
                 reader.read_exact(&mut header_buf)?;
