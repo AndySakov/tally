@@ -8,7 +8,7 @@
 
 use std::fs::{File, TryLockError};
 use std::io::{self, Read};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 
 pub(crate) mod sealed {
@@ -37,6 +37,13 @@ pub trait Fs: sealed::Sealed {
     /// Removes the name `path`. Durable only after `sync_dir` on its
     /// directory.
     fn remove(&self, path: &Path) -> io::Result<()>;
+
+    /// Gives the file `from` names a second name, `to`, which must not
+    /// exist. Durable only after `sync_dir` on the directory.
+    fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Whether `a` and `b` name the same file.
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool>;
 
     /// Makes every name created, replaced, renamed away or removed inside the
     /// directory `path` durable.
@@ -106,6 +113,15 @@ impl Fs for OsFs {
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::hard_link(from, to)
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        let (a, b) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+        Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
     }
 
     fn sync_dir(&self, path: &Path) -> io::Result<()> {

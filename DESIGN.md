@@ -97,11 +97,22 @@ The log is split into segment files, each named for the log offset of its first 
 
 ### From one file to segments
 
-A directory from before segments has `tally.log` (and maybe `tally.hint`) and no segment files. `open` (and `repair`) renames `tally.log` to the segment at 0 and `tally.hint` to its hint, removes any `tally.log.compact` and `tally.hint.compact` a crashed compaction left, writes the marker to `tally.log`, fsyncs it and the directory. Offsets do not change, since the segment at 0 holds exactly the old file.
+A directory from before segments has `tally.log` (and maybe `tally.hint`) and no segment files. `open` (and `repair`):
 
-The marker is one record header of type 255 with valid checksums. Every earlier version reads `tally.log` from offset 0, so it fails with `Unsupported` (unknown type 255) instead of finding no records and starting an empty store over the real data; its `repair` refuses unsupported records too. A `tally.log` that is empty or a prefix of the marker is a torn marker write and is rewritten. One holding anything else while segments exist fails `open`: an earlier version wrote records the segments know nothing about, and they cannot be put in order. The move is one way.
+1. Hard-links `tally.log` as the segment at 0, renames `tally.hint` to its hint, and removes any `tally.log.compact` and `tally.hint.compact` a crashed compaction left.
+2. Writes the marker to `tally.log.marker` and fsyncs it, then the directory.
+3. Renames `tally.log.marker` over `tally.log`, and fsyncs the directory.
 
-Risk left: between the rename and the directory fsync, a real file system may make the rename durable without the new `tally.log`. An earlier version opened after a power cut in that window would see an empty store. The in-memory disk lands both together, so the power-cut test cannot show this window.
+Offsets do not change, since the segment at 0 holds exactly the old file. The marker is one record header of type 255 with valid checksums. Every earlier version reads `tally.log` from offset 0, so it fails with `Unsupported` (unknown type 255) instead of finding no records and starting an empty store over the real data; its `repair` refuses unsupported records too.
+
+At every step, then, `tally.log` holds either all the old records or the whole marker, so a power cut never leaves an earlier version a `tally.log` that is missing, torn or zeroed, any of which it would open as an empty store. The directory fsync in step 2 keeps the rename from landing without the link, which would leave the records with no name. The power-cut test checks this at every cut of the move.
+
+- A `tally.log` that holds records while the segment at 0 is the same file (by device and inode) is a move stopped after step 1, and `open` finishes it.
+- A `tally.log` shorter than any record (16 bytes) that is not the marker is replaced with it: it holds no records.
+- A `tally.log` holding records while any other segment exists fails `open`: an earlier version wrote records the segments know nothing about, and they cannot be put in order.
+- On a file system without hard links, step 1 renames `tally.log` instead, and a power cut before step 3 lands can leave no `tally.log` for an earlier version to refuse.
+
+The move is one way.
 
 ## Recovery (startup)
 
@@ -204,7 +215,7 @@ An automatic compaction never turns a successful write or `open` into an error: 
 
 `Store<F: Fs = OsFs>` reaches the disk only through two traits in `tally::fs`, so the power-cut tests can swap in an in-memory disk:
 
-- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `sync_dir`, `list`, with `type File: LogFile`.
+- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `hard_link`, `same_file`, `sync_dir`, `list`, with `type File: LogFile`.
 - `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, `try_lock`. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
 
 Both traits are sealed: public because `Store`'s type parameter is, but implementable only inside tally. `Store::open` and `Store::repair` are defined on `Store<OsFs>` (a default type parameter is not used for inference, so a generic `open` would need annotations); the generic versions are crate-private. The traits return errors; the panic on a failed fsync stays in `Store`.

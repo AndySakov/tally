@@ -21,6 +21,8 @@ pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 /// Where an earlier version's compaction wrote the new log.
 const COMPACT_FILE_NAME: &str = "tally.log.compact";
+/// Where the marker is written before it is renamed over `tally.log`.
+const MARKER_FILE_NAME: &str = "tally.log.marker";
 
 /// What `tally.log` holds once the log is in segments: a record header of
 /// type 255 with valid checksums, which every earlier version reads as an
@@ -874,49 +876,59 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
 
 /// Turns a `tally.log` from before segments into the segment at 0, with
 /// its hint, and leaves the marker in `tally.log`. Returns whether it
-/// changed anything the directory must make durable. Fails if `tally.log`
-/// holds records while segments exist: an earlier version wrote them after
-/// the log was split, and they can't be put in order.
+/// changed anything the directory must make durable. `tally.log` holds the
+/// records or the whole marker at every step, so an earlier version never
+/// finds it missing or torn and starts an empty store. Fails if
+/// `tally.log` holds records while segments exist: an earlier version
+/// wrote them after the log was split, and they can't be put in order.
 fn migrate<F: Fs>(fs: &F, dir: &Path) -> Result<bool, Error> {
     let names = fs.list(dir)?;
+    let has = |name: &str| names.iter().any(|n| n == name);
     let legacy = dir.join(LOG_FILE_NAME);
-    let marker = marker();
-    if names.iter().any(|n| n == LOG_FILE_NAME) {
+    let first = dir.join(log_name(0));
+    if has(LOG_FILE_NAME) {
         let file = fs.open_existing(&legacy)?;
         let size = file.size()?;
-        // Shorter than any record: the marker, or a write of it that a
-        // power cut tore or left as zeros.
         if size <= HEADER_LEN as u64 {
+            // Shorter than any record: the marker, or a write of it that a
+            // power cut tore or left as zeros.
             let mut bytes = vec![0u8; size as usize];
             file.read_exact_at(&mut bytes, 0)?;
-            if bytes[..] == marker[..] {
+            if bytes[..] == marker()[..] {
                 return Ok(false);
             }
-            write_marker(fs, &legacy, &marker)?;
-            return Ok(true);
-        }
-        if names.iter().any(|n| parse_log_name(n).is_some()) {
+        } else if !names.iter().any(|n| parse_log_name(n).is_some()) {
+            // Without hard links, the rename leaves a window in which
+            // `tally.log` is missing.
+            if fs.hard_link(&legacy, &first).is_err() {
+                fs.rename(&legacy, &first)?;
+            }
+            if has(HINT_FILE_NAME) {
+                fs.rename(&dir.join(HINT_FILE_NAME), &dir.join(hint_name(0)))?;
+            }
+            remove_if_present(fs, &dir.join(COMPACT_FILE_NAME))?;
+            remove_if_present(fs, &dir.join(COMPACT_HINT_FILE_NAME))?;
+        } else if !(has(&log_name(0)) && fs.same_file(&legacy, &first)?) {
             return Err(Error::Io(io::Error::other(
                 "tally.log holds records next to segment files: an earlier version of tally wrote them",
             )));
         }
-        drop(file);
-        fs.rename(&legacy, &dir.join(log_name(0)))?;
-        if names.iter().any(|n| n == HINT_FILE_NAME) {
-            fs.rename(&dir.join(HINT_FILE_NAME), &dir.join(hint_name(0)))?;
-        }
-        remove_if_present(fs, &dir.join(COMPACT_FILE_NAME))?;
-        remove_if_present(fs, &dir.join(COMPACT_HINT_FILE_NAME))?;
     }
-    write_marker(fs, &legacy, &marker)?;
+    replace_with_marker(fs, dir)?;
     Ok(true)
 }
 
-fn write_marker<F: Fs>(fs: &F, path: &Path, marker: &[u8]) -> io::Result<()> {
-    let file = fs.open_or_create(path)?;
+/// Writes the marker to its own file, then renames it over `tally.log`
+/// once every name made so far is durable: a link from `tally.log` to the
+/// segment at 0 must not be lost while the marker takes its place.
+fn replace_with_marker<F: Fs>(fs: &F, dir: &Path) -> io::Result<()> {
+    let path = dir.join(MARKER_FILE_NAME);
+    let file = fs.open_or_create(&path)?;
     file.set_len(0)?;
-    file.write_all_at(marker, 0)?;
-    file.sync()
+    file.write_all_at(&marker(), 0)?;
+    file.sync()?;
+    fs.sync_dir(dir)?;
+    fs.rename(&path, &dir.join(LOG_FILE_NAME))
 }
 
 /// Builds the index from every segment in order: from its hint and the
@@ -2313,6 +2325,28 @@ mod tests {
             ),
             "read from the hint, not the log"
         );
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_move_to_segments_stopped_after_its_link_is_finished() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        fs::rename(
+            tmp.path().join(log_name(35)),
+            tmp.path().join(LOG_FILE_NAME),
+        )
+        .unwrap();
+        fs::remove_file(tmp.path().join(hint_name(35))).unwrap();
+        fs::hard_link(tmp.path().join(LOG_FILE_NAME), tmp.path().join(log_name(0))).unwrap();
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(
+            file_names(tmp.path()),
+            ["tally.00000000000000000000.log", "tally.lock", "tally.log"]
+        );
+        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
     }
 

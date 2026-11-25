@@ -420,6 +420,27 @@ impl Fs for MemFs {
         Ok(())
     }
 
+    fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.step();
+        let mut state = self.0.borrow_mut();
+        let disk = &mut state.disk;
+        assert_eq!(from.parent(), to.parent(), "links stay in one directory");
+        if disk.files.contains_key(to) {
+            return Err(ErrorKind::AlreadyExists.into());
+        }
+        let ino = *disk.files.get(from).ok_or(ErrorKind::NotFound)?;
+        disk.files.insert(to.to_path_buf(), ino);
+        disk.entry_changes
+            .push(EntryChange(vec![(to.to_path_buf(), Some(ino))]));
+        Ok(())
+    }
+
+    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
+        let state = self.0.borrow();
+        let ino = |path| state.disk.files.get(path).ok_or(ErrorKind::NotFound);
+        Ok(ino(a)? == ino(b)?)
+    }
+
     fn list(&self, path: &Path) -> io::Result<Vec<String>> {
         let state = self.0.borrow();
         state.disk.has_dir(path)?;
