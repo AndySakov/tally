@@ -7,15 +7,13 @@
 //! an entry. `get` checks the key stored in the record, so that would show
 //! up as a corruption error, never as another key's value.
 //!
-//! The map is split into 64 shards by the top bits of the hash, so `fill`
-//! and `apply_in_order` can insert from several threads at once, and
+//! The map is split into 64 shards by the top bits of the hash, so
+//! `apply_in_order` can insert from several threads at once, and
 //! growing the map moves one shard at a time instead of the whole index.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use siphasher::sip128::SipHasher13;
@@ -40,8 +38,6 @@ impl Entry {
 
 const SHARD_BITS: u32 = 6;
 const SHARDS: usize = 1 << SHARD_BITS;
-/// Entries a `Filler` holds per shard before taking the shard's lock.
-const FLUSH_AT: usize = 256;
 
 type Map = HashMap<u128, Entry, BuildHasherDefault<LowBits>>;
 
@@ -140,49 +136,6 @@ impl Index {
         self.shards.iter().map(Map::capacity).sum()
     }
 
-    /// Runs `job` on every element of `jobs`, spread over `threads` threads
-    /// (the calling thread is one of them), inserting what each pushes into
-    /// its `Filler`, over any entry already there. For keys no two jobs
-    /// share: if two do, which entry wins is not defined. Returns how many
-    /// inserts replaced an entry at `floor` or later, so a caller filling
-    /// from `floor` on can tell a key it pushed twice.
-    pub(crate) fn fill<J: Sync>(
-        &mut self,
-        threads: usize,
-        jobs: &[J],
-        floor: u64,
-        job: impl Fn(&J, &mut Filler<'_>) + Sync,
-    ) -> usize {
-        let shards: Vec<Mutex<Map>> = self.shards.drain(..).map(Mutex::new).collect();
-        let next = AtomicUsize::new(0);
-        let replaced = AtomicUsize::new(0);
-        let work = || {
-            let mut filler = Filler {
-                hasher: &self.hasher,
-                shards: &shards,
-                pending: vec![Vec::new(); SHARDS],
-                floor,
-                replaced: 0,
-            };
-            while let Some(j) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                job(j, &mut filler);
-            }
-            filler.flush_all();
-            replaced.fetch_add(filler.replaced, Ordering::Relaxed);
-        };
-        thread::scope(|scope| {
-            for _ in 1..threads.min(jobs.len()) {
-                scope.spawn(work);
-            }
-            work();
-        });
-        self.shards = shards
-            .into_iter()
-            .map(|shard| shard.into_inner().expect("no filler panicked"))
-            .collect();
-        replaced.into_inner()
-    }
-
     /// Applies `changes` in order, an insert for `Some` and a remove for
     /// `None`, with the result of applying them one after another. On up to
     /// `threads` threads: they hash the keys, then each applies the changes
@@ -237,45 +190,6 @@ impl Index {
                 });
             }
         });
-    }
-}
-
-/// Where one `fill` thread puts entries. Holds a few per shard so it takes
-/// each shard's lock once per batch, not once per entry.
-pub(crate) struct Filler<'a> {
-    hasher: &'a KeyHasher,
-    shards: &'a [Mutex<Map>],
-    pending: Vec<Vec<(u128, Entry)>>,
-    floor: u64,
-    replaced: usize,
-}
-
-impl Filler<'_> {
-    pub(crate) fn push(&mut self, key: &[u8], entry: Entry) {
-        let hash = self.hasher.hash(key);
-        let shard = shard_of(hash);
-        self.pending[shard].push((hash, entry));
-        if self.pending[shard].len() >= FLUSH_AT {
-            self.flush(shard);
-        }
-    }
-
-    fn flush(&mut self, shard: usize) {
-        let mut map = self.shards[shard].lock().expect("no filler panicked");
-        for (hash, entry) in self.pending[shard].drain(..) {
-            if map
-                .insert(hash, entry)
-                .is_some_and(|old| old.offset >= self.floor)
-            {
-                self.replaced += 1;
-            }
-        }
-    }
-
-    fn flush_all(&mut self) {
-        for shard in 0..SHARDS {
-            self.flush(shard);
-        }
     }
 }
 
@@ -336,34 +250,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_on_many_threads_builds_the_index_inserts_would() {
-        let keys: Vec<Vec<u8>> = (0..10_000u32).map(|i| i.to_le_bytes().to_vec()).collect();
-        let jobs: Vec<&[Vec<u8>]> = keys.chunks(37).collect();
-        let mut filled = Index::new();
-        filled.insert(&keys[5], entry(1 << 40));
-        filled.insert(&keys[6], entry(99));
-        filled.insert(b"older", entry(3));
-        let replaced = filled.fill(4, &jobs, 100, |chunk, filler| {
-            for key in *chunk {
-                filler.push(
-                    key,
-                    entry(u64::from_le_bytes([
-                        key[0], key[1], key[2], key[3], 0, 0, 0, 0,
-                    ])),
-                );
-            }
-        });
-
-        assert_eq!(replaced, 1, "keys[6] was below the floor");
-        assert_eq!(filled.len(), 10_001);
-        assert_eq!(filled.get(b"older"), Some(&entry(3)));
-        for (i, key) in keys.iter().enumerate() {
-            assert_eq!(filled.get(key), Some(&entry(i as u64)), "key {i}");
-        }
-        assert_eq!(filled.get(&10_000u32.to_le_bytes()), None);
-    }
-
-    #[test]
     fn apply_in_order_on_many_threads_ends_as_one_change_after_another_would() {
         let keys: Vec<[u8; 4]> = (0..5_000u32).map(u32::to_le_bytes).collect();
         let mut changes: Vec<(&[u8], Option<Entry>)> = Vec::new();
@@ -392,15 +278,6 @@ mod tests {
             assert_eq!(index.get(&keys[4]), Some(&entry(10_004)));
             assert_eq!(index.get(&keys[4_999]), Some(&entry(4_999)));
         }
-    }
-
-    #[test]
-    fn fill_with_no_jobs_leaves_the_index_as_it_was() {
-        let mut index = Index::new();
-        index.insert(b"a", entry(0));
-        assert_eq!(index.fill(4, &[] as &[u8], 0, |_, _| unreachable!()), 0);
-        assert_eq!(index.get(b"a"), Some(&entry(0)));
-        assert_eq!(index.len(), 1);
     }
 
     #[test]

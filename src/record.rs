@@ -122,6 +122,15 @@ impl Header {
         self.format
     }
 
+    pub fn fields(self) -> Fields {
+        Fields {
+            kind: self.kind,
+            format: self.format,
+            key_len: self.key_len,
+            value_len: self.value_len,
+        }
+    }
+
     pub fn payload_len(self) -> usize {
         self.key_len as usize + self.value_len as usize
     }
@@ -200,23 +209,68 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, DecodeError> {
     if stored_checksum != computed_checksum {
         return Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum));
     }
-    let kind = Kind::of(bytes[4])?;
-    let key_len = u16::from_le_bytes(bytes[5..7].try_into().unwrap());
+    let Fields {
+        kind,
+        format,
+        key_len,
+        value_len,
+    } = decode_fields(bytes[4..11].try_into().unwrap())?;
     let mut payload_checksum = [0u8; 8];
     payload_checksum[..bytes.len() - 11].copy_from_slice(&bytes[11..]);
-    let payload_checksum = u64::from_le_bytes(payload_checksum);
+    Ok(Header {
+        kind,
+        format,
+        key_len,
+        value_len,
+        payload_checksum: u64::from_le_bytes(payload_checksum),
+    })
+}
+
+/// Header bytes 4 to 11: the type byte, `key_len` and `value_len`. A hint
+/// entry starts with the same bytes.
+pub const FIELDS_LEN: usize = 7;
+
+/// What a header says about its record, apart from the payload checksum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fields {
+    pub kind: Kind,
+    pub format: Format,
+    pub key_len: u16,
+    pub value_len: u32,
+}
+
+impl Fields {
+    pub fn to_bytes(self) -> [u8; FIELDS_LEN] {
+        let mut bytes = [0u8; FIELDS_LEN];
+        bytes[0] = self.kind.type_byte(self.format);
+        bytes[1..3].copy_from_slice(&self.key_len.to_le_bytes());
+        bytes[3..].copy_from_slice(&self.value_len.to_le_bytes());
+        bytes
+    }
+
+    pub fn record_len(self) -> u64 {
+        (self.format.header_len() + usize::from(self.key_len)) as u64 + u64::from(self.value_len)
+    }
+}
+
+/// Checks a header's type and lengths against the limits and the record
+/// rules.
+pub fn decode_fields(bytes: &[u8; FIELDS_LEN]) -> Result<Fields, DecodeError> {
+    let kind = Kind::of(bytes[0])?;
+    let format = Format::of(bytes[0]);
+    let key_len = u16::from_le_bytes([bytes[1], bytes[2]]);
+    let value_len = u32::from_le_bytes(bytes[3..].try_into().unwrap());
+    let fields = Fields {
+        kind,
+        format,
+        key_len,
+        value_len,
+    };
     if kind == Kind::Batch {
-        let value_len = u32::from_le_bytes(bytes[7..11].try_into().unwrap());
         if key_len != 0 || value_len != BATCH_PAYLOAD_LEN {
             return Err(DecodeError::Corrupt(CorruptionReason::BadBatch));
         }
-        return Ok(Header {
-            kind,
-            format,
-            key_len,
-            value_len,
-            payload_checksum,
-        });
+        return Ok(fields);
     }
     if key_len == 0 {
         return Err(DecodeError::Corrupt(CorruptionReason::EmptyKey));
@@ -228,7 +282,6 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, DecodeError> {
             max: MAX_KEY_LEN,
         }));
     }
-    let value_len = u32::from_le_bytes(bytes[7..11].try_into().unwrap());
     if value_len as usize > MAX_VALUE_LEN {
         return Err(DecodeError::Unsupported(UnsupportedReason::OverLimit {
             field: Field::Value,
@@ -245,13 +298,7 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, DecodeError> {
         }
         _ => {}
     }
-    Ok(Header {
-        kind,
-        format,
-        key_len,
-        value_len,
-        payload_checksum,
-    })
+    Ok(fields)
 }
 
 /// Checks the payload CRC and builds the record.

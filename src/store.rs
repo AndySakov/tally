@@ -11,7 +11,7 @@ use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
 use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
-    Format, HEADER_LEN, Header, IndexOp, Record, SHORTEST_HEADER_LEN, decode_header,
+    Fields, Format, HEADER_LEN, Header, IndexOp, Kind, Record, SHORTEST_HEADER_LEN, decode_header,
     decode_index_op, decode_payload, encode, encode_set,
 };
 use crate::segment::{Segment, hint_name, log_name, parse_hint_name, parse_log_name};
@@ -175,7 +175,13 @@ impl<F: Fs> Store<F> {
         let mut index = Index::new();
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
-            match scan(segment, &mut index, segment.base, segment.end()) {
+            match scan(
+                segment,
+                &mut index,
+                segment.base,
+                segment.end(),
+                &mut |_, _| {},
+            ) {
                 Ok(end) if end < segment.end() && i + 1 < segments.len() => {
                     bad = Some((segment, end));
                     break;
@@ -389,14 +395,18 @@ impl<F: Fs> Store<F> {
                 reader.read_exact(&mut payload_buf)?;
                 let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
                 match op {
-                    IndexOp::Set { key, value_len, .. } => {
+                    IndexOp::Set { key, .. } => {
                         if let Some(entry) = self.index.get_mut(key.as_bytes())
                             && entry.offset == offset
                         {
                             entry.offset = output.base + written + buffer.len() as u64;
                             entry.format = Format::Crc64;
                             moved.push(offset);
-                            hint.push(key.as_bytes(), value_len)?;
+                            let fields = Fields {
+                                format: Format::Crc64,
+                                ..header.fields()
+                            };
+                            hint.push(fields, key.as_bytes())?;
                             match header.format() {
                                 Format::Crc64 => {
                                     buffer.extend_from_slice(header_bytes);
@@ -686,7 +696,13 @@ impl<F: Fs> Store<F> {
             if len != segment.end() {
                 return Err(mismatch(len.min(segment.end())));
             }
-            let end = scan(segment, &mut scanned, segment.base, segment.end())?;
+            let end = scan(
+                segment,
+                &mut scanned,
+                segment.base,
+                segment.end(),
+                &mut |_, _| {},
+            )?;
             if end != segment.end() {
                 return Err(mismatch(end));
             }
@@ -1020,12 +1036,14 @@ fn try_load<F: Fs>(
     segments: &mut [Segment<F::File>],
 ) -> Result<Result<Index, HintFailure>, Error> {
     let mut hints = Vec::with_capacity(segments.len());
+    // The largest hint's Set count, not their sum: a key overwritten in
+    // every segment is counted in each.
     let mut count = 0u64;
     for segment in segments.iter() {
         let hint = match fs.open_existing(&dir.join(hint_name(segment.base))) {
             Ok(file) => match hint::trailer(&file) {
                 Ok(trailer) => {
-                    count = count.saturating_add(trailer.count);
+                    count = count.max(trailer.count);
                     Some(file)
                 }
                 Err(invalid) => return Ok(Err((segment.base, invalid))),
@@ -1042,15 +1060,45 @@ fn try_load<F: Fs>(
     let mut index = Index::with_capacity(capacity);
     let newest = segments.len() - 1;
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
-        let hinted = match hint {
-            Some(file) => match read_hint(&file, segment, &mut index, HINT_SIZES, PARALLEL_FROM) {
-                Ok(hinted) => hinted,
+        let (hinted, tail) = match &hint {
+            Some(file) => match read_hint(file, segment, &mut index, HINT_WINDOW, PARALLEL_FROM) {
+                Ok((hinted, tail)) => (hinted, Some(tail)),
                 Err(invalid) => return Ok(Err((segment.base, invalid))),
             },
-            None => segment.base,
+            None => (segment.base, None),
         };
         let len = segment.end();
-        let end = scan(&*segment, &mut index, hinted, len)?;
+        // A sealed segment never changes, so a hint for all of it stays
+        // valid. Not fsynced: a hint that didn't land whole fails its
+        // checksum, and the next open removes it and reads the segment.
+        let mut created = None;
+        let mut writer = None;
+        if i < newest && hinted < len {
+            let opened = match (&hint, tail) {
+                (Some(file), Some(tail)) => hint::Writer::extend(file, tail),
+                _ => fs
+                    .open_or_create(&dir.join(hint_name(segment.base)))
+                    .map(|file| hint::Writer::new(created.insert(file))),
+            };
+            match opened {
+                Ok(opened) => writer = Some(opened),
+                Err(err) => hint_not_written(segment.base, &err),
+            }
+        }
+        let end = scan(&*segment, &mut index, hinted, len, &mut |fields, key| {
+            if let Some(hint) = &mut writer
+                && let Err(err) = hint.push(fields, key)
+            {
+                hint_not_written(segment.base, &err);
+                writer = None;
+            }
+        })?;
+        if let Some(hint) = writer.take()
+            && end == len
+            && let Err(err) = hint.finish(len - segment.base)
+        {
+            hint_not_written(segment.base, &err);
+        }
         if end < len {
             if i < newest {
                 return Err(Error::Corruption {
@@ -1070,25 +1118,29 @@ fn try_load<F: Fs>(
     Ok(Ok(index))
 }
 
-/// Hints with fewer entries than this are read on one thread.
+fn hint_not_written(base: u64, err: &io::Error) {
+    log::warn!(
+        "could not write the hint for the segment at {base} ({err}); the next open reads it"
+    );
+}
+
+/// Hints with fewer Set entries than this are read on one thread.
 const PARALLEL_FROM: u64 = 100_000;
 const MAX_THREADS: usize = 8;
-const HINT_SIZES: hint::Sizes = hint::Sizes {
-    window_bytes: 16 << 20,
-    chunk_entries: 8192,
-};
+const HINT_WINDOW: usize = 2 << 20;
 
-/// Adds the entries of `segment`'s hint `file` to `index`, a window of
-/// `sizes` at a time: on one thread below `parallel_from` entries, on up to
-/// `MAX_THREADS` from there. Returns the log offset the hint covers to. On
-/// `Err`, what it added must be thrown away.
+/// Applies the records `segment`'s hint `file` describes to `index`, in
+/// order, a window of `window_bytes` at a time: on one thread below
+/// `parallel_from` Set entries, on up to `MAX_THREADS` from there. Returns
+/// the log offset the hint covers to, and where to extend it from. On
+/// `Err`, what it applied must be thrown away.
 fn read_hint<L: LogFile>(
     file: &impl LogFile,
     segment: &Segment<L>,
     index: &mut Index,
-    sizes: hint::Sizes,
+    window_bytes: usize,
     parallel_from: u64,
-) -> Result<u64, hint::Invalid> {
+) -> Result<(u64, hint::Tail), hint::Invalid> {
     let trailer = hint::trailer(file)?;
     if trailer.log_len > segment.len {
         return Err(hint::Invalid("the segment is shorter than the hint says"));
@@ -1101,27 +1153,26 @@ fn read_hint<L: LogFile>(
             .min(MAX_THREADS)
     };
     let base = segment.base;
-    let mut replaced = 0;
-    hint::read_entries(file, trailer, sizes, |window| {
-        replaced += index.fill(threads, window.chunks(), base, |chunk, filler| {
-            for (key, offset, value_len, format) in window.entries(chunk) {
-                let key_len = u16::try_from(key.len()).expect("read_entries checked it");
-                filler.push(
+    let tail = hint::read_entries(file, trailer, window_bytes, |window| {
+        let changes: Vec<(&[u8], Option<Entry>)> = window
+            .entries()
+            .filter_map(|(fields, key, offset)| match fields.kind {
+                Kind::Set => Some((
                     key,
-                    Entry {
+                    Some(Entry {
                         offset: base + offset,
-                        value_len,
-                        key_len,
-                        format,
-                    },
-                );
-            }
-        });
+                        value_len: fields.value_len,
+                        key_len: fields.key_len,
+                        format: fields.format,
+                    }),
+                )),
+                Kind::Delete => Some((key, None)),
+                Kind::Batch => None,
+            })
+            .collect();
+        index.apply_in_order(threads, &changes);
     })?;
-    if replaced > 0 {
-        return Err(hint::Invalid("a key appears twice"));
-    }
-    Ok(base + trailer.log_len)
+    Ok((base + trailer.log_len, tail))
 }
 
 /// Scans of fewer bytes than this apply each record as it is read, on one
@@ -1137,8 +1188,16 @@ const SCAN_BUFFER: usize = 1 << 20;
 /// one is a torn tail from its start, and an error inside one is reported
 /// at its start, so `repair` moves the whole batch. From
 /// `PARALLEL_SCAN_FROM` bytes, the index takes the records a window at a
-/// time on up to `MAX_THREADS` threads.
-fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<u64, Error> {
+/// time on up to `MAX_THREADS` threads. Calls `record` with every record
+/// read, in log order, Batch records too, including any that a torn batch
+/// then leaves out.
+fn scan(
+    file: &impl LogFile,
+    index: &mut Index,
+    start: u64,
+    len: u64,
+    record: &mut impl FnMut(Fields, &[u8]),
+) -> Result<u64, Error> {
     let threads = if len - start < PARALLEL_SCAN_FROM {
         1
     } else {
@@ -1146,7 +1205,7 @@ fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<
             .map_or(1, NonZero::get)
             .min(MAX_THREADS)
     };
-    scan_on(file, index, start, len, threads)
+    scan_on(file, index, start, len, threads, record)
 }
 
 /// On more than one thread, this one reads while another applies what it
@@ -1157,9 +1216,16 @@ fn scan_on(
     start: u64,
     len: u64,
     threads: usize,
+    record: &mut impl FnMut(Fields, &[u8]),
 ) -> Result<u64, Error> {
     if threads == 1 {
-        return scan_into(file, start, len, &mut |offset, op| apply(index, offset, op));
+        return scan_into(
+            file,
+            start,
+            len,
+            &mut |offset, op| apply(index, offset, op),
+            record,
+        );
     }
     let (send, receive) = mpsc::sync_channel::<Window>(1);
     thread::scope(|scope| {
@@ -1173,12 +1239,18 @@ fn scan_on(
             send.send(window)
                 .expect("the applier runs until the sender is dropped")
         };
-        let end = scan_into(file, start, len, &mut |offset, op| {
-            window.push(offset, op);
-            if window.changes.len() == SCAN_WINDOW {
-                sent(mem::take(&mut window));
-            }
-        });
+        let end = scan_into(
+            file,
+            start,
+            len,
+            &mut |offset, op| {
+                window.push(offset, op);
+                if window.changes.len() == SCAN_WINDOW {
+                    sent(mem::take(&mut window));
+                }
+            },
+            record,
+        );
         if end.is_ok() {
             sent(window);
         }
@@ -1190,12 +1262,13 @@ fn scan_on(
 }
 
 /// Calls `sink` with each record from `start` to `len` that is to be
-/// applied, in order, with its offset.
+/// applied, in order, with its offset, and `record` with every record read.
 fn scan_into(
     file: &impl LogFile,
     start: u64,
     len: u64,
     sink: &mut impl FnMut(u64, IndexOp),
+    record: &mut impl FnMut(Fields, &[u8]),
 ) -> Result<u64, Error> {
     let mut reader = Reader {
         inner: BufReader::with_capacity(
@@ -1208,9 +1281,11 @@ fn scan_into(
     let mut batch = Vec::new();
     let mut offset = start;
     while offset < len {
-        let Next::Op(record_len, op) = reader.next(offset, len)? else {
+        let Next::Op(header, op) = reader.next(offset, len)? else {
             return Ok(offset);
         };
+        record(header.fields(), key_of(&op));
+        let record_len = header.record_len();
         let IndexOp::Batch { body_len } = op else {
             sink(offset, op);
             offset += record_len;
@@ -1224,9 +1299,11 @@ fn scan_into(
         let mut at = body_start;
         while at < body_end {
             let next = reader.next(at, len).map_err(|err| err.moved_to(offset))?;
-            let Next::Op(len_here, op) = next else {
+            let Next::Op(header, op) = next else {
                 return Ok(offset);
             };
+            record(header.fields(), key_of(&op));
+            let len_here = header.record_len();
             if matches!(op, IndexOp::Batch { .. }) || len_here > body_end - at {
                 return Err(Error::Corruption {
                     offset,
@@ -1324,8 +1401,8 @@ struct Reader<R> {
 }
 
 enum Next {
-    /// A valid record and its length.
-    Op(u64, IndexOp),
+    /// A valid record.
+    Op(Header, IndexOp),
     /// The log from here to `len` is a torn or zero-filled tail.
     Torn,
 }
@@ -1355,7 +1432,7 @@ impl<R: Read> Reader<R> {
         self.payload_buf.resize(header.payload_len(), 0u8);
         self.inner.read_exact(&mut self.payload_buf)?;
         match decode_index_op(header, &self.payload_buf) {
-            Ok(op) => Ok(Next::Op(header.record_len(), op)),
+            Ok(op) => Ok(Next::Op(header, op)),
             Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
                 if all_zero(&self.payload_buf) && rest_is_zero(&mut self.inner)? =>
             {
@@ -1363,6 +1440,13 @@ impl<R: Read> Reader<R> {
             }
             Err(err) => Err(err.at(offset)),
         }
+    }
+}
+
+fn key_of(op: &IndexOp) -> &[u8] {
+    match op {
+        IndexOp::Set { key, .. } | IndexOp::Delete { key } => key.as_bytes(),
+        IndexOp::Batch { .. } => &[],
     }
 }
 
@@ -2945,13 +3029,9 @@ mod tests {
             map: None,
         };
         let mut one = Index::new();
-        let len_one = read_hint(&file, &segment, &mut one, HINT_SIZES, u64::MAX).unwrap();
-        let small = hint::Sizes {
-            window_bytes: 4096,
-            chunk_entries: 50,
-        };
+        let (len_one, _) = read_hint(&file, &segment, &mut one, HINT_WINDOW, u64::MAX).unwrap();
         let mut many = Index::new();
-        let len_many = read_hint(&file, &segment, &mut many, small, 0).unwrap();
+        let (len_many, _) = read_hint(&file, &segment, &mut many, 4096, 0).unwrap();
 
         assert_eq!((len_one, len_many), (segment.end(), segment.end()));
         assert_eq!(many.len(), 3000);
@@ -3017,8 +3097,14 @@ mod tests {
 
         let mut one = Index::new();
         let mut many = Index::new();
-        assert_eq!(scan_on(&file, &mut one, 0, len, 1).unwrap(), len - 9);
-        assert_eq!(scan_on(&file, &mut many, 0, len, 4).unwrap(), len - 9);
+        assert_eq!(
+            scan_on(&file, &mut one, 0, len, 1, &mut |_, _| {}).unwrap(),
+            len - 9
+        );
+        assert_eq!(
+            scan_on(&file, &mut many, 0, len, 4, &mut |_, _| {}).unwrap(),
+            len - 9
+        );
         assert_eq!(many.len(), one.len());
         assert_eq!(many.len(), 34_285);
         for i in 0..40_000u32 {
@@ -3037,7 +3123,14 @@ mod tests {
         for threads in [1, 4] {
             assert!(
                 matches!(
-                    scan_on(&file, &mut Index::new(), 0, log.len() as u64, threads),
+                    scan_on(
+                        &file,
+                        &mut Index::new(),
+                        0,
+                        log.len() as u64,
+                        threads,
+                        &mut |_, _| {},
+                    ),
                     Err(Error::Corruption {
                         offset,
                         reason: CorruptionReason::PayloadChecksum,
@@ -3130,6 +3223,311 @@ mod tests {
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
         assert_eq!(store.dead(), 0);
+    }
+
+    /// A hint's bytes, from its `entries`, Set count, log length and `crc`,
+    /// computed in Python.
+    fn hint_bytes(entries: &[&[u8]], count: u64, log_len: u64, crc: u64) -> Vec<u8> {
+        let mut bytes = b"TLYH\x02".to_vec();
+        for entry in entries {
+            bytes.extend_from_slice(entry);
+        }
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.extend_from_slice(&log_len.to_le_bytes());
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    /// Flips a byte of the segment at `base`, at `at` in its file.
+    fn damage(dir: &Path, base: u64, at: u64) {
+        let path = dir.join(log_name(base));
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[at as usize] ^= 0x01;
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn open_writes_a_hint_for_each_sealed_segment_it_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        store
+            .write(batch(&[(b"a", Some(b"1")), (b"b", Some(b"2"))]))
+            .unwrap();
+        store.delete(key(b"a")).unwrap();
+        put(&mut store, b"c", b"3");
+        drop(store);
+        assert_eq!(segment_bases(tmp.path()), [0, 69, 89]);
+
+        drop(Store::open_with(tmp.path(), segmented(1)).unwrap());
+        assert_eq!(
+            file_names(tmp.path()),
+            [
+                "tally.00000000000000000000.hint",
+                "tally.00000000000000000000.log",
+                "tally.00000000000000000069.hint",
+                "tally.00000000000000000069.log",
+                "tally.00000000000000000089.log",
+                "tally.lock",
+                "tally.log"
+            ],
+            "the active segment gets none"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join(hint_name(0))).unwrap(),
+            hint_bytes(
+                &[
+                    &[0x13, 0, 0, 8, 0, 0, 0],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'a'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
+                ],
+                2,
+                69,
+                0x908f_2205_8d4b_c596
+            )
+        );
+        assert_eq!(
+            fs::read(tmp.path().join(hint_name(69))).unwrap(),
+            hint_bytes(
+                &[&[0x12, 1, 0, 0, 0, 0, 0, b'a']],
+                0,
+                20,
+                0x11c1_da6b_3036_b216
+            )
+        );
+
+        // From the hints, open no longer reads b's record, so damage to its
+        // value shows up only when b is read.
+        damage(tmp.path(), 0, 68);
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert!(matches!(
+            store.get(&key(b"b")),
+            Err(Error::Corruption {
+                offset: 48,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(read(&store, b"a"), None);
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+    }
+
+    #[test]
+    fn open_extends_a_hint_that_covers_only_the_start_of_a_sealed_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(50)).unwrap();
+        put(&mut store, b"a", b"hi");
+        put(&mut store, b"b", b"2");
+        store.compact().unwrap();
+        put(&mut store, b"c", b"3");
+        put(&mut store, b"d", b"4");
+        drop(store);
+        assert_eq!(segment_bases(tmp.path()), [43, 107]);
+
+        drop(Store::open_with(tmp.path(), segmented(50)).unwrap());
+        assert_eq!(
+            fs::read(tmp.path().join(hint_name(43))).unwrap(),
+            hint_bytes(
+                &[
+                    &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'c'],
+                ],
+                3,
+                64,
+                0x4390_d75d_52fc_839d
+            )
+        );
+
+        damage(tmp.path(), 43, 63);
+        let store = Store::open_with(tmp.path(), segmented(50)).unwrap();
+        assert!(matches!(
+            store.get(&key(b"c")),
+            Err(Error::Corruption {
+                offset: 86,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(read(&store, b"d").as_deref(), Some(&b"4"[..]));
+    }
+
+    #[test]
+    fn a_store_opened_from_the_hints_open_wrote_matches_a_full_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(64)).unwrap();
+        let mut model = HashMap::new();
+        for i in 0..90u8 {
+            let k = [b'k', i % 7];
+            let other = [b'k', i % 5];
+            match i % 4 {
+                0 => {
+                    store.delete(key(&k)).unwrap();
+                    model.remove(&k);
+                }
+                1 => {
+                    store
+                        .write(batch(&[(&k, Some(&[i])), (&other, None)]))
+                        .unwrap();
+                    model.insert(k, vec![i]);
+                    model.remove(&other);
+                }
+                _ => {
+                    put(&mut store, &k, &[i]);
+                    model.insert(k, vec![i]);
+                }
+            }
+        }
+        drop(store);
+        let segments = segment_bases(tmp.path()).len();
+        assert!(segments > 20, "{segments} segments");
+
+        for _ in 0..2 {
+            let store = Store::open_with(tmp.path(), segmented(64)).unwrap();
+            store.verify().unwrap();
+            for i in 0..7 {
+                let k = [b'k', i];
+                assert_eq!(read(&store, &k), model.get(&k).cloned(), "{k:?}");
+            }
+        }
+        let hints = file_names(tmp.path())
+            .iter()
+            .filter(|n| n.ends_with(".hint"))
+            .count();
+        assert_eq!(hints, segments - 1);
+    }
+
+    #[test]
+    fn a_sealed_segment_from_before_64_bit_checksums_gets_a_hint_too() {
+        let mut old = Vec::new();
+        encode_as(Format::Crc32c, &set_record(b"a", b"hi"), &mut old);
+        let tmp = store_with_log(&old);
+        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&mut store, b"b", b"2");
+        drop(store);
+
+        drop(Store::open_with(tmp.path(), segmented(1)).unwrap());
+        assert_eq!(
+            fs::read(tmp.path().join(hint_name(0))).unwrap(),
+            hint_bytes(
+                &[&[0x01, 1, 0, 2, 0, 0, 0, b'a']],
+                1,
+                18,
+                0x500e_34e4_b61c_0fa6
+            )
+        );
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(store.index.get(b"a").unwrap().format, Format::Crc32c);
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        store.verify().unwrap();
+    }
+
+    fn open_on(fs: &MemFs, options: Options) -> Store<MemFs> {
+        Store::open_in(fs.clone(), Path::new("/db"), options).unwrap()
+    }
+
+    fn get_on(store: &Store<MemFs>, k: &[u8]) -> Option<Vec<u8>> {
+        store.get(&key(k)).unwrap().map(|v| v.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_hint_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
+        let fs = MemFs::new();
+        let mut store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        drop(store);
+        let hint = Path::new("/db").join(hint_name(0));
+
+        fs.limit_free_space(Some(10));
+        let store = open_on(&fs, segmented(1));
+        assert_eq!(fs.read(&hint).unwrap(), b"TLYH\x02\x11\x01\x00\x01\x00");
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+        drop(store);
+
+        fs.limit_free_space(None);
+        let store = open_on(&fs, segmented(1));
+        assert_eq!(
+            fs.read(&hint).unwrap(),
+            hint_bytes(
+                &[&[0x11, 1, 0, 1, 0, 0, 0, b'a']],
+                1,
+                21,
+                0xeba4_83e6_d395_4202
+            )
+        );
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_hint_extension_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
+        let fs = MemFs::new();
+        let mut store = open_on(&fs, segmented(50));
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.compact().unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.set(key(b"d"), value(b"4")).unwrap();
+        drop(store);
+        let hint = Path::new("/db").join(hint_name(43));
+        let compacted = fs.read(&hint).unwrap();
+        assert_eq!(compacted.len(), 5 + 16 + 24);
+
+        // Cutting the old trailer frees 24 bytes; the new entry and trailer
+        // need 32.
+        fs.limit_free_space(Some(0));
+        let store = open_on(&fs, segmented(50));
+        let cut = fs.read(&hint).unwrap();
+        assert_eq!(cut.len(), 5 + 16 + 24);
+        assert_eq!(cut[..21], compacted[..21]);
+        assert_eq!(cut[21..29], [0x11, 1, 0, 1, 0, 0, 0, b'c']);
+        assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+        drop(store);
+
+        fs.limit_free_space(None);
+        let store = open_on(&fs, segmented(50));
+        assert_eq!(
+            fs.read(&hint).unwrap(),
+            hint_bytes(
+                &[
+                    &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'c'],
+                ],
+                3,
+                64,
+                0x4390_d75d_52fc_839d
+            )
+        );
+        for (k, v) in [(b"a", &b"hi"[..]), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
+            assert_eq!(get_on(&store, k).as_deref(), Some(v));
+        }
+    }
+
+    #[test]
+    fn open_succeeds_when_it_cannot_write_a_hint() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&mut store, b"a", b"1");
+        put(&mut store, b"b", b"2");
+        drop(store);
+
+        let mode = |mode| fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode));
+        mode(0o555).unwrap();
+        let writable = fs::File::create(tmp.path().join("probe")).is_ok();
+        let opened = Store::open_with(tmp.path(), segmented(1));
+        mode(0o755).unwrap();
+        if writable {
+            // Run as root, which writes anyway: nothing to check.
+            return;
+        }
+        let store = opened.unwrap();
+        assert!(!tmp.path().join(hint_name(0)).exists());
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
     }
 
     #[test]
