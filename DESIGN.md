@@ -305,7 +305,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | Crate                      | Why                               |
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
-| `crc-fast`                 | CRC-64/NVME for payloads and hints, with hardware acceleration; default features off, which drops its C API and `no_std` panic handler |
+| `crc-fast`                 | CRC-64/NVME for payloads and hints, with hardware acceleration; default features off, which drops its C API (26 exported `extern "C"` symbols and the unsafe code behind them) |
 | `siphasher`                | 128-bit SipHash-1-3 for the index |
 | `log`                      | the recovery warning; the caller picks the logger |
 | `memmap2`                  | read-only maps of sealed segments: the one `unsafe` call, with its argument in `src/fs.rs` |
