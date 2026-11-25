@@ -29,7 +29,10 @@ pub mod fuzz {
     use std::path::Path;
 
     pub use crate::mem_fs::MemFs;
-    pub use crate::record::{HEADER_LEN, Record, decode_header, decode_payload, encode};
+    pub use crate::record::{
+        Format, HEADER_LEN, Record, SHORTEST_HEADER_LEN, decode_header, decode_payload, encode,
+        encode_as,
+    };
     use crate::{Error, Options, Store};
 
     /// A store on the in-memory disk, which has no syscalls to wait on.

@@ -55,7 +55,8 @@ let store = Store::open_with("data", options)?;
 ```
 
 A directory from an earlier tally, with one `tally.log`, is moved to segments on its first `open`. The move is
-one way: `tally.log` then holds a marker that earlier versions refuse to open.
+one way: `tally.log` then holds a marker that earlier versions refuse to open. Records with 64-bit checksums are one
+way too: a version from before them refuses a log that holds one, instead of misreading it.
 
 ## Numbers
 
@@ -118,9 +119,10 @@ cargo bench
 
 ## Design
 
-Every record is a 15-byte header with its own CRC32C, then the key and value with a second CRC32C. Because the
-header is checked on its own, a torn tail can't be mistaken for a corrupted length mid-file, which would
-otherwise drop acknowledged records. On `open`, a torn or zero-filled tail is truncated, fsynced and logged.
+Every record is a 19-byte header with its own CRC32C, then the key and value with a 64-bit CRC (CRC-64/NVME), so
+a corrupted value goes unnoticed about once in 2⁶⁴ instead of once in 2³². Because the header is checked on its
+own, a torn tail can't be mistaken for a corrupted length mid-file, which would otherwise drop acknowledged
+records. Records from before 64-bit checksums still read, and compaction rewrites them. On `open`, a torn or zero-filled tail is truncated, fsynced and logged.
 Any other damage fails `open` with its offset, and `Store::repair` moves the bad bytes to a side file before
 truncating. A failed fsync panics instead of retrying, because on Linux a retry can report success for data that
 never reached the disk.

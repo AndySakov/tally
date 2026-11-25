@@ -12,7 +12,7 @@ use std::path::Path;
 use proptest::prelude::*;
 use tally::{AutoCompact, Batch, Key, Options, Store, Value};
 
-const HEADER_LEN: u64 = 15;
+const HEADER_LEN: u64 = 19;
 
 /// Few distinct keys, so overwrites, deletes of live keys and deletes of
 /// missing keys all happen often.

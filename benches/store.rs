@@ -37,12 +37,14 @@ fn value(len: usize) -> Value {
 /// Encodes one Set record. A second, independent implementation of the
 /// format, so large fixtures can be written without one fsync per record.
 fn encode_set(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
-    let mut header = [0u8; 15];
-    header[4] = 1;
+    let mut header = [0u8; 19];
+    header[4] = 0x11;
     header[5..7].copy_from_slice(&(key.len() as u16).to_le_bytes());
     header[7..11].copy_from_slice(&(value.len() as u32).to_le_bytes());
-    let payload_checksum = crc32c::crc32c_append(crc32c::crc32c(key), value);
-    header[11..15].copy_from_slice(&payload_checksum.to_le_bytes());
+    let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
+    digest.update(key);
+    digest.update(value);
+    header[11..19].copy_from_slice(&digest.finalize().to_le_bytes());
     let header_checksum = crc32c::crc32c(&header[4..]);
     header[..4].copy_from_slice(&header_checksum.to_le_bytes());
     out.extend_from_slice(&header);
