@@ -1,5 +1,7 @@
 //! Runs random sequences of operations against a `Store` and a `HashMap`
-//! and checks they agree after every step, including across reopens.
+//! and checks they agree after every step, including across reopens. With
+//! automatic compaction off, the log must be exactly as long as the writes
+//! that reached it; with it on, at least as long as the live records.
 //!
 //! Every `set` and `delete` fsyncs (about 5 ms on macOS), so the default case
 //! count is small. For a longer run: `PROPTEST_CASES=2000 cargo test --test model`.
@@ -8,7 +10,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use proptest::prelude::*;
-use tally::{Batch, Key, Options, Store, Value};
+use tally::{AutoCompact, Batch, Key, Options, Store, Value};
 
 const HEADER_LEN: u64 = 15;
 
@@ -43,11 +45,20 @@ fn op() -> impl Strategy<Value = Op> {
 }
 
 /// Small segments, so writes roll into new ones and reads and reopens
-/// cross several.
-fn options() -> Options {
+/// cross several. Automatic compaction, if on, at half dead with no floor,
+/// so it cleans some segments and keeps others.
+fn options(auto: bool) -> Options {
     let mut options = Options::default();
     options.segment_bytes = 100;
+    options.auto_compact = auto.then(|| AutoCompact::new(50, 0)).flatten();
     options
+}
+
+fn live_len(model: &HashMap<u8, Vec<u8>>) -> u64 {
+    model
+        .iter()
+        .map(|(&k, v)| HEADER_LEN + key_bytes(k).len() as u64 + v.len() as u64)
+        .sum()
 }
 
 fn key_bytes(k: u8) -> [u8; 2] {
@@ -83,9 +94,9 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(cases()))]
 
     #[test]
-    fn store_matches_a_hashmap(ops in prop::collection::vec(op(), 1..40)) {
+    fn store_matches_a_hashmap(auto in any::<bool>(), ops in prop::collection::vec(op(), 1..40)) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), options()).unwrap();
+        let mut store = Store::open_with(tmp.path(), options(auto)).unwrap();
         let mut model: HashMap<u8, Vec<u8>> = HashMap::new();
         let mut expected_len = 0u64;
 
@@ -111,7 +122,7 @@ proptest! {
                 }
                 Op::Reopen => {
                     drop(store);
-                    store = Store::open_with(tmp.path(), options()).unwrap();
+                    store = Store::open_with(tmp.path(), options(auto)).unwrap();
                 }
                 Op::Batch(ops) => {
                     let mut batch = Batch::new();
@@ -137,11 +148,15 @@ proptest! {
                     }
                 }
             }
-            prop_assert_eq!(log_len(tmp.path()), expected_len);
+            if auto {
+                prop_assert!(log_len(tmp.path()) >= live_len(&model));
+            } else {
+                prop_assert_eq!(log_len(tmp.path()), expected_len);
+            }
         }
 
         drop(store);
-        let store = Store::open_with(tmp.path(), options()).unwrap();
+        let store = Store::open_with(tmp.path(), options(auto)).unwrap();
         for k in 0..KEY_SPACE {
             let got = store.get(&key(k)).unwrap();
             prop_assert_eq!(
