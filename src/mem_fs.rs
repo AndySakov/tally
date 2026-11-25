@@ -14,8 +14,8 @@
 //! `limit_free_space` makes the disk fill up: a write that doesn't fit
 //! lands what does and fails with `StorageFull`, as a full disk does, and
 //! truncating a file frees what it cut. `fail_truncates` makes every
-//! truncate fail, changing nothing, and `fail_dir_syncs` every directory
-//! sync. `fail_syncs` makes every file sync fail the way Linux does: the
+//! truncate fail, changing nothing, and `fail_dir_syncs_after(n)` every
+//! directory sync after the next `n`. `fail_syncs` makes every file sync fail the way Linux does: the
 //! pending changes never reach the disk, even after a later sync, while
 //! reads still see them.
 //!
@@ -314,7 +314,8 @@ struct State {
     /// Bytes writes can still add, or `None` for no limit.
     free: Option<u64>,
     fail_syncs: bool,
-    fail_dir_syncs: bool,
+    /// Directory syncs that succeed before every later one fails.
+    dir_syncs_left: Option<usize>,
     fail_truncates: bool,
 }
 
@@ -340,7 +341,7 @@ impl MemFs {
             snapshot: None,
             free: None,
             fail_syncs: false,
-            fail_dir_syncs: false,
+            dir_syncs_left: None,
             fail_truncates: false,
         })))
     }
@@ -381,7 +382,11 @@ impl MemFs {
     }
 
     pub(crate) fn fail_dir_syncs(&self, fail: bool) {
-        self.0.borrow_mut().fail_dir_syncs = fail;
+        self.0.borrow_mut().dir_syncs_left = fail.then_some(0);
+    }
+
+    pub(crate) fn fail_dir_syncs_after(&self, n: usize) {
+        self.0.borrow_mut().dir_syncs_left = Some(n);
     }
 
     pub(crate) fn fail_truncates(&self, fail: bool) {
@@ -528,10 +533,12 @@ impl Fs for MemFs {
     /// creations, replacements, renames away and removals all land together.
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.step();
-        if self.0.borrow().fail_dir_syncs {
-            return Err(io::Error::other("injected directory fsync failure"));
-        }
         let mut state = self.0.borrow_mut();
+        match &mut state.dir_syncs_left {
+            Some(0) => return Err(io::Error::other("injected directory fsync failure")),
+            Some(left) => *left -= 1,
+            None => {}
+        }
         let disk = &mut state.disk;
         disk.has_dir(path)?;
         let in_dir = |p: &Path| p.parent() == Some(path);

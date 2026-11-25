@@ -7,7 +7,10 @@
 //! gone after the cut, so a missing `sync` fails here.
 
 use std::collections::BTreeMap;
+use std::num::NonZero;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::thread;
 
 use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
@@ -137,19 +140,17 @@ fn read_state(store: &Store<MemFs>) -> State {
 
 /// Runs the workload with power cut before `step`. Returns the disk at the
 /// cut and the states it may hold: every operation finished before the cut,
-/// with the one in progress either applied or not, or for a group, any
-/// number of its writes applied from the first. One past the last step
-/// is a cut after the workload finished. `None` beyond that.
+/// with the one in progress either applied or not, a group as a whole. One
+/// past the last step is a cut after the workload finished. `None` beyond
+/// that.
 fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let fs = MemFs::new();
     fs.cut_before(step);
     let dir = Path::new(DIR);
     // states[i] is the state after the first i operations, the open counting
-    // as the first; ends[i] is the step count once operation i has finished;
-    // partial[i] are the states operation i may leave partway through.
+    // as the first; ends[i] is the step count once operation i has finished.
     let mut states = vec![State::new()];
     let mut ends = vec![0];
-    let mut partial = vec![Vec::new(), Vec::new()];
 
     let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
     states.push(State::new());
@@ -183,15 +184,6 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
                 }
             }
         }
-        let mut prefixes = Vec::new();
-        if let Op::Group(ops) = &op {
-            let mut prefix = state.clone();
-            for op in &ops[..ops.len() - 1] {
-                apply(&mut prefix, op);
-                prefixes.push(prefix.clone());
-            }
-        }
-        partial.push(prefixes);
         apply(&mut state, &op);
         states.push(state.clone());
         ends.push(fs.steps());
@@ -203,10 +195,8 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let snapshot = fs.snapshot()?;
     let in_flight = ends.iter().position(|&end| end >= step).unwrap();
     let mut candidates = vec![states[in_flight - 1].clone()];
-    for state in partial[in_flight].iter().chain([&states[in_flight]]) {
-        if !candidates.contains(state) {
-            candidates.push(state.clone());
-        }
+    if states[in_flight] != candidates[0] {
+        candidates.push(states[in_flight].clone());
     }
     Some((snapshot, candidates))
 }
@@ -263,18 +253,31 @@ fn check_recovery(
     checked
 }
 
+/// Each thread takes the next step to cut at until the workload runs out:
+/// every step reruns the workload on a disk of its own.
 #[test]
 fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
-    let mut checked = 0;
-    for step in 1.. {
-        let Some((snapshot, candidates)) = cut_workload(step) else {
-            break;
-        };
-        for cut in snapshot.cuts() {
-            let context = format!("cut before step {step} {cut:?}");
-            checked += check_recovery(&snapshot, cut, &candidates, 1, &context);
+    let next = AtomicU64::new(1);
+    let checked = AtomicUsize::new(0);
+    let threads = thread::available_parallelism().map_or(1, NonZero::get);
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let step = next.fetch_add(1, Ordering::Relaxed);
+                    let Some((snapshot, candidates)) = cut_workload(step) else {
+                        break;
+                    };
+                    for cut in snapshot.cuts() {
+                        let context = format!("cut before step {step} {cut:?}");
+                        let disks = check_recovery(&snapshot, cut, &candidates, 1, &context);
+                        checked.fetch_add(disks, Ordering::Relaxed);
+                    }
+                }
+            });
         }
-    }
+    });
+    let checked = checked.into_inner();
     assert!(checked > 50, "only {checked} disks checked");
     println!("power cut: {checked} disks checked");
 }
@@ -359,6 +362,70 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
             assert_eq!(
                 store.get(&Key::try_from(&b"a"[..]).unwrap()).unwrap(),
                 Some(Value::try_from(&b"hi"[..]).unwrap()),
+                "{context}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_power_cut_while_repairing_a_segment_header_never_loses_a_byte() {
+    let dir = Path::new(DIR);
+    let damaged_path = dir.join(log_name(0));
+    let side_path = dir.join(format!("{LOG_FILE_NAME}.corrupt-0"));
+    let set = |k: &[u8], v: &[u8], at: u64| {
+        let mut bytes = Vec::new();
+        let record = Record::Set {
+            key: Key::try_from(k).unwrap(),
+            value: Value::try_from(v).unwrap(),
+        };
+        encode(&record, Place::Top, at, &mut bytes);
+        bytes
+    };
+    let mut original = segment_file(0, &set(b"a", b"hi", 0));
+    original[14] ^= 0x01;
+    let empty = segment_file(0, b"");
+    let later = segment_file(22, &set(b"b", b"2", 22));
+    let put = |fs: &MemFs| {
+        fs.put(&damaged_path, &original);
+        fs.put(&dir.join(log_name(22)), &later);
+    };
+
+    let fs = MemFs::new();
+    put(&fs);
+    Store::repair_in(&fs, dir).unwrap();
+    let steps = fs.steps();
+
+    for step in 1..=steps {
+        let fs = MemFs::new();
+        put(&fs);
+        fs.cut_before(step);
+        Store::repair_in(&fs, dir).unwrap();
+        let snapshot = fs.snapshot().unwrap();
+        for cut in snapshot.cuts() {
+            let context = format!("repair cut before step {step} {cut:?}");
+            let fs = MemFs::after(&snapshot, cut);
+            let log = fs.read(&damaged_path).unwrap();
+            if log != original {
+                assert_eq!(
+                    log, empty,
+                    "{context}: segment replaced with the wrong bytes"
+                );
+                assert_eq!(
+                    fs.read(&side_path).as_deref(),
+                    Some(&original[..]),
+                    "{context}: the segment was replaced before the side file was durable"
+                );
+            }
+
+            let rerun = Store::repair_in(&fs, dir).unwrap();
+            assert_eq!(rerun.is_some(), log == original, "{context}");
+            assert_eq!(fs.read(&damaged_path).unwrap(), empty, "{context}");
+            assert_eq!(fs.read(&side_path).unwrap(), original, "{context}");
+            let store = Store::open_in(fs.clone(), dir, options()).unwrap();
+            assert_eq!(
+                store.get(&Key::try_from(&b"b"[..]).unwrap()).unwrap(),
+                Some(Value::try_from(&b"2"[..]).unwrap()),
                 "{context}"
             );
         }

@@ -3,6 +3,7 @@
 mod batch;
 mod constants;
 mod error;
+mod filter;
 pub mod fs;
 mod hint;
 mod index;
