@@ -218,7 +218,7 @@ An automatic compaction never turns a successful write or `open` into an error: 
 `Store<F: Fs = OsFs>` reaches the disk only through two traits in `tally::fs`, so the power-cut tests can swap in an in-memory disk:
 
 - `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `hard_link`, `same_file`, `sync_dir`, `list`, with `type File: LogFile`.
-- `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, `try_lock`. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
+- `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, `try_lock`, and a hidden `map(len)` that only the real file implements. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
 
 Both traits are sealed: public because `Store`'s type parameter is, but implementable only inside tally. `Store::open` and `Store::repair` are defined on `Store<OsFs>` (a default type parameter is not used for inference, so a generic `open` would need annotations); the generic versions are crate-private. The traits return errors; the panic on a failed fsync stays in `Store`.
 
@@ -250,6 +250,10 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 3. Verify both checksums and that the stored key equals the requested key.
 4. Return the value. Any failure returns a corruption error, never `None`.
 
+A sealed segment (every one but the last) is mapped into memory read-only when it is sealed, on `open` or when a write starts the next one, and a read inside it copies from the map instead of calling `pread`. That took a 1 KiB hit in a sealed segment from 1.03 µs to 0.49 µs; reads from the active segment still use `pread`, since it grows. The checks in steps 2 and 3 are the same either way, so damage on disk is still reported, not returned.
+
+A map is undefined behaviour if its file changes underneath it, and on Unix a file truncated under a map kills the process with `SIGBUS` on the next read past the new end. tally never writes to or truncates a sealed segment while a `Store` has it: writes go to the last segment, compaction removes sealed segments without truncating them (removing a mapped file is safe on Unix), and `repair`, which does truncate them, takes the same lock as `open`. `Segment` asserts that a mapped segment takes no write or truncation, so a bug that tried would panic before touching the file. Another process writing the files anyway is outside what tally can guard against. If a map fails, reads fall back to `pread`. The in-memory disk has no maps, so the power-cut tests read with positioned reads as before.
+
 ## Errors
 
 One error enum, marked `#[non_exhaustive]` so variants can be added without breaking callers. Grouped by what the caller can do:
@@ -272,7 +276,7 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 - **Model test** (`tests/model.rs`): random sequences of set, get, delete, batch and reopen against a `HashMap`, with 100-byte segments, checking every read after every step. Half the cases run with automatic compaction at 50% dead and no floor, so it cleans some segments and keeps others, and check the log is at least as long as the live records; the rest check the log is exactly as long as the writes. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
 - **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
 - **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records and batches, then damaged), `ops` (the model test, coverage-guided, on the in-memory disk, where it runs about 4 times faster than on files; the input chooses whether automatic compaction runs), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
-- **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `set` next to a bare append + `sync_all` baseline and with overwrites of 1,000 keys under the default automatic compaction (which fails if the log outgrows twice its live size, so compaction must have run), `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
+- **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `set` next to a bare append + `sync_all` baseline and with overwrites of 1,000 keys under the default automatic compaction (which fails if the log outgrows twice its live size, so compaction must have run), `get` hit in the active and in a sealed segment, and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
 
@@ -290,6 +294,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | `crc32c`                   | CRC32C with hardware acceleration |
 | `siphasher`                | 128-bit SipHash-1-3 for the index |
 | `log`                      | the recovery warning; the caller picks the logger |
+| `memmap2`                  | read-only maps of sealed segments: the one `unsafe` call, with its argument in `src/fs.rs` |
 | `tempfile` (dev)           | isolated directories for tests    |
 | `proptest` (dev)           | model and codec property tests    |
 | `criterion` (dev)          | benchmarks                        |

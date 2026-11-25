@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 crc32c = "0.6.9"
 log = "0.4.35"
+memmap2 = "0.9.12"
 siphasher = "1.0.4"
 
 [dev-dependencies]

@@ -68,7 +68,8 @@ Criterion on an M1 Pro running macOS, where `sync_all` is `F_FULLFSYNC` and flus
 | Baseline: bare append and `sync_all` of the same record | 5.51 ms, 181 writes/s |
 | `write`, a batch of 100 sets of 1 KiB | 5.97 ms, 16,752 sets/s |
 | `write`, a batch of 1,000 sets of 1 KiB | 10.6 ms, 93,993 sets/s |
-| `get`, 1 KiB value | 1.03 µs |
+| `get`, 1 KiB value in the active segment | 1.03 µs |
+| `get`, 1 KiB value in a sealed segment (memory-mapped) | 0.49 µs |
 | `get`, missing key | 14 ns |
 | `open`, 100k records | 12.6 ms |
 | `compact`, 100k live records of 100 B | 44.2 ms |
