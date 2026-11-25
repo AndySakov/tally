@@ -1,4 +1,6 @@
-//! Builds a log from arbitrary records, optionally damages it, and opens it.
+//! Builds a log from arbitrary records and batches, optionally damages it,
+//! and opens it. A batch is one unit: applied whole or not at all, and any
+//! error inside it is reported at its start.
 //!
 //! - Undamaged: `open` succeeds and every key reads back the value the
 //!   records describe.
@@ -24,6 +26,32 @@ use tally::{CorruptionReason, Error, Key, Store, Value};
 enum Op {
     Set { key: u8, value: Vec<u8> },
     Delete { key: u8 },
+    Batch(Vec<Inner>),
+}
+
+#[derive(Arbitrary, Debug)]
+enum Inner {
+    Set { key: u8, value: Vec<u8> },
+    Delete { key: u8 },
+}
+
+/// The record for one set or delete, applied to `state`. `None` for a set
+/// whose value is not a valid `Value`.
+fn record(op: Inner, state: &mut State) -> Option<Record> {
+    match op {
+        Inner::Set { key: k, value } => {
+            let v = Value::try_from(&value[..]).ok()?;
+            state.insert(k, value);
+            Some(Record::Set {
+                key: key(k),
+                value: v,
+            })
+        }
+        Inner::Delete { key: k } => {
+            state.remove(&k);
+            Some(Record::Delete { key: key(k) })
+        }
+    }
 }
 
 #[derive(Arbitrary, Debug)]
@@ -57,30 +85,50 @@ enum Expect {
 
 fuzz_target!(|input: Input| {
     let mut log = Vec::new();
-    // `boundaries[i]` is the log length after `i` records; `states[i]` is the
-    // key-value state after them.
+    // `boundaries[i]` is the log length after `i` units (a record or a whole
+    // batch); `states[i]` is the key-value state after them. `starts` holds
+    // each record's start and the start of the unit it belongs to.
     let mut boundaries = vec![0];
     let mut states = vec![State::new()];
+    let mut starts: Vec<(usize, usize)> = Vec::new();
     let mut state = State::new();
 
     for op in input.ops {
-        let record = match op {
-            Op::Set { key: k, value } => {
-                let Ok(v) = Value::try_from(&value[..]) else {
+        let unit = log.len();
+        match op {
+            Op::Set { key, value } => {
+                let Some(record) = record(Inner::Set { key, value }, &mut state) else {
                     continue;
                 };
-                state.insert(k, value);
-                Record::Set {
-                    key: key(k),
-                    value: v,
+                starts.push((unit, unit));
+                encode(&record, &mut log);
+            }
+            Op::Delete { key } => {
+                let record = record(Inner::Delete { key }, &mut state).unwrap();
+                starts.push((unit, unit));
+                encode(&record, &mut log);
+            }
+            Op::Batch(inner) => {
+                let mut body = Vec::new();
+                let mut inner_starts = Vec::new();
+                for op in inner {
+                    if let Some(record) = record(op, &mut state) {
+                        inner_starts.push(body.len());
+                        encode(&record, &mut body);
+                    }
                 }
+                starts.push((unit, unit));
+                encode(
+                    &Record::Batch {
+                        body_len: body.len() as u64,
+                    },
+                    &mut log,
+                );
+                let body_start = log.len();
+                starts.extend(inner_starts.into_iter().map(|s| (body_start + s, unit)));
+                log.extend_from_slice(&body);
             }
-            Op::Delete { key: k } => {
-                state.remove(&k);
-                Record::Delete { key: key(k) }
-            }
-        };
-        encode(&record, &mut log);
+        }
         boundaries.push(log.len());
         states.push(state.clone());
     }
@@ -105,8 +153,8 @@ fuzz_target!(|input: Input| {
             }
             let i = at as usize % log.len();
             log[i] ^= mask;
-            let r = boundaries.iter().rposition(|&b| b <= i).unwrap();
-            let start = boundaries[r];
+            let &(start, unit) = starts.iter().rfind(|&&(s, _)| s <= i).unwrap();
+            let r = boundaries.iter().position(|&b| b == unit).unwrap();
             let (covered_from, reason) = if i - start < HEADER_LEN {
                 (start, CorruptionReason::HeaderChecksum)
             } else {
@@ -115,11 +163,11 @@ fuzz_target!(|input: Input| {
             if log[covered_from..].iter().all(|&b| b == 0) {
                 Expect::Opens {
                     state: states.swap_remove(r),
-                    len: start,
+                    len: unit,
                 }
             } else {
                 Expect::Corrupt {
-                    offset: start as u64,
+                    offset: unit as u64,
                     reason,
                 }
             }
@@ -132,8 +180,9 @@ fuzz_target!(|input: Input| {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("tally.log");
-    std::fs::write(&path, &log).unwrap();
+    std::fs::write(dir.path().join("tally.log"), &log).unwrap();
+    // `open` makes a log from before segments the segment at 0.
+    let path = dir.path().join("tally.00000000000000000000.log");
     let opened = Store::open(dir.path());
 
     match expect {

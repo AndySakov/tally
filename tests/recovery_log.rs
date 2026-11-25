@@ -42,7 +42,7 @@ fn open_warns_with_the_offset_and_bytes_dropped() {
     drop(store);
     let mut log = std::fs::OpenOptions::new()
         .append(true)
-        .open(dir.join("tally.log"))
+        .open(dir.join("tally.00000000000000000000.log"))
         .unwrap();
     std::io::Write::write_all(&mut log, &[0u8; 14]).unwrap();
     drop(log);

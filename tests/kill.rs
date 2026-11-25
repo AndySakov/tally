@@ -2,7 +2,7 @@
 //! random delay, and checks that no acknowledged write was lost.
 //!
 //! The test binary is its own child: with `TALLY_KILL_CHILD` set it runs a
-//! seeded sequence of set, delete, reopen and compact against a store and prints
+//! seeded sequence of set, delete, reopen, compact and batch against a store and prints
 //! `ack <i>` after each one returns `Ok`. The parent regenerates the same
 //! sequence from the seed, so it knows what every ack means.
 //!
@@ -29,7 +29,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tally::{AutoCompact, Key, Options, Store, Value};
+use tally::{AutoCompact, Batch, Key, Options, Store, Value};
 
 const CHILD_DIR: &str = "TALLY_KILL_CHILD";
 const CHILD_SEED: &str = "TALLY_KILL_CHILD_SEED";
@@ -46,6 +46,8 @@ enum Op {
     Delete(u8),
     Reopen,
     Compact,
+    /// Sets (`Some`) and deletes (`None`) written as one batch.
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
 /// splitmix64: small, seedable, and good enough to pick test operations.
@@ -71,15 +73,25 @@ fn ops(seed: u64) -> impl Iterator<Item = Op> {
     let mut rng = Rng(seed);
     (0..MAX_OPS).map(move |i| {
         let k = rng.below(KEY_SPACE) as u8;
-        match rng.below(20) {
-            0..=11 => {
-                let len = 1 + rng.below(4096) as usize;
-                let tag = format!("{seed:x}-{i}-");
-                Op::Set(k, tag.bytes().cycle().take(len).collect())
-            }
+        let tag = format!("{seed:x}-{i}-");
+        let value = |rng: &mut Rng, j: u64| -> Vec<u8> {
+            let len = 1 + rng.below(4096) as usize;
+            format!("{tag}{j}-").bytes().cycle().take(len).collect()
+        };
+        match rng.below(22) {
+            0..=11 => Op::Set(k, value(&mut rng, 0)),
             12..=17 => Op::Delete(k),
             18 => Op::Reopen,
-            _ => Op::Compact,
+            19 => Op::Compact,
+            _ => Op::Batch(
+                (0..1 + rng.below(8))
+                    .map(|j| {
+                        let k = rng.below(KEY_SPACE) as u8;
+                        let v = (rng.below(3) != 0).then(|| value(&mut rng, j + 1));
+                        (k, v)
+                    })
+                    .collect(),
+            ),
         }
     })
 }
@@ -91,6 +103,14 @@ fn apply(state: &mut State, op: &Op) {
         }
         Op::Delete(k) => {
             state.remove(k);
+        }
+        Op::Batch(ops) => {
+            for (k, v) in ops {
+                match v {
+                    Some(v) => state.insert(*k, v.clone()),
+                    None => state.remove(k),
+                };
+            }
         }
         Op::Reopen | Op::Compact => {}
     }
@@ -112,10 +132,13 @@ fn read_state(store: &Store) -> State {
 }
 
 /// Compacts whenever half the log is dead, so kills also land inside
-/// automatic compactions, during writes and during `open`.
+/// automatic compactions, during writes and during `open`. Segments of
+/// 16 KiB, a few values each, so compactions clean some segments and keep
+/// others.
 fn open(dir: &Path) -> Result<Store, tally::Error> {
     let mut options = Options::default();
     options.auto_compact = AutoCompact::new(50, 0);
+    options.segment_bytes = 16 << 10;
     Store::open_with(dir, options)
 }
 
@@ -134,6 +157,16 @@ fn child(dir: &Path, seed: u64) {
                 store = open(dir).unwrap_or_else(|err| fail(&what, err));
             }
             Op::Compact => store.compact().unwrap_or_else(|err| fail(&what, err)),
+            Op::Batch(ops) => {
+                let mut batch = Batch::new();
+                for (k, v) in ops {
+                    match v {
+                        Some(v) => batch.set(key(k), Value::try_from(&v[..]).unwrap()),
+                        None => batch.delete(key(k)),
+                    };
+                }
+                store.write(batch).unwrap_or_else(|err| fail(&what, err));
+            }
         }
         println!("ack {i}");
     }

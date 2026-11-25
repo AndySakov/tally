@@ -37,3 +37,10 @@ path = "fuzz_targets/ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "hint"
+path = "fuzz_targets/hint.rs"
+test = false
+doc = false
+bench = false

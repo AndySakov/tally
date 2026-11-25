@@ -12,8 +12,9 @@ use std::path::Path;
 use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::record::{Record, encode};
+use crate::segment::{hint_name, log_name};
 use crate::store::LOG_FILE_NAME;
-use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
+use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
 
@@ -24,6 +25,7 @@ type State = BTreeMap<u8, Vec<u8>>;
 fn options() -> Options {
     Options {
         auto_compact: AutoCompact::new(50, 0),
+        segment_bytes: 64,
     }
 }
 
@@ -33,6 +35,8 @@ enum Op {
     Delete(u8),
     Reopen,
     Compact,
+    /// Sets (`Some`) and deletes (`None`), as one batch.
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
 fn key(k: u8) -> Key {
@@ -48,6 +52,12 @@ fn workload() -> Vec<Op> {
         Delete(2),
         Delete(3),
         Compact,
+        Batch(vec![
+            (5, Some(b"five".to_vec())),
+            (1, None),
+            (6, Some(vec![b'z'; 200])),
+            (5, Some(b"FIVE".to_vec())),
+        ]),
         Reopen,
         Set(3, b"three".to_vec()),
         Delete(1),
@@ -56,6 +66,7 @@ fn workload() -> Vec<Op> {
         Compact,
         Compact,
         Set(4, vec![b'y'; 40]),
+        Batch(vec![(6, None), (4, Some(b"four".to_vec())), (2, None)]),
     ]
 }
 
@@ -66,6 +77,14 @@ fn apply(state: &mut State, op: &Op) {
         }
         Op::Delete(k) => {
             state.remove(k);
+        }
+        Op::Batch(ops) => {
+            for (k, v) in ops {
+                match v {
+                    Some(v) => state.insert(*k, v.clone()),
+                    None => state.remove(k),
+                };
+            }
         }
         Op::Reopen | Op::Compact => {}
     }
@@ -110,6 +129,16 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
                 store = Store::open_in(fs.clone(), dir, options()).unwrap();
             }
             Op::Compact => store.compact().unwrap(),
+            Op::Batch(ops) => {
+                let mut batch = Batch::new();
+                for (k, v) in ops {
+                    match v {
+                        Some(v) => batch.set(key(*k), Value::try_from(&v[..]).unwrap()),
+                        None => batch.delete(key(*k)),
+                    };
+                }
+                store.write(batch).unwrap();
+            }
         }
         apply(&mut state, &op);
         states.push(state.clone());
@@ -227,7 +256,7 @@ fn log_with_a_corrupt_middle() -> Vec<u8> {
 #[test]
 fn a_power_cut_during_repair_never_loses_a_byte() {
     let dir = Path::new(DIR);
-    let log_path = dir.join(LOG_FILE_NAME);
+    let log_path = dir.join(log_name(0));
     let side_path = dir.join(format!("{LOG_FILE_NAME}.corrupt-18"));
     let original = log_with_a_corrupt_middle();
     let (kept, moved) = original.split_at(18);
@@ -306,7 +335,7 @@ fn what_open_reads_survives_a_power_cut() {
         },
         &mut unsynced,
     );
-    let log = fs.open_existing(&dir.join(LOG_FILE_NAME)).unwrap();
+    let log = fs.open_existing(&dir.join(log_name(0))).unwrap();
     let end = log.size().unwrap();
     log.write_all_at(&unsynced, end).unwrap();
     drop(log);
@@ -325,4 +354,106 @@ fn what_open_reads_survives_a_power_cut() {
         let store = Store::open_in(after.clone(), dir, options()).unwrap();
         assert_eq!(read_state(&store), served, "{cut:?}");
     }
+}
+
+/// A hint for more log than there is gets removed. If that removal were
+/// not durable, writes that grow the log past the hint's length would make
+/// it look valid again after a power cut.
+#[test]
+fn a_removed_hint_stays_removed_after_a_power_cut() {
+    let dir = Path::new(DIR);
+    let fs = MemFs::new();
+    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    store
+        .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
+        .unwrap();
+    store
+        .set(key(2), Value::try_from(&b"2"[..]).unwrap())
+        .unwrap();
+    store.compact().unwrap();
+    drop(store);
+    let compacted = 19 + 18;
+    let hint = fs.read(&dir.join(hint_name(compacted))).unwrap();
+    let log = fs.read(&dir.join(log_name(compacted))).unwrap();
+    assert_eq!(log.len(), 19 + 18);
+
+    let fs = MemFs::new();
+    fs.put(&dir.join(log_name(0)), &log[..19]);
+    fs.put(&dir.join(hint_name(0)), &hint);
+    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    store
+        .set(key(3), Value::try_from(&b"3"[..]).unwrap())
+        .unwrap();
+    drop(store);
+    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), 19 + 18);
+
+    let disk = fs.disk();
+    for cut in disk.cuts() {
+        let store = Store::open_in(MemFs::after(&disk, cut), dir, Options::default()).unwrap();
+        assert_eq!(
+            read_state(&store),
+            State::from([(1, b"hi".to_vec()), (3, b"3".to_vec())]),
+            "{cut:?}"
+        );
+    }
+}
+
+/// Turning a log from before segments, with its hint, into the first
+/// segment renames both and rewrites `tally.log`. A power cut at any point
+/// of it must leave a store that opens with every key, and never one an
+/// earlier tally would open as empty.
+#[test]
+fn a_power_cut_while_moving_to_segments_loses_nothing() {
+    let dir = Path::new(DIR);
+    let fs = MemFs::new();
+    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    store
+        .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
+        .unwrap();
+    store
+        .set(key(2), Value::try_from(&b"2"[..]).unwrap())
+        .unwrap();
+    store.compact().unwrap();
+    drop(store);
+    let log = fs.read(&dir.join(log_name(37))).unwrap();
+    let hint = fs.read(&dir.join(hint_name(37))).unwrap();
+    let legacy = || {
+        let fs = MemFs::new();
+        fs.put(&dir.join(LOG_FILE_NAME), &log);
+        fs.put(&dir.join(crate::hint::HINT_FILE_NAME), &hint);
+        fs
+    };
+    let expected = State::from([(1, b"hi".to_vec()), (2, b"2".to_vec())]);
+
+    let fs = legacy();
+    drop(Store::open_in(fs.clone(), dir, Options::default()).unwrap());
+    let steps = fs.steps();
+    let mut checked = 0;
+    for step in 1..=steps {
+        let fs = legacy();
+        fs.cut_before(step);
+        drop(Store::open_in(fs.clone(), dir, Options::default()).unwrap());
+        let snapshot = fs.snapshot().unwrap();
+        for cut in snapshot.cuts() {
+            let context = format!("cut before step {step} {cut:?}");
+            let after = MemFs::after(&snapshot, cut);
+            let legacy_log = after.read(&dir.join(LOG_FILE_NAME));
+            assert!(
+                legacy_log.as_deref() == Some(&log[..])
+                    || legacy_log.as_deref() == Some(&crate::store::marker()[..])
+                        && after.read(&dir.join(log_name(0))).as_deref() == Some(&log[..]),
+                "{context}: an earlier version would not find the records, or would not be refused"
+            );
+            let store = Store::open_in(after.clone(), dir, Options::default()).unwrap();
+            assert_eq!(read_state(&store), expected, "{context}");
+            drop(store);
+            assert_eq!(
+                after.read(&dir.join(LOG_FILE_NAME)).as_deref(),
+                Some(&crate::store::marker()[..]),
+                "{context}"
+            );
+            checked += 1;
+        }
+    }
+    println!("moving to segments: {checked} disks checked");
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use tally::{Key, Store, Value};
+use tally::{Batch, Key, Store, Value};
 
 const VALUE_LEN: usize = 1024;
 
@@ -116,7 +116,16 @@ fn set(c: &mut Criterion) {
         )
     });
     group.finish();
-    let log_len = fs::metadata(churn.path().join("tally.log")).unwrap().len();
+    let log_len: u64 = fs::read_dir(churn.path())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
+        })
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
     assert!(
         log_len <= 2 * KEYS * record.len() as u64,
         "{writes} overwrites left a {log_len}-byte log: compaction never ran"
@@ -189,5 +198,38 @@ fn compact(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, set, get, open, compact);
+/// Writes per second when one fsync covers a whole batch.
+fn write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("write");
+    group
+        .sample_size(samples(20))
+        .measurement_time(Duration::from_secs(10));
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = Store::open(tmp.path()).unwrap();
+    let mut i = 0;
+    for size in [10u64, 100, 1000] {
+        group.throughput(Throughput::Elements(size));
+        group.bench_with_input(
+            BenchmarkId::new("1KiB values, batch of", size),
+            &size,
+            |b, &size| {
+                b.iter_batched(
+                    || {
+                        let mut batch = Batch::new();
+                        for _ in 0..size {
+                            i += 1;
+                            batch.set(key(i), value(VALUE_LEN));
+                        }
+                        batch
+                    },
+                    |batch| store.write(batch).unwrap(),
+                    BatchSize::SmallInput,
+                )
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(benches, set, write, get, open, compact);
 criterion_main!(benches);
