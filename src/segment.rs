@@ -5,11 +5,10 @@
 
 use std::fs::TryLockError;
 use std::io::{self, Read};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::fs::LogFile;
 use crate::fs::sealed::Sealed;
-use crate::fs::{LogFile, Map};
 
 const PREFIX: &str = "tally.";
 const DIGITS: usize = 20;
@@ -51,9 +50,6 @@ pub(crate) struct Segment<L> {
     len: AtomicU64,
     /// Bytes in the file no live key points at.
     dead: AtomicU64,
-    /// The file mapped into memory once it is sealed, so reads within it
-    /// copy instead of making a system call.
-    map: OnceLock<Map>,
 }
 
 impl<L> Segment<L> {
@@ -63,7 +59,6 @@ impl<L> Segment<L> {
             file,
             len: AtomicU64::new(len),
             dead: AtomicU64::new(0),
-            map: OnceLock::new(),
         }
     }
 
@@ -96,20 +91,6 @@ impl<L> Segment<L> {
     pub fn set_dead(&self, bytes: u64) {
         self.dead.store(bytes, Ordering::Relaxed);
     }
-
-    pub fn is_mapped(&self) -> bool {
-        self.map.get().is_some()
-    }
-}
-
-impl<L: LogFile> Segment<L> {
-    /// Maps the file, which must take no more writes or truncation from
-    /// here on.
-    pub fn seal(&self) {
-        if let Some(map) = self.file.map(self.len()) {
-            let _ = self.map.set(map);
-        }
-    }
 }
 
 impl<L> Sealed for Segment<L> {}
@@ -121,18 +102,7 @@ impl<L: LogFile> LogFile for Segment<L> {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        let at = offset - self.base;
-        let mapped = self.map.get().and_then(|map| {
-            let start = usize::try_from(at).ok()?;
-            map.bytes().get(start..start.checked_add(buf.len())?)
-        });
-        match mapped {
-            Some(bytes) => {
-                buf.copy_from_slice(bytes);
-                Ok(())
-            }
-            None => self.file.read_exact_at(buf, at),
-        }
+        self.file.read_exact_at(buf, offset - self.base)
     }
 
     fn reader_at(&self, offset: u64) -> impl Read + '_ {
@@ -140,12 +110,10 @@ impl<L: LogFile> LogFile for Segment<L> {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
-        assert!(!self.is_mapped(), "a sealed segment takes no writes");
         self.file.write_all_at(buf, offset - self.base)
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
-        assert!(!self.is_mapped(), "a sealed segment is never truncated");
         self.file.set_len(len - self.base)
     }
 
@@ -163,53 +131,19 @@ mod tests {
     use super::*;
     use crate::fs::{Fs, OsFs};
 
-    fn sealed(bytes: &[u8], base: u64) -> (tempfile::TempDir, Segment<crate::fs::OsFile>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(log_name(base));
-        std::fs::write(&path, bytes).unwrap();
-        let segment = Segment::new(base, OsFs.open_existing(&path).unwrap(), bytes.len() as u64);
-        segment.seal();
-        (tmp, segment)
-    }
-
     #[test]
-    fn a_sealed_segment_reads_from_its_map() {
-        let (_tmp, segment) = sealed(b"0123456789", 100);
-        assert_eq!(segment.map.get().map(|m| m.bytes().len()), Some(10));
+    fn a_segment_reads_and_writes_at_log_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(log_name(100));
+        std::fs::write(&path, b"0123456789").unwrap();
+        let segment = Segment::new(100, OsFs.open_existing(&path).unwrap(), 10);
         let mut buf = [0u8; 4];
         segment.read_exact_at(&mut buf, 103).unwrap();
         assert_eq!(&buf, b"3456");
-    }
-
-    #[test]
-    fn a_read_past_the_map_goes_to_the_file() {
-        let (_tmp, segment) = sealed(b"0123456789", 100);
-        let segment = Segment::new(100, segment.file, 6);
-        segment.seal();
-        let mut buf = [0u8; 4];
-        segment.read_exact_at(&mut buf, 104).unwrap();
-        assert_eq!(&buf, b"4567");
-        assert!(segment.read_exact_at(&mut buf, 108).is_err());
-    }
-
-    #[test]
-    fn an_empty_segment_is_not_mapped() {
-        let (_tmp, segment) = sealed(b"", 0);
-        assert!(!segment.is_mapped());
-    }
-
-    #[test]
-    #[should_panic(expected = "a sealed segment takes no writes")]
-    fn a_sealed_segment_refuses_writes() {
-        let (_tmp, segment) = sealed(b"0123456789", 0);
-        let _ = segment.write_all_at(b"x", 10);
-    }
-
-    #[test]
-    #[should_panic(expected = "a sealed segment is never truncated")]
-    fn a_sealed_segment_refuses_truncation() {
-        let (_tmp, segment) = sealed(b"0123456789", 0);
-        let _ = segment.set_len(5);
+        assert_eq!(segment.size().unwrap(), 110);
+        segment.write_all_at(b"a", 110).unwrap();
+        segment.set_len(105).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"01234");
     }
 
     #[test]

@@ -263,7 +263,7 @@ An automatic compaction never turns a successful write or `open` into an error: 
 `Store<F: Fs = OsFs>` reaches the disk only through two traits in `tally::fs`, so the power-cut tests can swap in an in-memory disk:
 
 - `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `hard_link`, `same_file`, `sync_dir`, `list`, with `type File: LogFile`.
-- `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, `try_lock`, and a hidden `map(len)` that only the real file implements. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
+- `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, and `try_lock`. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
 
 Both traits are sealed: public because `Store`'s type parameter is, but implementable only inside tally. `Store::open` and `Store::repair` are defined on `Store<OsFs>` (a default type parameter is not used for inference, so a generic `open` would need annotations); the generic versions are crate-private. The traits return errors; poisoning on a failed fsync is `Store`'s.
 
@@ -298,12 +298,10 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 `get` takes no lock while it reads:
 
 - Each of the index's 64 shards is behind its own `RwLock`. `get` copies the 16-byte entry out and lets go before any I/O, so a write waits on a shard only for a lookup, never for a read of the disk.
-- The segment list is an `Arc` of a list of `Arc`ed segments, behind a lock that is held only to clone the outer `Arc`. A new segment or a compaction replaces the list; a read keeps the list it took. A segment removed while a read holds it stays open until the read lets go, which is safe on Unix: an unlinked file, and a map of one, stay readable.
+- The segment list is an `Arc` of a list of `Arc`ed segments, behind a lock that is held only to clone the outer `Arc`. A new segment or a compaction replaces the list; a read keeps the list it took. A segment removed while a read holds it stays open until the read lets go, which is safe on Unix: an unlinked file stays readable.
 - If no segment in the list holds the entry's offset, a compaction moved the key and removed its segment between the lookup and taking the list, since entries only move after their copy is durable and segments only go after that. `get` looks the key up again. If the entry is unchanged, it points outside the log, which is a bug, and `get` panics.
 
-A sealed segment (every one but the last) is mapped into memory read-only when it is sealed, on `open` or when a write starts the next one, and a read inside it copies from the map instead of calling `pread`. That took a 1 KiB hit in a sealed segment from 1.03 µs to 0.49 µs; reads from the active segment still use `pread`, since it grows. The checks in steps 2 and 3 are the same either way, so damage on disk is still reported, not returned.
-
-A map is undefined behaviour if its file changes underneath it, and on Unix a file truncated under a map kills the process with `SIGBUS` on the next read past the new end. tally never writes to or truncates a sealed segment while a `Store` has it: writes go to the last segment, compaction removes sealed segments without truncating them (removing a mapped file is safe on Unix), and `repair`, which does truncate them, takes the same lock as `open`. `Segment` asserts that a mapped segment takes no write or truncation, so a bug that tried would panic before touching the file. Another process writing the files anyway is outside what tally can guard against. If a map fails, reads fall back to `pread`. The in-memory disk has no maps, so the power-cut tests read with positioned reads as before.
+Every read is a `pread`. Mapping sealed segments took a 1 KiB hit in one from 1.03 to 0.50 µs, but an I/O error while faulting in a mapped page kills the process with `SIGBUS` instead of failing the read, and again on every restart that reads that key. A bad sector should cost one `get`, not the process, and the 0.5 µs is lost behind any network round trip. Without the map, tally has no `unsafe` code (`#![forbid(unsafe_code)]`).
 
 ## Errors
 
@@ -350,7 +348,6 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | `crc-fast`                 | CRC-64/NVME for payloads and hints, with hardware acceleration; default features off, which drops its C API (26 exported `extern "C"` symbols and the unsafe code behind them) |
 | `siphasher`                | 128-bit SipHash-1-3 for the index |
 | `log`                      | the recovery warning; the caller picks the logger |
-| `memmap2`                  | read-only maps of sealed segments: the one `unsafe` call, with its argument in `src/fs.rs` |
 | `tempfile` (dev)           | isolated directories for tests    |
 | `proptest` (dev)           | model and codec property tests    |
 | `criterion` (dev)          | benchmarks                        |
