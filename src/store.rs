@@ -378,13 +378,10 @@ impl<F: Fs> Store<F> {
     pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
         match self.index.get(key.as_bytes()) {
             Some(entry) => {
-                if let (
-                    _,
-                    Record::Set {
-                        key: stored_key,
-                        value,
-                    },
-                ) = load_record(&self.file, entry.offset)?
+                if let Record::Set {
+                    key: stored_key,
+                    value,
+                } = load_indexed(&self.file, entry)?
                 {
                     if *key == stored_key {
                         Ok(Some(value))
@@ -402,6 +399,47 @@ impl<F: Fs> Store<F> {
                 }
             }
             None => Ok(None),
+        }
+    }
+
+    /// Reads every record in the log, checking both checksums of each, and
+    /// checks that they describe exactly the index in memory. `open` skips
+    /// the checksums of records a hint covers (DESIGN.md, Hint file); this
+    /// is the full check, on demand. Reads the whole log and holds two
+    /// sorted lists of 16 bytes per live key while it compares them.
+    ///
+    /// Fails with the first bad record's error, or `IndexMismatch` at the
+    /// first offset where the log and the index disagree.
+    pub fn verify(&self) -> Result<(), Error> {
+        let mismatch = |offset| Error::Corruption {
+            offset,
+            reason: CorruptionReason::IndexMismatch,
+        };
+        let len = self.file.size()?;
+        if len != self.end {
+            return Err(mismatch(len.min(self.end)));
+        }
+        let (scanned, end) = load_index(&self.file, self.end)?;
+        if end != self.end {
+            return Err(mismatch(end));
+        }
+        let mut ours: Vec<Entry> = self.index.values().copied().collect();
+        let mut theirs: Vec<Entry> = scanned.values().copied().collect();
+        drop(scanned);
+        ours.sort_unstable_by_key(|e| e.offset);
+        theirs.sort_unstable_by_key(|e| e.offset);
+        let first_difference = (0..ours.len().max(theirs.len()))
+            .find(|&i| ours.get(i) != theirs.get(i))
+            .map(|i| {
+                let offsets = [ours.get(i), theirs.get(i)].into_iter().flatten();
+                offsets
+                    .map(|e| e.offset)
+                    .min()
+                    .expect("one side has an entry")
+            });
+        match first_difference {
+            Some(offset) => Err(mismatch(offset)),
+            None => Ok(()),
         }
     }
 
@@ -491,6 +529,28 @@ fn copy_to_end(mut reader: impl Read, file: &impl LogFile) -> io::Result<()> {
             Err(err) => return Err(err),
         }
     }
+}
+
+/// The record `entry` points at, in one read of the length the entry
+/// gives. If the header there disagrees with the entry, or the read runs
+/// past the end, falls back to `load_record`, which reads the length the
+/// header gives and reports what is actually there.
+fn load_indexed(file: &impl LogFile, entry: &Entry) -> Result<Record, Error> {
+    let len = record_len(usize::from(entry.key_len), entry.value_len);
+    let mut buf = vec![0u8; usize::try_from(len).expect("a record fits in memory")];
+    match file.read_exact_at(&mut buf, entry.offset) {
+        Ok(()) => {}
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
+            return load_record(file, entry.offset).map(|(_, record)| record);
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let header_buf = buf[..HEADER_LEN].try_into().expect("buf holds a header");
+    let header = decode_header(header_buf).map_err(|err| err.at(entry.offset))?;
+    if header.record_len() != len {
+        return load_record(file, entry.offset).map(|(_, record)| record);
+    }
+    decode_payload(header, &buf[HEADER_LEN..]).map_err(|err| err.at(entry.offset))
 }
 
 fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Error> {
@@ -1346,6 +1406,101 @@ mod tests {
         ));
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
         assert_eq!(store.get(&key(b"cc")).unwrap(), None);
+    }
+
+    #[test]
+    fn get_reads_the_record_even_when_the_index_has_its_lengths_wrong() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.index.get_mut(b"a").unwrap().value_len = 5;
+        assert_eq!(
+            store.get(&key(b"a")).unwrap(),
+            Some(value(b"1")),
+            "past the end"
+        );
+
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.index.get_mut(b"a").unwrap().value_len = 2;
+        assert_eq!(
+            store.get(&key(b"a")).unwrap(),
+            Some(value(b"1")),
+            "header disagrees"
+        );
+    }
+
+    #[test]
+    fn verify_passes_a_healthy_store_before_and_after_compaction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.delete(key(b"b")).unwrap();
+        store.verify().unwrap();
+        store.compact().unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.verify().unwrap();
+        drop(store);
+        Store::open(tmp.path()).unwrap().verify().unwrap();
+    }
+
+    #[test]
+    fn verify_finds_damage_that_open_skipped_because_of_the_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        write_log_at(tmp.path(), 16, b"X");
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(matches!(
+            store.verify(),
+            Err(Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_finds_an_index_that_disagrees_with_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.index.remove(b"b");
+        assert!(matches!(
+            store.verify(),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::IndexMismatch
+            })
+        ));
+        store.index.get_mut(b"a").unwrap().offset = 18;
+        assert!(matches!(
+            store.verify(),
+            Err(Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::IndexMismatch
+            })
+        ));
+    }
+
+    #[test]
+    fn verify_finds_a_log_cut_short_behind_the_stores_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let store = Store::open(tmp.path()).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(log_path(tmp.path()))
+            .unwrap()
+            .set_len(18)
+            .unwrap();
+        assert!(matches!(
+            store.verify(),
+            Err(Error::Corruption {
+                offset: 18,
+                reason: CorruptionReason::IndexMismatch
+            })
+        ));
     }
 
     // hint file

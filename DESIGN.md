@@ -4,7 +4,7 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 
 ## Scope (v1)
 
-- API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `compact()`.
+- API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `compact()`, `verify()`.
 - `open` takes a directory. It holds `tally.log` (the data), `tally.lock`, `tally.hint` after a compaction, and, during one, `tally.log.compact` and `tally.hint.compact`.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
@@ -180,12 +180,16 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 - `open` pre-sizes from the hint's count. Without a hint it grows the map as it reads, and peaks higher because old and new tables coexist during each resize: 1.11 GB against 557 MB for 10M keys of 16 bytes.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction, and counts as dead bytes.
 
+### Verify
+
+`verify()` is the full check `open` no longer does once a hint covers most of the log: it reads every record from 0 to the store's end, checking both checksums, and compares the index that scan describes with the one in memory, as lists of entries sorted by offset. It fails with the first bad record's error, or `IndexMismatch` at the first offset where they disagree, including a log whose size is not the store's end. It reads the whole log and holds 32 bytes per live key while comparing; it is meant to be run on demand or on a schedule, not on every open.
+
 ### Reads
 
 `get` always verifies:
 
 1. Look up the key. Missing: return `None` with no I/O.
-2. Read the record at `offset`. The code does two positioned reads, header then payload. One read would do: the index entry holds `value_len`, so the record is `15 + key.len() + value_len` bytes (see Deferred ideas).
+2. Read the record at `offset` in one positioned read of `15 + key_len + value_len` bytes, both from the index entry. If the header there gives other lengths, or the read runs past the end, read it again the old way (header, then the payload length the header gives), so errors report what is actually on disk. One read instead of two took a 1 KiB hit from 1.30 µs to 0.82 µs.
 3. Verify both checksums and that the stored key equals the requested key.
 4. Return the value. Any failure returns a corruption error, never `None`.
 
@@ -245,4 +249,3 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 - `Interval` sync policy with group commit, once there are concurrent writers.
 - Background compaction, once the TCP server brings concurrency.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
-- `get` in one positioned read, sized from the index entry.
