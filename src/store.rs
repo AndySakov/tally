@@ -3,8 +3,9 @@ use std::fs::TryLockError;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, mpsc};
+use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use crate::fs::{Fs, LogFile, OsFs};
@@ -83,12 +84,17 @@ pub struct Store<F: Fs = OsFs> {
     queue: Mutex<Queue>,
     /// Signalled when a group of writes is done.
     committed: Condvar,
+    /// Signalled when a write joins the queue, for a leader waiting to
+    /// fill its group.
+    arrived: Condvar,
+    /// How long the last fsync of the log took, in nanoseconds.
+    last_sync_nanos: AtomicU64,
     /// Set by a failed fsync, or a failed truncate after a failed write:
     /// from then on writes fail with `Poisoned` (DESIGN.md, Failed fsync).
     poisoned: AtomicBool,
     /// Appends fsynced, for tests of group commit.
     #[cfg(test)]
-    commits: std::sync::atomic::AtomicU64,
+    commits: AtomicU64,
 }
 
 type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
@@ -140,7 +146,13 @@ struct Queue {
     done: HashMap<u64, Result<(), Error>>,
     /// Whether a leader is writing a group now.
     leading: bool,
+    /// How many writes the last group took.
+    last_group: usize,
 }
+
+/// The share of the last fsync's time, in percent, a leader waits for its
+/// group to fill (DESIGN.md, Group commit). 25 and 50 gained nothing more.
+const GROUP_WAIT_PERCENT: u64 = 10;
 
 /// A group takes waiting writes until it has this many, or this many bytes.
 const GROUP_MOST_WRITES: usize = 1024;
@@ -243,9 +255,11 @@ impl<F: Fs> Store<F> {
             writing: Mutex::new(()),
             queue: Mutex::default(),
             committed: Condvar::new(),
+            arrived: Condvar::new(),
+            last_sync_nanos: AtomicU64::new(0),
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
-            commits: std::sync::atomic::AtomicU64::new(0),
+            commits: AtomicU64::new(0),
         };
         {
             let writing = store.writer();
@@ -704,9 +718,12 @@ impl<F: Fs> Store<F> {
             }
             return Err(err.into());
         }
+        let started = Instant::now();
         if let Err(err) = active.file.sync() {
             return Err(self.poison(err));
         }
+        let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.last_sync_nanos.store(took, Ordering::Relaxed);
         #[cfg(test)]
         self.commits.fetch_add(1, Ordering::Relaxed);
         active.set_len_written(active.len() + buffer.len() as u64);
@@ -762,6 +779,7 @@ impl<F: Fs> Store<F> {
         let ticket = queue.next;
         queue.next += 1;
         queue.waiting.push_back((ticket, write));
+        self.arrived.notify_one();
         loop {
             if let Some(result) = queue.done.remove(&ticket) {
                 return result;
@@ -774,6 +792,7 @@ impl<F: Fs> Store<F> {
                 continue;
             }
             queue.leading = true;
+            queue = self.fill(queue);
             let group = queue.take_group();
             drop(queue);
             let leader = Leader {
@@ -785,6 +804,31 @@ impl<F: Fs> Store<F> {
             self.commit_then(&writes, move |results| leader.finish(results));
             queue = hold(&self.queue);
         }
+    }
+
+    /// Waits, as the leader, for the queue to hold as many writes as the
+    /// last group took, or for a share of the last fsync's time, whichever
+    /// comes first. Waits not at all if the last group was one write: a
+    /// writer alone is written at once.
+    fn fill<'q>(&self, mut queue: MutexGuard<'q, Queue>) -> MutexGuard<'q, Queue> {
+        let want = queue.last_group;
+        if want <= 1 || queue.waiting.len() >= want {
+            return queue;
+        }
+        let wait = self.last_sync_nanos.load(Ordering::Relaxed) / 100 * GROUP_WAIT_PERCENT;
+        let deadline = Instant::now() + Duration::from_nanos(wait);
+        while queue.waiting.len() < want {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            queue = self
+                .arrived
+                .wait_timeout(queue, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        queue
     }
 
     /// Writes `writes` as one group and returns each one's result, in order,
@@ -1052,6 +1096,7 @@ impl Queue {
             bytes += size;
             group.push(self.waiting.pop_front().expect("one is waiting"));
         }
+        self.last_group = group.len();
         group
     }
 }
@@ -4437,5 +4482,62 @@ mod tests {
         );
         store.commit(&[Write::One(set_record(b"a", b"3"))]);
         assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
+    }
+
+    /// A store whose next leader expects a group of `last_group` writes
+    /// and whose last fsync took `last_sync`.
+    fn expecting(dir: &Path, last_group: usize, last_sync: Duration) -> Store {
+        let store = Store::open(dir).unwrap();
+        hold(&store.queue).last_group = last_group;
+        store
+            .last_sync_nanos
+            .store(last_sync.as_nanos() as u64, Ordering::Relaxed);
+        store
+    }
+
+    #[test]
+    fn a_writer_after_a_group_of_one_does_not_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = expecting(tmp.path(), 1, Duration::from_secs(60));
+        let started = Instant::now();
+        put(&store, b"a", b"1");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a wait would take 6 s"
+        );
+    }
+
+    #[test]
+    fn a_leader_waits_for_its_group_to_fill_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = expecting(tmp.path(), 3, Duration::from_secs(60));
+        let started = Instant::now();
+        thread::scope(|scope| {
+            for i in 0..3u8 {
+                let store = &store;
+                scope.spawn(move || put(store, &[i], &[i]));
+            }
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait ends at 3 queued"
+        );
+        assert_eq!(store.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(hold(&store.queue).last_group, 3);
+    }
+
+    #[test]
+    fn a_leader_stops_waiting_after_a_tenth_of_the_last_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = expecting(tmp.path(), 3, Duration::from_millis(200));
+        let started = Instant::now();
+        put(&store, b"a", b"1");
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert_eq!(store.commits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            hold(&store.queue).last_group,
+            1,
+            "the next leader won't wait"
+        );
     }
 }

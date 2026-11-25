@@ -74,8 +74,8 @@ Criterion on an M1 Pro running macOS, where `sync_all` is `F_FULLFSYNC` and flus
 | `set`, 1 KiB value | 5.53 ms, 181 writes/s |
 | `set`, 1 KiB value, overwriting 1,000 keys with automatic compaction | 5.24 ms, 191 writes/s |
 | Baseline: bare append and `sync_all` of the same record | 5.51 ms, 181 writes/s |
-| `set`, 1 KiB value, from 16 threads at once | 0.67 ms each, 1,490 writes/s |
-| `set`, 1 KiB value, from 64 threads at once | 0.18 ms each, 5,540 writes/s |
+| `set`, 1 KiB value, from 16 threads at once | 0.37 ms each, 2,736 writes/s |
+| `set`, 1 KiB value, from 64 threads at once | 0.10 ms each, 9,739 writes/s |
 | `write`, a batch of 100 sets of 1 KiB | 5.97 ms, 16,752 sets/s |
 | `write`, a batch of 1,000 sets of 1 KiB | 10.6 ms, 93,993 sets/s |
 | `get`, 1 KiB value in the active segment | 1.03 µs |
