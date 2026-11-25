@@ -97,7 +97,7 @@ type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
 type Writing<'a> = MutexGuard<'a, ()>;
 
 /// A write a caller asked for: one record, or a batch.
-enum Write {
+pub(crate) enum Write {
     One(Record),
     Batch(Vec<Record>),
 }
@@ -767,7 +767,7 @@ impl<F: Fs> Store<F> {
 
     /// Writes a group with one append and one fsync, then updates the index,
     /// and returns each write's result in order.
-    fn commit(&self, writes: &[Write]) -> Vec<Result<(), Error>> {
+    pub(crate) fn commit(&self, writes: &[Write]) -> Vec<Result<(), Error>> {
         let writing = hold(&self.writing);
         if let Err(err) = self.writable() {
             return each(err, writes.len());

@@ -2,14 +2,16 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 133,333 possible disk states.
+cut before every disk operation of a workload, across 216,898 possible disk states.
 
 ## Status
 
-v1 is done. tally is an embedded library for one process and one thread:
+v1 is done. tally is an embedded library for one process, shared by its threads:
 
 - an append-only log split into segment files, with an in-memory index of 16 bytes per key;
-- writes of one record, or of a batch that applies all or nothing, each with one fsync;
+- writes of one record, or of a batch that applies all or nothing, each with one fsync, shared by writes from
+  other threads that arrive while it waits;
+- reads that take no lock while they read, alongside writes and compaction;
 - recovery from torn tails on `open`, `repair` for any other damage, and `verify` to check every record;
 - compaction that runs on its own and cleans only the segments with the most dead bytes;
 - hint files, written by compaction and by `open` itself, so `open` reads each sealed segment's keys without its
@@ -21,7 +23,7 @@ v1 is done. tally is an embedded library for one process and one thread:
 use tally::{Batch, Key, Store, Value};
 
 fn main() -> Result<(), tally::Error> {
-    let mut store = Store::open("data")?;
+    let store = Store::open("data")?;
 
     store.set(Key::try_from(&b"user:42"[..])?, Value::try_from(&b"Ada"[..])?)?;
 
@@ -40,6 +42,10 @@ fn main() -> Result<(), tally::Error> {
 
 Keys are 1 byte to 1 KiB and values 1 byte to 16 MiB. `Key::try_from` and `Value::try_from` refuse anything
 else, so `set` never sees invalid input. A second `open` of the same directory fails with `Error::Locked`.
+
+Every method takes `&self`. To use a store from several threads, put it in an `Arc`: writes that arrive
+together share one fsync. If an fsync fails, that write returns the error and every later write returns
+`Error::Poisoned` until the store is reopened; reads keep working.
 
 Overwrites and deletes leave dead bytes in the log. By default, `open` and every write compact once half of the
 log is dead and it is at least 1 MiB, cleaning the segments with the largest share of dead bytes until it no
@@ -68,6 +74,8 @@ Criterion on an M1 Pro running macOS, where `sync_all` is `F_FULLFSYNC` and flus
 | `set`, 1 KiB value | 5.53 ms, 181 writes/s |
 | `set`, 1 KiB value, overwriting 1,000 keys with automatic compaction | 5.24 ms, 191 writes/s |
 | Baseline: bare append and `sync_all` of the same record | 5.51 ms, 181 writes/s |
+| `set`, 1 KiB value, from 16 threads at once | 0.67 ms each, 1,490 writes/s |
+| `set`, 1 KiB value, from 64 threads at once | 0.18 ms each, 5,540 writes/s |
 | `write`, a batch of 100 sets of 1 KiB | 5.97 ms, 16,752 sets/s |
 | `write`, a batch of 1,000 sets of 1 KiB | 10.6 ms, 93,993 sets/s |
 | `get`, 1 KiB value in the active segment | 1.03 µs |
@@ -77,7 +85,7 @@ Criterion on an M1 Pro running macOS, where `sync_all` is `F_FULLFSYNC` and flus
 | `compact`, 100k live records of 100 B | 44.2 ms |
 
 A write costs what its fsync costs: `set` is within the run-to-run noise of the bare baseline, and a batch
-shares one fsync across its records.
+shares one fsync across its records, as writes from several threads share one across the group.
 
 At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random with default
 options: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB segments (9.01 s
@@ -89,7 +97,7 @@ hints for the segments compaction didn't (1.8 s without them).
 Each layer below was checked by breaking the code on purpose and watching it fail.
 
 - **Power-cut simulation** (`src/power_cut.rs`): an in-memory disk that keeps only what was synced. A workload of
-  sets, deletes, batches and compactions, with 64-byte segments so most compactions clean some segments and keep
+  sets, deletes, batches, compactions and a group of writes sharing one fsync, with 64-byte segments so most compactions clean some segments and keep
   others, has the power cut before each write, truncate, fsync, rename and directory sync, and after its last
   one. Every way the disk could be left is checked: any prefix of each file's unsynced writes, the next one torn
   or zeroed, and any of the directory changes since the last directory sync, in any order that keeps each name's
@@ -98,10 +106,11 @@ Each layer below was checked by breaking the code on purpose and watching it fai
   removing all of a compaction's cleaned segments, instead of one after each, fails it: a deleted key comes back.
 - **Kill test** (`tests/kill.rs`): the test binary runs itself as a child, applies a seeded sequence of sets,
   deletes, batches, reopens and compactions with 16 KiB segments, and is killed after 0 to 40 ms, three times per
-  run on the same directory. Every acknowledged operation must survive. CI runs 1,000 runs on Linux. Making `set` update the
+  run on the same directory. Every other run, four threads share the store, each with keys of its own. Every acknowledged operation must survive. CI runs 1,000 runs on Linux. Making `set` update the
   index without writing the record fails it.
 - **Model test** (`tests/model.rs`): random sets, gets, deletes, batches and reopens against a `HashMap`, with
-  100-byte segments and, in half the cases, automatic compaction with no floor, checking every read after each step. The same broken
+  100-byte segments and, in half the cases, automatic compaction with no floor, checking every read after each step.
+  A second test runs four threads on one store, each against its own `HashMap`, with compactions between them. The same broken
   `set` fails it, and so does dropping the Delete records compaction must keep.
 - **Fuzzing** (`fuzz/`): `decode` on arbitrary bytes, `open` on damaged logs, `hint` on damaged hint files, and
   `ops` as a coverage-guided model test on the in-memory disk.
@@ -126,8 +135,8 @@ a corrupted value goes unnoticed about once in 2⁶⁴ instead of once in 2³².
 own, a torn tail can't be mistaken for a corrupted length mid-file, which would otherwise drop acknowledged
 records. Records from before 64-bit checksums still read, and compaction rewrites them. On `open`, a torn or zero-filled tail is truncated, fsynced and logged.
 Any other damage fails `open` with its offset, and `Store::repair` moves the bad bytes to a side file before
-truncating. A failed fsync panics instead of retrying, because on Linux a retry can report success for data that
-never reached the disk.
+truncating. A failed fsync stops all writes until a reopen instead of retrying, because on Linux a retry can
+report success for data that never reached the disk.
 
 The log is a run of segment files, each named for the log offset of its first byte, so offsets in the index and
 in errors address the whole log. Compaction copies the live records of the segments it cleans into a new

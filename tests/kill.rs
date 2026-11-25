@@ -3,8 +3,12 @@
 //!
 //! The test binary is its own child: with `TALLY_KILL_CHILD` set it runs a
 //! seeded sequence of set, delete, reopen, compact and batch against a store and prints
-//! `ack <i>` after each one returns `Ok`. The parent regenerates the same
-//! sequence from the seed, so it knows what every ack means.
+//! `ack <t> <i>` after operation `i` of stream `t` returns `Ok`. The parent
+//! regenerates the same sequences from the seed, so it knows what every ack
+//! means. Every other run, the child runs four streams on four threads
+//! sharing one store, each with keys of its own, so their writes land in
+//! groups (DESIGN.md, Group commit); a reopen in a stream becomes a
+//! compaction there, since the threads share the store.
 //!
 //! Each run kills the child `ROUNDS` times on the same directory without
 //! opening the store in between, so the next child's `open` is the first to
@@ -13,7 +17,8 @@
 //!
 //! 1. `open` succeeds.
 //! 2. The state is that of every acknowledged operation, with each round's
-//!    one in-flight operation either applied or not. Nothing else.
+//!    one in-flight operation per stream either applied or not. Nothing
+//!    else.
 //! 3. A write after recovery works and survives a reopen.
 //!
 //! This cannot catch a missing fsync: the page cache survives the process.
@@ -24,15 +29,20 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::mem;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use tally::{AutoCompact, Batch, Key, Options, Store, Value};
 
 const CHILD_DIR: &str = "TALLY_KILL_CHILD";
 const CHILD_SEED: &str = "TALLY_KILL_CHILD_SEED";
+const CHILD_STREAMS: &str = "TALLY_KILL_CHILD_STREAMS";
+/// Streams in a run with threads. Each has `KEY_SPACE` keys of its own.
+const THREADS: u64 = 4;
 const ROUNDS: u64 = 3;
 const KEY_SPACE: u64 = 8;
 const MAX_DELAY_MICROS: u64 = 40_000;
@@ -67,13 +77,15 @@ impl Rng {
     }
 }
 
-/// The operation sequence for one round. Values carry the round seed and
-/// the op index, so no two sets write the same value.
-fn ops(seed: u64) -> impl Iterator<Item = Op> {
-    let mut rng = Rng(seed);
+/// The operation sequence for stream `t` of `streams` in one round, on keys
+/// from `t * KEY_SPACE`. Values carry the round seed, the stream and the op
+/// index, so no two sets write the same value.
+fn ops(seed: u64, t: u64, streams: u64) -> impl Iterator<Item = Op> {
+    let mut rng = Rng(seed.wrapping_add(t));
+    let first = (t * KEY_SPACE) as u8;
     (0..MAX_OPS).map(move |i| {
-        let k = rng.below(KEY_SPACE) as u8;
-        let tag = format!("{seed:x}-{i}-");
+        let k = first + rng.below(KEY_SPACE) as u8;
+        let tag = format!("{seed:x}-{t}-{i}-");
         let value = |rng: &mut Rng, j: u64| -> Vec<u8> {
             let len = 1 + rng.below(4096) as usize;
             format!("{tag}{j}-").bytes().cycle().take(len).collect()
@@ -81,12 +93,12 @@ fn ops(seed: u64) -> impl Iterator<Item = Op> {
         match rng.below(22) {
             0..=11 => Op::Set(k, value(&mut rng, 0)),
             12..=17 => Op::Delete(k),
-            18 => Op::Reopen,
-            19 => Op::Compact,
+            18 if streams == 1 => Op::Reopen,
+            18 | 19 => Op::Compact,
             _ => Op::Batch(
                 (0..1 + rng.below(8))
                     .map(|j| {
-                        let k = rng.below(KEY_SPACE) as u8;
+                        let k = first + rng.below(KEY_SPACE) as u8;
                         let v = (rng.below(3) != 0).then(|| value(&mut rng, j + 1));
                         (k, v)
                     })
@@ -120,8 +132,9 @@ fn key(k: u8) -> Key {
     Key::try_from(&[b'k', k][..]).unwrap()
 }
 
+/// Every stream's keys.
 fn read_state(store: &Store) -> State {
-    (0..KEY_SPACE as u8)
+    (0..(THREADS * KEY_SPACE) as u8)
         .filter_map(|k| {
             let value = store
                 .get(&key(k))
@@ -142,35 +155,55 @@ fn open(dir: &Path) -> Result<Store, tally::Error> {
     Store::open_with(dir, options)
 }
 
-fn child(dir: &Path, seed: u64) {
+fn child(dir: &Path, seed: u64, streams: u64) {
     let mut store = open(dir).unwrap_or_else(|err| fail("open", err));
     println!("opened");
-    for (i, op) in ops(seed).enumerate() {
-        let what = format!("op {i}");
-        match op {
-            Op::Set(k, v) => store
-                .set(key(k), Value::try_from(&v[..]).unwrap())
-                .unwrap_or_else(|err| fail(&what, err)),
-            Op::Delete(k) => store.delete(key(k)).unwrap_or_else(|err| fail(&what, err)),
-            Op::Reopen => {
+    if streams == 1 {
+        for (i, op) in ops(seed, 0, 1).enumerate() {
+            let what = format!("op {i}");
+            if let Op::Reopen = op {
                 drop(store);
                 store = open(dir).unwrap_or_else(|err| fail(&what, err));
+            } else {
+                run_op(&store, op, &what);
             }
-            Op::Compact => store.compact().unwrap_or_else(|err| fail(&what, err)),
-            Op::Batch(ops) => {
-                let mut batch = Batch::new();
-                for (k, v) in ops {
-                    match v {
-                        Some(v) => batch.set(key(k), Value::try_from(&v[..]).unwrap()),
-                        None => batch.delete(key(k)),
-                    };
-                }
-                store.write(batch).unwrap_or_else(|err| fail(&what, err));
-            }
+            println!("ack 0 {i}");
         }
-        println!("ack {i}");
+    } else {
+        thread::scope(|scope| {
+            for t in 0..streams {
+                let store = &store;
+                scope.spawn(move || {
+                    for (i, op) in ops(seed, t, streams).enumerate() {
+                        run_op(store, op, &format!("stream {t} op {i}"));
+                        println!("ack {t} {i}");
+                    }
+                });
+            }
+        });
     }
     println!("done");
+}
+
+fn run_op(store: &Store, op: Op, what: &str) {
+    match op {
+        Op::Set(k, v) => store
+            .set(key(k), Value::try_from(&v[..]).unwrap())
+            .unwrap_or_else(|err| fail(what, err)),
+        Op::Delete(k) => store.delete(key(k)).unwrap_or_else(|err| fail(what, err)),
+        Op::Reopen => unreachable!("the caller reopens"),
+        Op::Compact => store.compact().unwrap_or_else(|err| fail(what, err)),
+        Op::Batch(ops) => {
+            let mut batch = Batch::new();
+            for (k, v) in ops {
+                match v {
+                    Some(v) => batch.set(key(k), Value::try_from(&v[..]).unwrap()),
+                    None => batch.delete(key(k)),
+                };
+            }
+            store.write(batch).unwrap_or_else(|err| fail(what, err));
+        }
+    }
 }
 
 fn fail(what: &str, err: tally::Error) -> ! {
@@ -178,16 +211,17 @@ fn fail(what: &str, err: tally::Error) -> ! {
     std::process::exit(1)
 }
 
-/// What one round's child got through before it died.
+/// What one stream of a round's child got through before it died.
 struct Round {
     acked: usize,
     in_flight: bool,
 }
 
-fn run_round(dir: &Path, seed: u64, delay: Duration) -> Round {
+fn run_round(dir: &Path, seed: u64, streams: u64, delay: Duration) -> Vec<Round> {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .env(CHILD_DIR, dir)
         .env(CHILD_SEED, seed.to_string())
+        .env(CHILD_STREAMS, streams.to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -218,54 +252,72 @@ fn run_round(dir: &Path, seed: u64, delay: Duration) -> Round {
     let lines: Vec<&str> = stdout.lines().collect();
     let opened = lines.first() == Some(&"opened");
     let done = lines.last() == Some(&"done");
-    let acked = lines.iter().filter(|l| l.starts_with("ack ")).count();
-    for (i, line) in lines.iter().filter(|l| l.starts_with("ack ")).enumerate() {
-        assert_eq!(*line, format!("ack {i}"), "acks must arrive in order");
-    }
-    Round {
-        acked,
-        in_flight: opened && !done,
-    }
+    (0..streams)
+        .map(|t| {
+            let prefix = format!("ack {t} ");
+            let acks: Vec<&&str> = lines.iter().filter(|l| l.starts_with(&prefix)).collect();
+            for (i, line) in acks.iter().enumerate() {
+                assert_eq!(**line, format!("{prefix}{i}"), "acks must arrive in order");
+            }
+            Round {
+                acked: acks.len(),
+                in_flight: opened && !done,
+            }
+        })
+        .collect()
 }
 
-fn run(dir: &Path, seed: u64) {
+fn run(dir: &Path, seed: u64, streams: u64) {
     let mut rng = Rng(seed);
-    let mut candidates = vec![State::new()];
+    // For each stream, the states its keys may be in.
+    let mut candidates: Vec<Vec<State>> = (0..streams).map(|_| vec![State::new()]).collect();
 
     for _ in 0..ROUNDS {
         let round_seed = rng.next();
         let delay = Duration::from_micros(rng.below(MAX_DELAY_MICROS));
-        let round = run_round(dir, round_seed, delay);
+        let rounds = run_round(dir, round_seed, streams, delay);
 
-        let ops: Vec<Op> = ops(round_seed).take(round.acked + 1).collect();
-        let mut next = Vec::new();
-        for mut state in candidates {
-            for op in &ops[..round.acked] {
-                apply(&mut state, op);
-            }
-            if round.in_flight {
-                let mut with = state.clone();
-                apply(&mut with, &ops[round.acked]);
-                if !next.contains(&with) {
-                    next.push(with);
+        for (t, round) in rounds.iter().enumerate() {
+            let ops: Vec<Op> = ops(round_seed, t as u64, streams)
+                .take(round.acked + 1)
+                .collect();
+            let mut next = Vec::new();
+            for mut state in mem::take(&mut candidates[t]) {
+                for op in &ops[..round.acked] {
+                    apply(&mut state, op);
+                }
+                if round.in_flight {
+                    let mut with = state.clone();
+                    apply(&mut with, &ops[round.acked]);
+                    if !next.contains(&with) {
+                        next.push(with);
+                    }
+                }
+                if !next.contains(&state) {
+                    next.push(state);
                 }
             }
-            if !next.contains(&state) {
-                next.push(state);
-            }
+            candidates[t] = next;
         }
-        candidates = next;
     }
 
     let store = Store::open(dir).unwrap_or_else(|err| panic!("open after kill failed: {err}"));
     let observed = read_state(&store);
-    assert!(
-        candidates.contains(&observed),
-        "seed {seed:#x}: state after kills matches no acknowledged history\n\
-         observed keys: {:?}\ncandidates: {}",
-        observed.keys().collect::<Vec<_>>(),
-        candidates.len()
-    );
+    for (t, candidates) in candidates.iter().enumerate() {
+        let keys = (t as u64 * KEY_SPACE) as u8..((t as u64 + 1) * KEY_SPACE) as u8;
+        let ours: State = observed
+            .iter()
+            .filter(|(k, _)| keys.contains(k))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        assert!(
+            candidates.contains(&ours),
+            "seed {seed:#x}, {streams} streams: stream {t}'s state after kills matches no \
+             acknowledged history\nobserved keys: {:?}\ncandidates: {}",
+            ours.keys().collect::<Vec<_>>(),
+            candidates.len()
+        );
+    }
 
     let store = store;
     store
@@ -288,7 +340,11 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 fn main() {
     if let Ok(dir) = std::env::var(CHILD_DIR) {
-        child(Path::new(&dir), env_u64(CHILD_SEED, 0));
+        child(
+            Path::new(&dir),
+            env_u64(CHILD_SEED, 0),
+            env_u64(CHILD_STREAMS, 1),
+        );
         return;
     }
     // harness = false: honour a `cargo test <filter>` that doesn't name us.
@@ -306,7 +362,8 @@ fn main() {
     for i in 0..runs {
         let run_seed = rng.next();
         let tmp = tempfile::tempdir().unwrap();
-        run(tmp.path(), run_seed);
+        let streams = if i % 2 == 0 { 1 } else { THREADS };
+        run(tmp.path(), run_seed, streams);
         if (i + 1) % 100 == 0 {
             println!("kill: {} runs passed", i + 1);
         }
