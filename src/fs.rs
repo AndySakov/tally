@@ -41,6 +41,9 @@ pub trait Fs: sealed::Sealed {
     /// Makes every name created, replaced, renamed away or removed inside the
     /// directory `path` durable.
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
+
+    /// The names of the files in the directory `path`, in no order.
+    fn list(&self, path: &Path) -> io::Result<Vec<String>>;
 }
 
 /// One open file. Writes go only at the end of the file: the real file is
@@ -110,6 +113,16 @@ impl Fs for OsFs {
             return Ok(());
         }
         File::open(path)?.sync_all()
+    }
+
+    fn list(&self, path: &Path) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(path)? {
+            if let Ok(name) = entry?.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 }
 

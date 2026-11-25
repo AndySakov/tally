@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::TryLockError;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::num::NonZero;
@@ -12,62 +12,79 @@ use crate::options::{AutoCompact, Options};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
+use crate::segment::{Segment, hint_name, log_name, parse_hint_name, parse_log_name};
 use crate::{Batch, CorruptionReason, DecodeError, Error, Key, Value};
 
+/// The log before it was split into segments, and now the marker that
+/// keeps earlier versions of tally out (DESIGN.md, Segments).
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
-pub(crate) const COMPACT_FILE_NAME: &str = "tally.log.compact";
+/// Where an earlier version's compaction wrote the new log.
+const COMPACT_FILE_NAME: &str = "tally.log.compact";
+
+/// What `tally.log` holds once the log is in segments: a record header of
+/// type 255 with valid checksums, which every earlier version reads as an
+/// unsupported record at offset 0 instead of starting an empty log.
+pub(crate) fn marker() -> [u8; HEADER_LEN] {
+    let mut bytes = [0u8; HEADER_LEN];
+    bytes[4] = 0xff;
+    bytes[11..15].copy_from_slice(&crc32c::crc32c(&[]).to_le_bytes());
+    let checksum = crc32c::crc32c(&bytes[4..]);
+    bytes[..4].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
 
 /// What `Store::repair` moved out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repaired {
-    /// Offset of the first bad record, where the log now ends.
+    /// Offset of the first bad record, where its segment now ends.
     pub offset: u64,
-    /// Bytes moved out of the log: everything from `offset` to the old end.
+    /// Bytes moved out of the log: everything from `offset` to the end of
+    /// its segment.
     pub dropped: u64,
     /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
     /// store directory.
     pub side_file: PathBuf,
 }
 
-/// An open store: the log file plus an in-memory index of every live key.
+/// An open store: the log's segments plus an in-memory index of every live
+/// key.
 ///
 /// `F` is the file system. It is always [`OsFs`] outside tally's own tests,
 /// which swap in an in-memory disk to simulate power cuts.
 pub struct Store<F: Fs = OsFs> {
     fs: F,
     dir: PathBuf,
-    /// Holds the exclusive lock for as long as the store is open. A separate
-    /// file, because compaction replaces `tally.log`.
+    /// Holds the exclusive lock for as long as the store is open.
     _lock: F::File,
-    file: F::File,
-    /// Length of the log, which is also the offset the next record lands at.
-    end: u64,
-    /// Bytes of the log no live key points at: overwritten values, deleted
-    /// values and Delete records.
-    dead: u64,
+    /// In log order, none overlapping. Writes go to the last, which is
+    /// never empty of a file: there is always one to write to.
+    segments: Vec<Segment<F::File>>,
+    segment_bytes: u64,
     /// `None` once an automatic compaction has failed, until the next open.
     auto_compact: Option<AutoCompact>,
     index: Index,
 }
 
 impl Store {
-    /// Opens the store in `dir`, creating the directory and `tally.log` if
-    /// they don't exist, and rebuilds the index: from `tally.hint` and the
-    /// records written after it if the last compaction left a usable one,
-    /// otherwise by reading every record. A hint that can't be used is
-    /// logged as a warning and removed (DESIGN.md, Hint file).
+    /// Opens the store in `dir`, creating the directory and its first
+    /// segment if they don't exist, and rebuilds the index: for each
+    /// segment, from its hint and the records written after it if a
+    /// compaction left a usable one, otherwise by reading every record. A
+    /// hint that can't be used is logged as a warning and removed
+    /// (DESIGN.md, Hint file). A log from before segments, a lone
+    /// `tally.log`, becomes the first segment (DESIGN.md, Segments).
     /// Takes an exclusive lock on `tally.lock`: a second `open` of the same
     /// directory fails with `Locked` until this `Store` is dropped.
     ///
-    /// Creating either one requires an fsync of its parent directory (see
+    /// Creating any file requires an fsync of its parent directory (see
     /// DESIGN.md, New files).
     ///
-    /// A torn or zero-filled tail is truncated, fsynced and logged as a
-    /// warning before `open` returns. Any other bad record `open` reads fails
-    /// it with its offset; `repair` handles those (DESIGN.md, Recovery).
-    /// Records the hint covers aren't read, so damage to them shows up in
-    /// `get` instead.
+    /// A torn or zero-filled tail of the newest segment is truncated,
+    /// fsynced and logged as a warning before `open` returns. Any other bad
+    /// record `open` reads fails it with its offset; `repair` handles those
+    /// (DESIGN.md, Recovery). Records a hint covers aren't read, so damage
+    /// to them shows up in `get` instead.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
         Self::open_with(dir, Options::default())
     }
@@ -84,12 +101,13 @@ impl Store {
 
     /// Makes a log that `open` refuses openable again, without opening it.
     ///
-    /// Returns `None` if `open` would succeed (a torn tail is left for
-    /// `open` to truncate). On a corrupt record, saves every byte from it to
-    /// the end of the log in a side file, fsyncs the side file and the
-    /// directory, then truncates the log at the record and fsyncs it.
-    /// Unsupported records are an error, not something to repair: a newer
-    /// tally can read them. Fails with `Locked` while a `Store` is open.
+    /// Returns `None` if `open` would succeed (a torn tail of the newest
+    /// segment is left for `open` to truncate). On a corrupt record, saves
+    /// every byte from it to the end of its segment in a side file, fsyncs
+    /// the side file and the directory, then truncates the segment at the
+    /// record and fsyncs it. Unsupported records are an error, not something
+    /// to repair: a newer tally can read them. Fails with `Locked` while a
+    /// `Store` is open.
     ///
     /// If the side file already exists and is the start of what would be
     /// moved, a crashed earlier run left it, and it is rewritten. Otherwise
@@ -102,7 +120,6 @@ impl Store {
 
 impl<F: Fs> Store<F> {
     pub(crate) fn open_in(fs: F, dir: &Path, options: Options) -> Result<Self, Error> {
-        let file_path = dir.join(LOG_FILE_NAME);
         match fs.create_dir(dir) {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
@@ -114,35 +131,30 @@ impl<F: Fs> Store<F> {
         };
         let lock_file = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&lock_file)?;
-        let file = fs.open_or_create(&file_path)?;
-        sync(&file);
+        let mut segments = open_segments(&fs, dir)?;
+        if segments.is_empty() {
+            let file = fs.open_or_create(&dir.join(log_name(0)))?;
+            segments.push(Segment {
+                base: 0,
+                file,
+                len: 0,
+                dead: 0,
+            });
+        }
+        sync(&segments.last().expect("one was just made").file);
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
-        let len = file.size()?;
-        let (mut index, hinted) = load_hint(&fs, dir, len)?;
-        let end = scan(&file, &mut index, hinted, len)?;
-        if end < len {
-            file.set_len(end)?;
-            sync(&file);
-            log::warn!(
-                "truncated a torn tail at offset {end}: dropped {} bytes",
-                len - end
-            );
-        }
-        let live: u64 = index
-            .values()
-            .map(|entry| record_len(usize::from(entry.key_len), entry.value_len))
-            .sum();
+        let index = load(&fs, dir, &mut segments)?;
         let mut store = Store {
             fs,
             dir: dir.to_path_buf(),
             _lock: lock_file,
-            file,
-            end,
-            dead: end - live,
+            segments,
+            segment_bytes: options.segment_bytes,
             auto_compact: options.auto_compact,
             index,
         };
+        store.count_dead();
         store.compact_if_due();
         Ok(store)
     }
@@ -150,18 +162,32 @@ impl<F: Fs> Store<F> {
     pub(crate) fn repair_in(fs: &F, dir: &Path) -> Result<Option<Repaired>, Error> {
         let _lock = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&_lock)?;
-        let file = fs.open_existing(&dir.join(LOG_FILE_NAME))?;
-        let len = file.size()?;
-        let offset = match load_index(&file, len) {
-            Ok(_) => return Ok(None),
-            Err(Error::Corruption { offset, .. }) => offset,
-            Err(err) => return Err(err),
+        let segments = open_segments(fs, dir)?;
+        let mut index = Index::new();
+        let mut bad = None;
+        for (i, segment) in segments.iter().enumerate() {
+            match scan(segment, &mut index, segment.base, segment.end()) {
+                Ok(end) if end < segment.end() && i + 1 < segments.len() => {
+                    bad = Some((segment, end));
+                    break;
+                }
+                Ok(_) => {}
+                Err(Error::Corruption { offset, .. }) => {
+                    bad = Some((segment, offset));
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        let Some((segment, offset)) = bad else {
+            return Ok(None);
         };
+        let len = segment.end();
 
         let side_file = dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"));
         let side = match fs.open_existing(&side_file) {
             Ok(existing) => {
-                if !starts_tail(&existing, &file, offset, len)? {
+                if !starts_tail(&existing, segment, offset, len)? {
                     return Err(Error::SideFileExists(side_file));
                 }
                 existing
@@ -170,13 +196,13 @@ impl<F: Fs> Store<F> {
             Err(err) => return Err(err.into()),
         };
         side.set_len(0)?;
-        copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
+        copy_to_end(segment.reader_at(offset).take(len - offset), &side)?;
         sync(&side);
-        remove_if_present(fs, &dir.join(HINT_FILE_NAME))?;
+        remove_if_present(fs, &dir.join(hint_name(segment.base)))?;
         fs.sync_dir(dir)?;
 
-        file.set_len(offset)?;
-        sync(&file);
+        segment.set_len(offset)?;
+        sync(segment);
         Ok(Some(Repaired {
             offset,
             dropped: len - offset,
@@ -184,126 +210,229 @@ impl<F: Fs> Store<F> {
         }))
     }
 
+    fn active(&self) -> &Segment<F::File> {
+        self.segments.last().expect("there is always a segment")
+    }
+
+    /// The log offset the next record lands at.
+    fn end(&self) -> u64 {
+        self.active().end()
+    }
+
+    /// Bytes no live key points at: overwritten values, deleted values,
+    /// Delete records and Batch records.
+    #[cfg(test)]
+    pub(crate) fn dead(&self) -> u64 {
+        self.segments.iter().map(|s| s.dead).sum()
+    }
+
+    /// The segment holding log offset `offset`.
+    fn segment_of(&self, offset: u64) -> usize {
+        self.segments.partition_point(|s| s.base <= offset) - 1
+    }
+
+    /// Sets each segment's dead bytes from the index: what no entry covers.
+    fn count_dead(&mut self) {
+        let mut live = vec![0u64; self.segments.len()];
+        for entry in self.index.values() {
+            live[self.segment_of(entry.offset)] +=
+                record_len(usize::from(entry.key_len), entry.value_len);
+        }
+        for (segment, live) in self.segments.iter_mut().zip(live) {
+            segment.dead = segment.len - live;
+        }
+    }
+
     /// Rewrites the log with only the latest record of each live key, so
     /// overwritten values and Delete records stop taking space.
     ///
-    /// Writes the live records to `tally.log.compact`, fsyncs it, renames it
-    /// over `tally.log` and fsyncs the directory (DESIGN.md, Compaction).
-    /// Until the rename the old log is untouched, so any failure before it
-    /// returns the error and leaves the store as it was. Reads the log in one
-    /// pass from the first live record and checks every record it reads, so
-    /// a corrupt record stops compaction with its offset rather than being
-    /// copied. Panics if
-    /// the directory fsync after the rename fails, as for any failed fsync.
+    /// Cleans every segment (DESIGN.md, Compaction): copies the live records
+    /// into a new segment with a hint, fsyncs both and the directory, then
+    /// removes the old segments oldest first, fsyncing the directory after
+    /// each. Until then the old segments are untouched, so any failure while
+    /// copying returns the error and leaves the store as it was. Reads each
+    /// segment in one pass and checks every record it reads, so a corrupt
+    /// record stops compaction with its offset rather than being copied.
+    /// Panics if a directory fsync fails, as for any failed fsync.
     pub fn compact(&mut self) -> Result<(), Error> {
-        let compact_path = self.dir.join(COMPACT_FILE_NAME);
-        let hint_path = self.dir.join(HINT_FILE_NAME);
+        let all: Vec<u64> = self
+            .segments
+            .iter()
+            .filter(|s| s.len > 0)
+            .map(|s| s.base)
+            .collect();
+        self.clean(&all)
+    }
+
+    /// Copies the live records of the segments based at `chosen` (in log
+    /// order) to a fresh segment, then removes them. A Delete record is
+    /// copied too while an older segment that is kept might hold a Set it
+    /// hides.
+    fn clean(&mut self, chosen: &[u64]) -> Result<(), Error> {
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        if self.active().len > 0 {
+            self.roll()?;
+        }
+        let oldest_kept = self
+            .segments
+            .iter()
+            .filter(|s| !chosen.contains(&s.base))
+            .map(|s| s.base)
+            .min()
+            .expect("the new segment is kept");
+        let hint_path = self.dir.join(hint_name(self.end()));
         let mut moved = Vec::with_capacity(self.index.len());
-        let copied = self
-            .copy_live(&compact_path, &mut moved)
-            .and_then(|copied| {
-                // The old hint describes the old log, so it must be gone for
-                // good before the new log takes its name.
-                if remove_if_present(&self.fs, &hint_path)? {
-                    self.fs.sync_dir(&self.dir)?;
-                }
-                self.fs
-                    .rename(&compact_path, &self.dir.join(LOG_FILE_NAME))?;
-                Ok(copied)
-            });
-        let (new, written) = match copied {
-            Ok(copied) => copied,
+        let mut carry = Vec::new();
+        let copied = self.copy_live(chosen, oldest_kept, &hint_path, &mut moved, &mut carry);
+        let written = match copied {
+            Ok(written) => written,
             Err(err) => {
                 self.restore_offsets(&moved);
+                let active = self.segments.last().expect("there is always a segment");
+                active.file.set_len(0).expect("truncate should not fail");
+                sync(&active.file);
+                if remove_if_present(&self.fs, &hint_path).expect("removing a fresh hint") {
+                    self.fs
+                        .sync_dir(&self.dir)
+                        .expect("directory fsync failed; restart to recover from the log");
+                }
                 return Err(err);
             }
         };
-        self.file = new;
-        self.end = written;
-        self.dead = 0;
+        self.segments
+            .last_mut()
+            .expect("there is always a segment")
+            .len = written;
         self.fs
             .sync_dir(&self.dir)
             .expect("directory fsync failed after compaction; restart to recover from the log");
-        // Not synced: if the name is lost, the next open scans the whole log.
-        if let Err(err) = self
-            .fs
-            .rename(&self.dir.join(COMPACT_HINT_FILE_NAME), &hint_path)
-        {
-            log::warn!("compacted, but could not put the hint file in place: {err}");
+        for segment in &mut self.segments {
+            if chosen.contains(&segment.base) {
+                segment.dead = segment.len;
+            }
+        }
+        if !carry.is_empty() {
+            let mut buffer = Vec::new();
+            for key in &carry {
+                encode(
+                    &Record::Delete {
+                        key: Key::try_from(&key[..]).expect("read from a record"),
+                    },
+                    &mut buffer,
+                );
+            }
+            self.append_bytes(&buffer)?;
+            let at = self.segments.len() - 1;
+            self.segments[at].dead += buffer.len() as u64;
+        }
+        for &base in chosen {
+            let at = self.segment_of(base);
+            remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
+            self.fs.remove(&self.dir.join(log_name(base)))?;
+            self.fs
+                .sync_dir(&self.dir)
+                .expect("directory fsync failed after compaction; restart to recover from the log");
+            self.segments.remove(at);
         }
         Ok(())
     }
 
-    /// Writes each live record to a fresh `compact_path`, and its key and
-    /// value length to a fresh `tally.hint.compact`, and fsyncs both,
-    /// pointing its index entry at the new offset as it goes and pushing the
-    /// old offset to `moved`, so a failure can put them back. One buffered
-    /// pass from the first live record: reading the dead records in between
-    /// costs less than a positioned read per live one.
+    /// Writes each live record of the `chosen` segments to the empty active
+    /// segment, and its key and value length to its hint at `hint_path`,
+    /// and fsyncs both, pointing its index entry at the new offset as it
+    /// goes and pushing the old offset to `moved`, so a failure can put
+    /// them back. Pushes to `carry` the key of each Delete record that must
+    /// outlive its segment: its key isn't live, and a segment older than
+    /// it is kept. Returns the bytes written. One buffered pass per segment:
+    /// reading the dead records in between costs less than a positioned
+    /// read per live one.
     fn copy_live(
         &mut self,
-        compact_path: &Path,
+        chosen: &[u64],
+        oldest_kept: u64,
+        hint_path: &Path,
         moved: &mut Vec<u64>,
-    ) -> Result<(F::File, u64), Error> {
-        let new = self.fs.open_or_create(compact_path)?;
-        new.set_len(0)?;
-        let hint_file = self
-            .fs
-            .open_or_create(&self.dir.join(COMPACT_HINT_FILE_NAME))?;
+        carry: &mut Vec<Vec<u8>>,
+    ) -> Result<u64, Error> {
+        let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
         let mut hint = hint::Writer::new(&hint_file);
-        let first = self
-            .index
-            .values()
-            .map(|e| e.offset)
-            .min()
-            .unwrap_or(self.end);
-        let mut reader = BufReader::with_capacity(COMPACT_BUFFER, self.file.reader_at(first));
+        let (inputs, output) = self.segments.split_at(self.segments.len() - 1);
+        let output = &output[0];
+        let mut carried = HashSet::new();
         let mut header_buf = [0u8; HEADER_LEN];
         let mut payload_buf = Vec::new();
         let mut buffer = Vec::new();
         let mut written = 0u64;
-        let mut offset = first;
-        while offset < self.end {
-            reader.read_exact(&mut header_buf)?;
-            let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
-            payload_buf.resize(header.payload_len(), 0);
-            reader.read_exact(&mut payload_buf)?;
-            let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
-            if let IndexOp::Set { key, value_len } = op
-                && let Some(entry) = self.index.get_mut(key.as_bytes())
-                && entry.offset == offset
-            {
-                entry.offset = written + buffer.len() as u64;
-                moved.push(offset);
-                hint.push(key.as_bytes(), value_len)?;
-                buffer.extend_from_slice(&header_buf);
-                buffer.extend_from_slice(&payload_buf);
-                if buffer.len() >= COMPACT_BUFFER {
-                    new.write_all_at(&buffer, written)?;
-                    written += buffer.len() as u64;
-                    buffer.clear();
+        let mut expected = 0usize;
+        for input in inputs.iter().filter(|s| chosen.contains(&s.base)) {
+            let mut reader = BufReader::with_capacity(COMPACT_BUFFER, input.reader_at(input.base));
+            let mut offset = input.base;
+            while offset < input.end() {
+                reader.read_exact(&mut header_buf)?;
+                let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+                payload_buf.resize(header.payload_len(), 0);
+                reader.read_exact(&mut payload_buf)?;
+                let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
+                match op {
+                    IndexOp::Set { key, value_len } => {
+                        if let Some(entry) = self.index.get_mut(key.as_bytes())
+                            && entry.offset == offset
+                        {
+                            entry.offset = output.base + written + buffer.len() as u64;
+                            moved.push(offset);
+                            hint.push(key.as_bytes(), value_len)?;
+                            buffer.extend_from_slice(&header_buf);
+                            buffer.extend_from_slice(&payload_buf);
+                            if buffer.len() >= COMPACT_BUFFER {
+                                output.file.write_all_at(&buffer, written)?;
+                                written += buffer.len() as u64;
+                                buffer.clear();
+                            }
+                        }
+                    }
+                    IndexOp::Delete { key } => {
+                        if oldest_kept < input.base
+                            && !self.index.contains(key.as_bytes())
+                            && carried.insert(key.as_bytes().to_vec())
+                        {
+                            carry.push(key.as_bytes().to_vec());
+                        }
+                    }
+                    IndexOp::Batch { .. } => {}
                 }
+                offset += header.record_len();
             }
-            offset += header.record_len();
+            expected += 1;
         }
-        assert_eq!(moved.len(), self.index.len(), "every live key is copied");
-        drop(reader);
-        new.write_all_at(&buffer, written)?;
+        assert_eq!(expected, chosen.len(), "every chosen segment is read");
+        let left_behind = self
+            .index
+            .values()
+            .filter(|e| {
+                let at = self.segments.partition_point(|s| s.base <= e.offset) - 1;
+                chosen.contains(&self.segments[at].base)
+            })
+            .count();
+        assert_eq!(left_behind, 0, "every live key in them is copied");
+        output.file.write_all_at(&buffer, written)?;
         written += buffer.len() as u64;
-        sync(&new);
+        sync(&output.file);
         hint.finish(written)?;
         sync(&hint_file);
-        Ok((new, written))
+        Ok(written)
     }
 
     /// Points the entries `copy_live` moved back at their records in the
-    /// old log, rereading each key from there. Each was read and checked
-    /// moments before, so a failure here panics: the old log is untouched,
-    /// and a restart rebuilds the index from it.
+    /// old segments, rereading each key from there. Each was read and
+    /// checked moments before, so a failure here panics: the old segments
+    /// are untouched, and a restart rebuilds the index from them.
     fn restore_offsets(&mut self, moved: &[u64]) {
         for &offset in moved {
-            let (_, record) = load_record(&self.file, offset)
+            let segment = &self.segments[self.segment_of(offset)];
+            let (_, record) = load_record(segment, offset)
                 .expect("rereading a key after a failed compaction; restart to rebuild the index");
             let Record::Set { key, .. } = record else {
                 unreachable!("only Set records are moved");
@@ -315,19 +444,43 @@ impl<F: Fs> Store<F> {
         }
     }
 
-    /// Compacts if automatic compaction is on and due. The caller's write
-    /// has already succeeded, so a failure is logged, not returned.
+    /// Compacts if automatic compaction is on and due, cleaning the
+    /// segments with the most dead bytes until it no longer would be. The
+    /// caller's write has already succeeded, so a failure is logged, not
+    /// returned.
     fn compact_if_due(&mut self) {
         let Some(auto) = self.auto_compact else {
             return;
         };
-        if !auto.is_due(self.dead, self.end) {
-            return;
-        }
-        if let Err(err) = self.compact() {
+        let sizes: Vec<SegmentSize> = self
+            .segments
+            .iter()
+            .map(|s| SegmentSize {
+                base: s.base,
+                len: s.len,
+                dead: s.dead,
+            })
+            .collect();
+        let chosen = deadest(&sizes, auto);
+        if let Err(err) = self.clean(&chosen) {
             self.auto_compact = None;
             log::warn!("automatic compaction failed, off until the next open: {err}");
         }
+    }
+
+    /// Starts a new, empty segment at the end of the log, and makes its
+    /// name durable before anything is written to it.
+    fn roll(&mut self) -> Result<(), Error> {
+        let base = self.end();
+        let file = self.fs.open_or_create(&self.dir.join(log_name(base)))?;
+        self.fs.sync_dir(&self.dir)?;
+        self.segments.push(Segment {
+            base,
+            file,
+            len: 0,
+            dead: 0,
+        });
+        Ok(())
     }
 
     fn append(&mut self, record: &Record) -> Result<u64, Error> {
@@ -336,14 +489,22 @@ impl<F: Fs> Store<F> {
         self.append_bytes(&buffer)
     }
 
+    /// Writes `buffer` at the end of the log in one write and fsyncs it,
+    /// first starting a new segment if the active one is full, so a write
+    /// never spans two segments.
     fn append_bytes(&mut self, buffer: &[u8]) -> Result<u64, Error> {
-        let offset = self.end;
-        if let Err(err) = self.file.write_all_at(buffer, offset) {
-            self.file.set_len(offset).expect("truncate should not fail");
+        let full = self.active().len;
+        if full > 0 && full >= self.segment_bytes {
+            self.roll()?;
+        }
+        let active = self.segments.last_mut().expect("there is always a segment");
+        let offset = active.end();
+        if let Err(err) = active.write_all_at(buffer, offset) {
+            active.set_len(offset).expect("truncate should not fail");
             return Err(Error::Io(err));
         }
-        sync(&self.file);
-        self.end += buffer.len() as u64;
+        sync(&active.file);
+        active.len += buffer.len() as u64;
         Ok(offset)
     }
 
@@ -401,7 +562,8 @@ impl<F: Fs> Store<F> {
         let header_len = buffer.len() as u64;
         buffer.extend_from_slice(&body);
         let start = self.append_bytes(&buffer)?;
-        self.dead += header_len;
+        let at = self.segments.len() - 1;
+        self.segments[at].dead += header_len;
         for (at, op) in written {
             self.indexed(op, start + header_len + at);
         }
@@ -412,6 +574,10 @@ impl<F: Fs> Store<F> {
     /// Updates the index and the dead bytes for a Set or Delete record now
     /// durable at `offset`. A Delete's key must be live.
     fn indexed(&mut self, record: &Record, offset: u64) {
+        let died = |store: &mut Self, at: u64, len: u64| {
+            let segment = store.segment_of(at);
+            store.segments[segment].dead += len;
+        };
         match record {
             Record::Set { key, value } => {
                 let old = self.index.insert(
@@ -424,7 +590,11 @@ impl<F: Fs> Store<F> {
                     },
                 );
                 if let Some(old) = old {
-                    self.dead += record_len(key.as_bytes().len(), old.value_len);
+                    died(
+                        self,
+                        old.offset,
+                        record_len(key.as_bytes().len(), old.value_len),
+                    );
                 }
             }
             Record::Delete { key } => {
@@ -433,7 +603,8 @@ impl<F: Fs> Store<F> {
                     .index
                     .remove(key.as_bytes())
                     .expect("deleted keys are live");
-                self.dead += record_len(key_len, old.value_len) + (HEADER_LEN + key_len) as u64;
+                died(self, old.offset, record_len(key_len, old.value_len));
+                died(self, offset, (HEADER_LEN + key_len) as u64);
             }
             Record::Batch { .. } => unreachable!("not an index operation"),
         }
@@ -450,7 +621,7 @@ impl<F: Fs> Store<F> {
                 if let Record::Set {
                     key: stored_key,
                     value,
-                } = load_indexed(&self.file, entry)?
+                } = load_indexed(&self.segments[self.segment_of(entry.offset)], entry)?
                 {
                     if *key == stored_key {
                         Ok(Some(value))
@@ -484,13 +655,16 @@ impl<F: Fs> Store<F> {
             offset,
             reason: CorruptionReason::IndexMismatch,
         };
-        let len = self.file.size()?;
-        if len != self.end {
-            return Err(mismatch(len.min(self.end)));
-        }
-        let (scanned, end) = load_index(&self.file, self.end)?;
-        if end != self.end {
-            return Err(mismatch(end));
+        let mut scanned = Index::new();
+        for segment in &self.segments {
+            let len = segment.size()?;
+            if len != segment.end() {
+                return Err(mismatch(len.min(segment.end())));
+            }
+            let end = scan(segment, &mut scanned, segment.base, segment.end())?;
+            if end != segment.end() {
+                return Err(mismatch(end));
+            }
         }
         let mut ours: Vec<Entry> = self.index.values().copied().collect();
         let mut theirs: Vec<Entry> = scanned.values().copied().collect();
@@ -624,34 +798,199 @@ fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Err
     Ok((header, record))
 }
 
-/// Reads every record in `file` from offset 0 to `len` and returns the index
-/// they describe.
-fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
-    let mut index = Index::new();
-    let end = scan(file, &mut index, 0, len)?;
-    Ok((index, end))
+#[derive(Debug, Clone, Copy)]
+struct SegmentSize {
+    base: u64,
+    len: u64,
+    dead: u64,
 }
 
-/// The index `tally.hint` gives and the log length it covers, or an empty
-/// index and 0 without one. A hint that can't be used is logged, removed
-/// for good, and treated as missing.
-fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Error> {
-    let path = dir.join(HINT_FILE_NAME);
-    let file = match fs.open_existing(&path) {
-        Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Index::new(), 0)),
-        Err(err) => return Err(err.into()),
-    };
-    match read_hint(&file, log_len, HINT_SIZES, PARALLEL_FROM) {
-        Ok(found) => Ok(found),
-        Err(hint::Invalid(why)) => {
-            log::warn!("ignored the hint file ({why}); reading the whole log instead");
-            drop(file);
-            fs.remove(&path)?;
-            fs.sync_dir(dir)?;
-            Ok((Index::new(), 0))
+/// The bases, in log order, of the segments to clean so that `auto` is no
+/// longer due: the largest share of dead bytes first, each taking the log's
+/// size down by its dead bytes. Empty if it isn't due.
+fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
+    let mut dead: u64 = segments.iter().map(|s| s.dead).sum();
+    let mut len: u64 = segments.iter().map(|s| s.len).sum();
+    let mut candidates: Vec<&SegmentSize> = segments.iter().filter(|s| s.dead > 0).collect();
+    candidates.sort_by(|a, b| {
+        (u128::from(b.dead) * u128::from(a.len)).cmp(&(u128::from(a.dead) * u128::from(b.len)))
+    });
+    let mut chosen = Vec::new();
+    for segment in candidates {
+        if !auto.is_due(dead, len) {
+            break;
+        }
+        dead -= segment.dead;
+        len -= segment.dead;
+        chosen.push(segment.base);
+    }
+    chosen.sort_unstable();
+    chosen
+}
+
+/// Opens every segment in `dir`, in log order, after turning a log from
+/// before segments into the first one, putting the marker in `tally.log`,
+/// and removing hints whose segment is gone. Fails if two segments overlap.
+fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
+    let mut changed = migrate(fs, dir)?;
+    let names = fs.list(dir)?;
+    let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
+    bases.sort_unstable();
+    for base in names.iter().filter_map(|n| parse_hint_name(n)) {
+        if bases.binary_search(&base).is_err() {
+            fs.remove(&dir.join(hint_name(base)))?;
+            changed = true;
         }
     }
+    if changed {
+        fs.sync_dir(dir)?;
+    }
+    let mut segments: Vec<Segment<F::File>> = Vec::with_capacity(bases.len());
+    for base in bases {
+        let file = fs.open_existing(&dir.join(log_name(base)))?;
+        let len = file.size()?;
+        if let Some(before) = segments.last()
+            && before.end() > base
+        {
+            return Err(Error::Corruption {
+                offset: base,
+                reason: CorruptionReason::SegmentsOverlap,
+            });
+        }
+        segments.push(Segment {
+            base,
+            file,
+            len,
+            dead: 0,
+        });
+    }
+    Ok(segments)
+}
+
+/// Turns a `tally.log` from before segments into the segment at 0, with
+/// its hint, and leaves the marker in `tally.log`. Returns whether it
+/// changed anything the directory must make durable. Fails if `tally.log`
+/// holds records while segments exist: an earlier version wrote them after
+/// the log was split, and they can't be put in order.
+fn migrate<F: Fs>(fs: &F, dir: &Path) -> Result<bool, Error> {
+    let names = fs.list(dir)?;
+    let legacy = dir.join(LOG_FILE_NAME);
+    let marker = marker();
+    if names.iter().any(|n| n == LOG_FILE_NAME) {
+        let file = fs.open_existing(&legacy)?;
+        let size = file.size()?;
+        if size <= HEADER_LEN as u64 {
+            let mut bytes = vec![0u8; size as usize];
+            file.read_exact_at(&mut bytes, 0)?;
+            if bytes[..] == marker[..] {
+                return Ok(false);
+            }
+            // A torn marker, or an empty log with nothing to move.
+            if bytes[..] == marker[..bytes.len()] {
+                write_marker(fs, &legacy, &marker)?;
+                return Ok(true);
+            }
+        }
+        if names.iter().any(|n| parse_log_name(n).is_some()) {
+            return Err(Error::Io(io::Error::other(
+                "tally.log holds records next to segment files: an earlier version of tally wrote them",
+            )));
+        }
+        drop(file);
+        fs.rename(&legacy, &dir.join(log_name(0)))?;
+        if names.iter().any(|n| n == HINT_FILE_NAME) {
+            fs.rename(&dir.join(HINT_FILE_NAME), &dir.join(hint_name(0)))?;
+        }
+        remove_if_present(fs, &dir.join(COMPACT_FILE_NAME))?;
+        remove_if_present(fs, &dir.join(COMPACT_HINT_FILE_NAME))?;
+    }
+    write_marker(fs, &legacy, &marker)?;
+    Ok(true)
+}
+
+fn write_marker<F: Fs>(fs: &F, path: &Path, marker: &[u8]) -> io::Result<()> {
+    let file = fs.open_or_create(path)?;
+    file.set_len(0)?;
+    file.write_all_at(marker, 0)?;
+    file.sync()
+}
+
+/// Builds the index from every segment in order: from its hint and the
+/// records after it, or from all its records. Truncates a torn tail of the
+/// newest segment; in any other, one is `CutShort` corruption. A hint that
+/// can't be used is logged, removed for good, and the whole index built
+/// again without it, since what it put in the index can't be told apart.
+fn load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Result<Index, Error> {
+    loop {
+        match try_load(fs, dir, segments)? {
+            Ok(index) => return Ok(index),
+            Err((base, hint::Invalid(why))) => {
+                log::warn!(
+                    "ignored the hint for the segment at {base} ({why}); reading the segment instead"
+                );
+                fs.remove(&dir.join(hint_name(base)))?;
+                fs.sync_dir(dir)?;
+            }
+        }
+    }
+}
+
+type HintFailure = (u64, hint::Invalid);
+
+fn try_load<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    segments: &mut [Segment<F::File>],
+) -> Result<Result<Index, HintFailure>, Error> {
+    let mut hints = Vec::with_capacity(segments.len());
+    let mut count = 0u64;
+    for segment in segments.iter() {
+        let hint = match fs.open_existing(&dir.join(hint_name(segment.base))) {
+            Ok(file) => match hint::trailer(&file) {
+                Ok(trailer) => {
+                    count = count.saturating_add(trailer.count);
+                    Some(file)
+                }
+                Err(invalid) => return Ok(Err((segment.base, invalid))),
+            },
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        hints.push(hint);
+    }
+    // The counts are unchecked until every entry is read: never reserve
+    // more than the log could hold.
+    let total: u64 = segments.iter().map(|s| s.len).sum();
+    let capacity = usize::try_from(count.min(total / record_len(1, 1))).unwrap_or(usize::MAX);
+    let mut index = Index::with_capacity(capacity);
+    let newest = segments.len() - 1;
+    for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
+        let hinted = match hint {
+            Some(file) => match read_hint(&file, segment, &mut index, HINT_SIZES, PARALLEL_FROM) {
+                Ok(hinted) => hinted,
+                Err(invalid) => return Ok(Err((segment.base, invalid))),
+            },
+            None => segment.base,
+        };
+        let len = segment.end();
+        let end = scan(&*segment, &mut index, hinted, len)?;
+        if end < len {
+            if i < newest {
+                return Err(Error::Corruption {
+                    offset: end,
+                    reason: CorruptionReason::CutShort,
+                });
+            }
+            segment.set_len(end)?;
+            sync(&segment.file);
+            segment.len = end - segment.base;
+            log::warn!(
+                "truncated a torn tail at offset {end}: dropped {} bytes",
+                len - end
+            );
+        }
+    }
+    Ok(Ok(index))
 }
 
 /// Hints with fewer entries than this are read on one thread.
@@ -662,23 +1001,21 @@ const HINT_SIZES: hint::Sizes = hint::Sizes {
     chunk_entries: 8192,
 };
 
-/// Reads the index from the hint, a window of `sizes` at a time: on one
-/// thread below `parallel_from` entries, on up to `MAX_THREADS` from there.
-fn read_hint(
+/// Adds the entries of `segment`'s hint `file` to `index`, a window of
+/// `sizes` at a time: on one thread below `parallel_from` entries, on up to
+/// `MAX_THREADS` from there. Returns the log offset the hint covers to. On
+/// `Err`, what it added must be thrown away.
+fn read_hint<L: LogFile>(
     file: &impl LogFile,
-    log_len: u64,
+    segment: &Segment<L>,
+    index: &mut Index,
     sizes: hint::Sizes,
     parallel_from: u64,
-) -> Result<(Index, u64), hint::Invalid> {
+) -> Result<u64, hint::Invalid> {
     let trailer = hint::trailer(file)?;
-    if trailer.log_len > log_len {
-        return Err(hint::Invalid("the log is shorter than the hint says"));
+    if trailer.log_len > segment.len {
+        return Err(hint::Invalid("the segment is shorter than the hint says"));
     }
-    // The count is unchecked until every entry is read: never reserve more
-    // than the log could hold.
-    let most = log_len / record_len(1, 1);
-    let capacity = usize::try_from(trailer.count.min(most)).unwrap_or(usize::MAX);
-    let mut index = Index::with_capacity(capacity);
     let threads = if trailer.count < parallel_from {
         1
     } else {
@@ -686,14 +1023,16 @@ fn read_hint(
             .map_or(1, NonZero::get)
             .min(MAX_THREADS)
     };
+    let base = segment.base;
+    let mut replaced = 0;
     hint::read_entries(file, trailer, sizes, |window| {
-        index.fill(threads, window.chunks(), |chunk, filler| {
+        replaced += index.fill(threads, window.chunks(), base, |chunk, filler| {
             for (key, offset, value_len) in window.entries(chunk) {
                 let key_len = u16::try_from(key.len()).expect("read_entries checked it");
                 filler.push(
                     key,
                     Entry {
-                        offset,
+                        offset: base + offset,
                         value_len,
                         key_len,
                     },
@@ -701,10 +1040,10 @@ fn read_hint(
             }
         });
     })?;
-    if index.len() as u64 != trailer.count {
+    if replaced > 0 {
         return Err(hint::Invalid("a key appears twice"));
     }
-    Ok((index, trailer.log_len))
+    Ok(base + trailer.log_len)
 }
 
 /// Applies the records from `start` to `len` to `index`. Returns where the
@@ -883,15 +1222,39 @@ mod tests {
         Value::try_from(bytes).unwrap()
     }
 
+    /// Bases of the segments in `dir`, in log order.
+    fn segment_bases(dir: &Path) -> Vec<u64> {
+        let mut bases: Vec<u64> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| parse_log_name(e.unwrap().file_name().to_str()?))
+            .collect();
+        bases.sort_unstable();
+        bases
+    }
+
+    /// The newest segment, or before the first open, `tally.log`, which
+    /// `open` turns into the first segment.
     fn log_path(dir: &Path) -> PathBuf {
-        dir.join(LOG_FILE_NAME)
+        match segment_bases(dir).last() {
+            Some(&base) => dir.join(log_name(base)),
+            None => dir.join(LOG_FILE_NAME),
+        }
     }
 
+    /// Every segment's bytes, in log order.
     fn log_bytes(dir: &Path) -> Vec<u8> {
-        fs::read(log_path(dir)).unwrap()
+        let bases = segment_bases(dir);
+        if bases.is_empty() {
+            return fs::read(dir.join(LOG_FILE_NAME)).unwrap();
+        }
+        bases
+            .into_iter()
+            .flat_map(|base| fs::read(dir.join(log_name(base))).unwrap())
+            .collect()
     }
 
-    /// Overwrites bytes in the log behind the store's back.
+    /// Overwrites bytes in the newest segment behind the store's back, at
+    /// an offset in its file.
     fn write_log_at(dir: &Path, offset: u64, bytes: &[u8]) {
         let file = OpenOptions::new().write(true).open(log_path(dir)).unwrap();
         file.write_all_at(bytes, offset).unwrap();
@@ -1135,7 +1498,10 @@ mod tests {
         let tmp = store_with_log(&bytes);
         assert_eq!(Store::repair(tmp.path()).unwrap(), None);
         assert_eq!(log_bytes(tmp.path()), bytes);
-        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+        assert_eq!(
+            file_names(tmp.path()),
+            ["tally.00000000000000000000.log", "tally.lock", "tally.log"]
+        );
     }
 
     #[test]
@@ -1531,8 +1897,14 @@ mod tests {
         store.compact().unwrap();
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.hint", "tally.lock", "tally.log"]
+            [
+                "tally.00000000000000000018.hint",
+                "tally.00000000000000000018.log",
+                "tally.lock",
+                "tally.log"
+            ]
         );
+        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
     }
 
     #[test]
@@ -1600,7 +1972,7 @@ mod tests {
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 0,
+                offset: 35,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -1615,15 +1987,15 @@ mod tests {
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 18,
+                offset: 53,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
-        store.index.get_mut(b"a").unwrap().offset = 18;
+        store.index.get_mut(b"a").unwrap().offset = 53;
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 0,
+                offset: 35,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
@@ -1643,10 +2015,325 @@ mod tests {
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 18,
+                offset: 53,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
+    }
+
+    // segments
+
+    fn segmented(segment_bytes: u64) -> Options {
+        Options {
+            auto_compact: None,
+            segment_bytes,
+        }
+    }
+
+    fn put(store: &mut Store, k: &[u8], v: &[u8]) {
+        store.set(key(k), value(v)).unwrap();
+    }
+
+    fn read(store: &Store, k: &[u8]) -> Option<Vec<u8>> {
+        store.get(&key(k)).unwrap().map(|v| v.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn writes_go_to_a_new_segment_once_one_is_full() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(20)).unwrap();
+        put(&mut store, b"a", b"hi");
+        put(&mut store, b"b", b"2");
+        assert_eq!(segment_bases(tmp.path()), [0], "18 bytes is not full yet");
+        put(&mut store, b"c", b"3");
+        assert_eq!(segment_bases(tmp.path()), [0, 35], "35 bytes is full");
+        store
+            .write(batch(&[(b"d", Some(b"4")), (b"a", None)]))
+            .unwrap();
+        assert_eq!(segment_bases(tmp.path()), [0, 35]);
+        assert_eq!(
+            fs::read(tmp.path().join(log_name(35))).unwrap(),
+            encoded(&[
+                set_record(b"c", b"3"),
+                Record::Batch { body_len: 33 },
+                set_record(b"d", b"4"),
+                delete_record(b"a"),
+            ]),
+            "17 bytes is not full: the whole batch goes after c=3"
+        );
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), segmented(20)).unwrap();
+        assert_eq!(read(&store, b"a"), None);
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+        assert_eq!(read(&store, b"d").as_deref(), Some(&b"4"[..]));
+        assert_eq!(store.dead(), 18 + 23 + 16);
+        store.verify().unwrap();
+    }
+
+    /// One record per segment: a=1 at 0, b=2 at 17, a deleted at 34, c=3
+    /// at 50.
+    fn one_record_per_segment(dir: &Path) -> Store {
+        let mut store = Store::open_with(dir, segmented(1)).unwrap();
+        put(&mut store, b"a", b"1");
+        put(&mut store, b"b", b"2");
+        store.delete(key(b"a")).unwrap();
+        put(&mut store, b"c", b"3");
+        assert_eq!(segment_bases(dir), [0, 17, 34, 50]);
+        store
+    }
+
+    #[test]
+    fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = one_record_per_segment(tmp.path());
+        store.clean(&[34]).unwrap();
+        assert_eq!(segment_bases(tmp.path()), [0, 17, 50, 67]);
+        assert_eq!(
+            fs::read(tmp.path().join(log_name(67))).unwrap(),
+            encoded(&[delete_record(b"a")])
+        );
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(read(&store, b"a"), None, "a=1 at 0 stays hidden");
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn cleaning_a_delete_with_every_older_segment_drops_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = one_record_per_segment(tmp.path());
+        store.clean(&[0, 17, 34]).unwrap();
+        assert_eq!(segment_bases(tmp.path()), [50, 67]);
+        assert_eq!(
+            fs::read(tmp.path().join(log_name(67))).unwrap(),
+            encoded(&[set_record(b"b", b"2")]),
+            "only b=2 is copied; the Delete has nothing left to hide"
+        );
+        assert!(tmp.path().join(hint_name(67)).exists());
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(read(&store, b"a"), None);
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+        assert_eq!(store.dead(), 0);
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn get_reads_each_key_from_its_own_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = one_record_per_segment(tmp.path());
+        assert_eq!(store.index.get(b"b").unwrap().offset, 17);
+        assert_eq!(store.index.get(b"c").unwrap().offset, 50);
+        write_log_at(tmp.path(), 15, b"X");
+        assert!(matches!(
+            store.get(&key(b"c")),
+            Err(Error::Corruption {
+                offset: 50,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
+    fn size(sizes: &[(u64, u64, u64)]) -> Vec<SegmentSize> {
+        sizes
+            .iter()
+            .map(|&(base, len, dead)| SegmentSize { base, len, dead })
+            .collect()
+    }
+
+    #[test]
+    fn automatic_compaction_cleans_the_deadest_segments_until_it_is_not_due() {
+        let auto = AutoCompact::new(50, 0).unwrap();
+        // 315 dead of 500. Cleaning 100 (90% dead) leaves 225 of 410,
+        // still due; then 200 (60%) leaves 105 of 290, not due.
+        let segments = size(&[
+            (0, 100, 55),
+            (100, 100, 90),
+            (200, 200, 120),
+            (400, 100, 50),
+            (500, 0, 0),
+        ]);
+        assert_eq!(deadest(&segments, auto), [100, 200]);
+        assert_eq!(
+            deadest(&size(&[(0, 100, 49), (100, 0, 0)]), auto),
+            [] as [u64; 0]
+        );
+        assert_eq!(deadest(&size(&[(0, 100, 50), (100, 0, 0)]), auto), [0]);
+    }
+
+    #[test]
+    fn automatic_compaction_leaves_segments_without_dead_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let options = Options {
+            auto_compact: AutoCompact::new(50, 0),
+            segment_bytes: 1,
+        };
+        let mut store = Store::open_with(tmp.path(), options).unwrap();
+        put(&mut store, b"a", b"1");
+        put(&mut store, b"b", b"2");
+        put(&mut store, b"b", b"3");
+        // b=3 at 34 made b=2 at 17 dead: 17 of 51, not due. Deleting b
+        // makes 17 + 17 + 16 of 67 dead. Cleaning the segment at 17 leaves
+        // 33 of 50, still due; then 34 leaves 16 of 33, not due. Neither has
+        // a live record, and a=1 at 0 is never read.
+        store.delete(key(b"b")).unwrap();
+        assert_eq!(segment_bases(tmp.path()), [0, 51, 67]);
+        assert_eq!(fs::read(tmp.path().join(log_name(67))).unwrap(), b"");
+        assert_eq!(store.dead(), 16);
+        drop(store);
+        let store = Store::open_with(tmp.path(), options).unwrap();
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(read(&store, b"b"), None);
+    }
+
+    #[test]
+    fn a_sealed_segment_cut_short_is_corruption_that_repair_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(one_record_per_segment(tmp.path()));
+        let second = tmp.path().join(log_name(17));
+        fs::write(&second, &fs::read(&second).unwrap()[..10]).unwrap();
+        assert!(matches!(
+            Store::open_with(tmp.path(), segmented(1)),
+            Err(Error::Corruption {
+                offset: 17,
+                reason: CorruptionReason::CutShort
+            })
+        ));
+
+        let repaired = Store::repair(tmp.path()).unwrap().unwrap();
+        assert_eq!((repaired.offset, repaired.dropped), (17, 10));
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(read(&store, b"b"), None);
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+        assert_eq!(read(&store, b"a"), None);
+    }
+
+    #[test]
+    fn segments_that_overlap_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        drop(one_record_per_segment(tmp.path()));
+        fs::write(
+            tmp.path().join(log_name(30)),
+            encoded(&[set_record(b"x", b"1")]),
+        )
+        .unwrap();
+        assert!(matches!(
+            Store::open_with(tmp.path(), segmented(1)),
+            Err(Error::Corruption {
+                offset: 30,
+                reason: CorruptionReason::SegmentsOverlap
+            })
+        ));
+    }
+
+    #[test]
+    fn a_hint_whose_segment_is_gone_is_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let orphan = tmp.path().join(hint_name(1000));
+        fs::copy(hint_path(tmp.path()), &orphan).unwrap();
+        Store::open(tmp.path()).unwrap();
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn a_hint_that_fails_after_filling_the_index_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        // The hint's one entry for "a" now names "c": its lengths still add
+        // up, so "c" goes into the index before the checksum fails.
+        let mut hint = fs::read(hint_path(tmp.path())).unwrap();
+        assert_eq!(hint[11], b'a');
+        hint[11] = b'c';
+        fs::write(hint_path(tmp.path()), hint).unwrap();
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(read(&store, b"c"), None);
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
+        store.verify().unwrap();
+    }
+
+    // migration from before segments
+
+    #[test]
+    fn a_log_from_before_segments_becomes_the_first_segment_with_its_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        fs::rename(
+            tmp.path().join(log_name(35)),
+            tmp.path().join(LOG_FILE_NAME),
+        )
+        .unwrap();
+        fs::rename(
+            tmp.path().join(hint_name(35)),
+            tmp.path().join(HINT_FILE_NAME),
+        )
+        .unwrap();
+        fs::write(tmp.path().join(COMPACT_FILE_NAME), b"left by a crash").unwrap();
+        write_log_at(tmp.path(), 16, b"X");
+
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(
+            file_names(tmp.path()),
+            [
+                "tally.00000000000000000000.hint",
+                "tally.00000000000000000000.log",
+                "tally.lock",
+                "tally.log"
+            ]
+        );
+        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
+        assert!(
+            matches!(
+                store.get(&key(b"a")),
+                Err(Error::Corruption {
+                    offset: 0,
+                    reason: CorruptionReason::PayloadChecksum
+                })
+            ),
+            "read from the hint, not the log"
+        );
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn the_marker_is_an_unsupported_record_to_any_earlier_tally() {
+        assert_eq!(
+            decode_header(&marker()),
+            Err(DecodeError::Unsupported(UnsupportedReason::UnknownType(
+                255
+            )))
+        );
+    }
+
+    #[test]
+    fn a_torn_marker_is_written_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        for torn in [&marker()[..7], &[]] {
+            fs::write(tmp.path().join(LOG_FILE_NAME), torn).unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
+            assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
+        }
+    }
+
+    #[test]
+    fn records_in_tally_log_next_to_segments_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        fs::write(tmp.path().join(LOG_FILE_NAME), SET_A_HI).unwrap();
+        assert!(matches!(Store::open(tmp.path()), Err(Error::Io(_))));
+        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), SET_A_HI);
     }
 
     // batches
@@ -1691,12 +2378,12 @@ mod tests {
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
-        assert_eq!(store.dead, 23 + 17 + 17 + 16);
+        assert_eq!(store.dead(), 23 + 17 + 17 + 16);
         drop(store);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
-        assert_eq!(store.dead, 23 + 17 + 17 + 16);
+        assert_eq!(store.dead(), 23 + 17 + 17 + 16);
         store.verify().unwrap();
     }
 
@@ -1830,7 +2517,7 @@ mod tests {
             .unwrap();
         store.compact().unwrap();
         assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
-        assert_eq!(store.dead, 0);
+        assert_eq!(store.dead(), 0);
         drop(store);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -1839,11 +2526,13 @@ mod tests {
 
     // hint file
 
+    /// The hint of the newest segment.
     fn hint_path(dir: &Path) -> PathBuf {
-        dir.join(HINT_FILE_NAME)
+        dir.join(hint_name(*segment_bases(dir).last().unwrap()))
     }
 
-    /// a=hi at 0 and b=2 at 18, compacted, so `tally.hint` covers both.
+    /// a=hi at 0 and b=2 at 18, compacted into the segment at 35, so a is
+    /// at 35, b at 53, and the segment's hint covers both.
     fn compacted_a_and_b(dir: &Path) {
         let mut store = Store::open(dir).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
@@ -1861,7 +2550,7 @@ mod tests {
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
-                offset: 0,
+                offset: 35,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -1871,7 +2560,14 @@ mod tests {
     #[test]
     fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        let mut store = Store::open_with(
+            tmp.path(),
+            Options {
+                auto_compact: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         let mut batch = Batch::new();
         for i in 0..3000u32 {
             batch.set(
@@ -1884,16 +2580,26 @@ mod tests {
         drop(store);
 
         let fs = OsFs;
-        let file = fs.open_existing(&tmp.path().join(HINT_FILE_NAME)).unwrap();
-        let log_len = log_bytes(tmp.path()).len() as u64;
-        let (one, len_one) = read_hint(&file, log_len, HINT_SIZES, u64::MAX).unwrap();
+        let [base] = segment_bases(tmp.path())[..] else {
+            panic!("compaction leaves one segment");
+        };
+        let file = fs.open_existing(&tmp.path().join(hint_name(base))).unwrap();
+        let segment = Segment {
+            base,
+            file: fs.open_existing(&tmp.path().join(log_name(base))).unwrap(),
+            len: log_bytes(tmp.path()).len() as u64,
+            dead: 0,
+        };
+        let mut one = Index::new();
+        let len_one = read_hint(&file, &segment, &mut one, HINT_SIZES, u64::MAX).unwrap();
         let small = hint::Sizes {
             window_bytes: 4096,
             chunk_entries: 50,
         };
-        let (many, len_many) = read_hint(&file, log_len, small, 0).unwrap();
+        let mut many = Index::new();
+        let len_many = read_hint(&file, &segment, &mut many, small, 0).unwrap();
 
-        assert_eq!((len_one, len_many), (log_len, log_len));
+        assert_eq!((len_one, len_many), (segment.end(), segment.end()));
         assert_eq!(many.len(), 3000);
         for i in 0..3000u32 {
             let k = format!("k{i}");
@@ -1917,7 +2623,7 @@ mod tests {
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"22")));
         assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
-        assert_eq!(store.dead, 18 + 16 + 17);
+        assert_eq!(store.dead(), 18 + 16 + 17);
     }
 
     #[test]
@@ -1929,7 +2635,10 @@ mod tests {
         fs::write(hint_path(tmp.path()), hint).unwrap();
 
         let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+        assert_eq!(
+            file_names(tmp.path()),
+            ["tally.00000000000000000035.log", "tally.lock", "tally.log"]
+        );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
     }
@@ -1942,7 +2651,10 @@ mod tests {
         fs::write(log_path(tmp.path()), &log[..18]).unwrap();
 
         let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(file_names(tmp.path()), ["tally.lock", "tally.log"]);
+        assert_eq!(
+            file_names(tmp.path()),
+            ["tally.00000000000000000035.log", "tally.lock", "tally.log"]
+        );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
     }
@@ -1954,7 +2666,7 @@ mod tests {
         write_log_at(tmp.path(), 33, b"X");
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!(repaired.offset, 18);
+        assert_eq!(repaired.offset, 53);
         assert!(!hint_path(tmp.path()).exists());
         let mut store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -1978,7 +2690,7 @@ mod tests {
         assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
-        assert_eq!(store.dead, 0);
+        assert_eq!(store.dead(), 0);
     }
 
     #[test]
@@ -2069,9 +2781,41 @@ mod tests {
         assert_eq!(store.get(&key(b"d")).unwrap(), Some(value(b"4")));
     }
 
+    #[test]
+    fn a_compaction_that_fails_after_writing_copies_empties_the_new_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        let big = vec![b'v'; 700 << 10];
+        store.set(key(b"a"), value(&big)).unwrap();
+        store.set(key(b"b"), value(&big)).unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        let c = 2 * (15 + 1 + (700 << 10));
+        write_log_at(tmp.path(), c + 16, b"X");
+
+        // More than the 1 MiB compaction buffer is copied before c fails.
+        assert!(matches!(
+            store.compact(),
+            Err(Error::Corruption { offset, reason: CorruptionReason::PayloadChecksum })
+                if offset == c
+        ));
+        let end = c + 17;
+        assert_eq!(segment_bases(tmp.path()), [0, end]);
+        assert_eq!(fs::read(tmp.path().join(log_name(end))).unwrap(), b"");
+        assert!(!tmp.path().join(hint_name(end)).exists());
+        assert_eq!(read(&store, b"a"), Some(big.clone()));
+        assert_eq!(read(&store, b"b"), Some(big));
+        put(&mut store, b"d", b"4");
+        assert_eq!(
+            fs::read(tmp.path().join(log_name(end))).unwrap(),
+            encoded(&[set_record(b"d", b"4")])
+        );
+        assert_eq!(store.index.get(b"d").unwrap().offset, end);
+    }
+
     fn auto(dead_percent: u8, min_log_bytes: u64) -> Options {
         Options {
             auto_compact: AutoCompact::new(dead_percent, min_log_bytes),
+            ..Options::default()
         }
     }
 
@@ -2122,7 +2866,10 @@ mod tests {
     #[test]
     fn without_auto_compact_the_log_only_grows() {
         let tmp = tempfile::tempdir().unwrap();
-        let options = Options { auto_compact: None };
+        let options = Options {
+            auto_compact: None,
+            ..Options::default()
+        };
         let mut store = Store::open_with(tmp.path(), options).unwrap();
         for v in [b"1", b"2", b"3"] {
             store.set(key(b"a"), value(v)).unwrap();
@@ -2136,7 +2883,14 @@ mod tests {
     #[test]
     fn open_compacts_a_log_that_is_due() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        let mut store = Store::open_with(
+            tmp.path(),
+            Options {
+                auto_compact: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         drop(store);
@@ -2149,7 +2903,14 @@ mod tests {
     #[test]
     fn open_counts_the_dead_bytes_already_in_the_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), Options { auto_compact: None }).unwrap();
+        let mut store = Store::open_with(
+            tmp.path(),
+            Options {
+                auto_compact: None,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"3")).unwrap();

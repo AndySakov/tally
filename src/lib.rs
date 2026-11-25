@@ -11,6 +11,7 @@ mod options;
 #[cfg(test)]
 mod power_cut;
 mod record;
+mod segment;
 mod store;
 
 pub use batch::Batch;

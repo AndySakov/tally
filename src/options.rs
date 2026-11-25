@@ -5,12 +5,16 @@ pub struct Options {
     /// When to compact without being asked. `None` leaves compaction to
     /// `Store::compact`. The default is [`AutoCompact::default`].
     pub auto_compact: Option<AutoCompact>,
+    /// Writes go to a new segment once the current one holds at least this
+    /// many bytes (DESIGN.md, Segments). The default is 256 MiB.
+    pub segment_bytes: u64,
 }
 
 impl Default for Options {
     fn default() -> Options {
         Options {
             auto_compact: Some(AutoCompact::default()),
+            segment_bytes: 256 << 20,
         }
     }
 }

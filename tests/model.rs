@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use proptest::prelude::*;
-use tally::{Batch, Key, Store, Value};
+use tally::{Batch, Key, Options, Store, Value};
 
 const HEADER_LEN: u64 = 15;
 
@@ -42,6 +42,14 @@ fn op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// Small segments, so writes roll into new ones and reads and reopens
+/// cross several.
+fn options() -> Options {
+    let mut options = Options::default();
+    options.segment_bytes = 100;
+    options
+}
+
 fn key_bytes(k: u8) -> [u8; 2] {
     [b'k', k]
 }
@@ -50,8 +58,18 @@ fn key(k: u8) -> Key {
     Key::try_from(&key_bytes(k)[..]).unwrap()
 }
 
+/// Bytes across the log's segment files, `tally.<20 digits>.log`.
 fn log_len(dir: &Path) -> u64 {
-    std::fs::metadata(dir.join("tally.log")).unwrap().len()
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
+        })
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
 }
 
 fn cases() -> u32 {
@@ -67,7 +85,7 @@ proptest! {
     #[test]
     fn store_matches_a_hashmap(ops in prop::collection::vec(op(), 1..40)) {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let mut store = Store::open_with(tmp.path(), options()).unwrap();
         let mut model: HashMap<u8, Vec<u8>> = HashMap::new();
         let mut expected_len = 0u64;
 
@@ -93,7 +111,7 @@ proptest! {
                 }
                 Op::Reopen => {
                     drop(store);
-                    store = Store::open(tmp.path()).unwrap();
+                    store = Store::open_with(tmp.path(), options()).unwrap();
                 }
                 Op::Batch(ops) => {
                     let mut batch = Batch::new();
@@ -123,7 +141,7 @@ proptest! {
         }
 
         drop(store);
-        let store = Store::open(tmp.path()).unwrap();
+        let store = Store::open_with(tmp.path(), options()).unwrap();
         for k in 0..KEY_SPACE {
             let got = store.get(&key(k)).unwrap();
             prop_assert_eq!(

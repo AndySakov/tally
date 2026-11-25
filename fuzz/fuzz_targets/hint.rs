@@ -1,5 +1,5 @@
-//! Compacts a store so it has a hint file, writes more records after it,
-//! damages the hint, and reopens.
+//! Compacts a store so its segment has a hint file, writes more records
+//! after it, damages the hint, and reopens.
 //!
 //! However the hint is damaged (a changed byte, a truncation, or arbitrary
 //! bytes in its place), `open` succeeds and every key reads back the value
@@ -67,7 +67,15 @@ fuzz_target!(|input: Input| {
     apply(&mut store, &mut state, input.after);
     drop(store);
 
-    let path = dir.path().join("tally.hint");
+    // Compaction leaves one segment with a hint, unless there was nothing
+    // to compact.
+    let Some(path) = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "hint"))
+    else {
+        return;
+    };
     let mut hint = std::fs::read(&path).unwrap();
     match input.damage {
         Damage::None => {}

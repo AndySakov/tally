@@ -32,6 +32,12 @@ pub enum CorruptionReason {
     /// A Batch record with the wrong lengths, a batch inside a batch, or
     /// records that don't exactly fill the batch.
     BadBatch,
+    /// A segment other than the newest ends partway through a record. Only
+    /// the newest can be torn by a crash: every other was complete and
+    /// fsynced before the next one was written.
+    CutShort,
+    /// A segment starts before the one before it ends.
+    SegmentsOverlap,
 }
 
 impl Display for CorruptionReason {
@@ -47,6 +53,8 @@ impl Display for CorruptionReason {
             CorruptionReason::NotASet => write!(f, "indexed record is not a set"),
             CorruptionReason::IndexMismatch => write!(f, "index does not match the log"),
             CorruptionReason::BadBatch => write!(f, "malformed batch"),
+            CorruptionReason::CutShort => write!(f, "segment ends partway through a record"),
+            CorruptionReason::SegmentsOverlap => write!(f, "segment starts inside the one before"),
         }
     }
 }
@@ -242,6 +250,14 @@ mod tests {
             (
                 CorruptionReason::BadBatch,
                 "corrupt record at offset 4096: malformed batch",
+            ),
+            (
+                CorruptionReason::CutShort,
+                "corrupt record at offset 4096: segment ends partway through a record",
+            ),
+            (
+                CorruptionReason::SegmentsOverlap,
+                "corrupt record at offset 4096: segment starts inside the one before",
             ),
         ];
         for (reason, expected) in cases {
