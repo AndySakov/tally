@@ -11,7 +11,7 @@ use std::path::Path;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use tally::fuzz::HEADER_LEN;
-use tally::{Key, Store, Value};
+use tally::{Batch, Key, Store, Value};
 
 /// Few distinct keys, so overwrites and deletes hit live keys often.
 const KEY_SPACE: u8 = 8;
@@ -23,6 +23,8 @@ enum Op {
     Delete(u8),
     Reopen,
     Compact,
+    /// Sets (`Some`) and deletes (`None`) written as one batch.
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
 }
 
 fn key_bytes(k: u8) -> [u8; 2] {
@@ -72,6 +74,33 @@ fuzz_target!(|ops: Vec<Op>| {
             Op::Reopen => {
                 drop(store);
                 store = Store::open(dir.path()).unwrap();
+            }
+            Op::Batch(ops) => {
+                let mut batch = Batch::new();
+                let mut written = 0u64;
+                for (k, v) in ops {
+                    let k = k % KEY_SPACE;
+                    match v {
+                        Some(v) => {
+                            let Ok(value) = Value::try_from(&v[..]) else {
+                                continue;
+                            };
+                            batch.set(key(k), value);
+                            written += (HEADER_LEN + key_bytes(k).len() + v.len()) as u64;
+                            model.insert(k, v);
+                        }
+                        None => {
+                            batch.delete(key(k));
+                            if model.remove(&k).is_some() {
+                                written += (HEADER_LEN + key_bytes(k).len()) as u64;
+                            }
+                        }
+                    }
+                }
+                store.write(batch).unwrap();
+                if written > 0 {
+                    expected_len += (HEADER_LEN + 8) as u64 + written;
+                }
             }
             Op::Compact => {
                 store.compact().unwrap();

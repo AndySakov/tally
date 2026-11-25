@@ -29,6 +29,9 @@ pub enum CorruptionReason {
     /// Found by `Store::verify`: reading the whole log gives a different
     /// index from the one in memory, or the log ends before the store's end.
     IndexMismatch,
+    /// A Batch record with the wrong lengths, a batch inside a batch, or
+    /// records that don't exactly fill the batch.
+    BadBatch,
 }
 
 impl Display for CorruptionReason {
@@ -43,6 +46,7 @@ impl Display for CorruptionReason {
             CorruptionReason::KeyMismatch => write!(f, "stored key does not match index"),
             CorruptionReason::NotASet => write!(f, "indexed record is not a set"),
             CorruptionReason::IndexMismatch => write!(f, "index does not match the log"),
+            CorruptionReason::BadBatch => write!(f, "malformed batch"),
         }
     }
 }
@@ -154,6 +158,18 @@ impl DecodeError {
     }
 }
 
+impl Error {
+    /// The same error reported at `offset`: an error inside a batch is
+    /// reported at the batch, the unit `repair` moves.
+    pub(crate) fn moved_to(self, offset: u64) -> Error {
+        match self {
+            Error::Corruption { reason, .. } => Error::Corruption { offset, reason },
+            Error::Unsupported { reason, .. } => Error::Unsupported { offset, reason },
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +238,10 @@ mod tests {
             (
                 CorruptionReason::IndexMismatch,
                 "corrupt record at offset 4096: index does not match the log",
+            ),
+            (
+                CorruptionReason::BadBatch,
+                "corrupt record at offset 4096: malformed batch",
             ),
         ];
         for (reason, expected) in cases {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::TryLockError;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,7 @@ use crate::options::{AutoCompact, Options};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
 };
-use crate::{CorruptionReason, DecodeError, Error, Key, Value};
+use crate::{Batch, CorruptionReason, DecodeError, Error, Key, Value};
 
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
@@ -328,10 +329,14 @@ impl<F: Fs> Store<F> {
     }
 
     fn append(&mut self, record: &Record) -> Result<u64, Error> {
-        let offset = self.end;
         let mut buffer: Vec<u8> = vec![];
         encode(record, &mut buffer);
-        if let Err(err) = self.file.write_all_at(&buffer, offset) {
+        self.append_bytes(&buffer)
+    }
+
+    fn append_bytes(&mut self, buffer: &[u8]) -> Result<u64, Error> {
+        let offset = self.end;
+        if let Err(err) = self.file.write_all_at(buffer, offset) {
             self.file.set_len(offset).expect("truncate should not fail");
             return Err(Error::Io(err));
         }
@@ -349,25 +354,87 @@ impl<F: Fs> Store<F> {
     pub fn set(&mut self, key: Key, value: Value) -> Result<(), Error> {
         let record = Record::Set { key, value };
         let offset = self.append(&record)?;
-        if let Record::Set { key, value } = record {
-            let key_len = key.as_bytes().len();
-            let old = self.index.insert(
-                key.as_bytes(),
-                Entry {
-                    offset,
-                    value_len: u32::try_from(value.as_bytes().len())
-                        .expect("Value guarantees len fits u32"),
-                    key_len: entry_key_len(&key),
-                },
-            );
-            if let Some(old) = old {
-                self.dead += record_len(key_len, old.value_len);
+        self.indexed(&record, offset);
+        self.compact_if_due();
+        Ok(())
+    }
+
+    /// Applies every operation in `batch` with one append and one fsync,
+    /// all or nothing: after a crash, `open` finds the whole batch or none
+    /// of it (DESIGN.md, Batches). Operations apply in order, so a delete
+    /// sees the batch's own earlier sets. A delete of a key that isn't live
+    /// at that point writes nothing, as `delete` does, and a batch that
+    /// writes nothing is a no-op. Then compacts if due, as `set` does.
+    /// Failed writes are handled as in `set`.
+    pub fn write(&mut self, batch: Batch) -> Result<(), Error> {
+        let mut live: HashMap<&[u8], bool> = HashMap::new();
+        let mut body = Vec::new();
+        let mut written = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            let (Record::Set { key, .. } | Record::Delete { key }) = op else {
+                unreachable!("a Batch holds only sets and deletes");
+            };
+            let is_set = matches!(op, Record::Set { .. });
+            let was_live = live
+                .get(key.as_bytes())
+                .copied()
+                .unwrap_or_else(|| self.index.contains(key.as_bytes()));
+            if !is_set && !was_live {
+                continue;
             }
-        } else {
-            unreachable!();
+            live.insert(key.as_bytes(), is_set);
+            written.push((body.len() as u64, op));
+            encode(op, &mut body);
+        }
+        if written.is_empty() {
+            return Ok(());
+        }
+        let mut buffer = Vec::with_capacity(HEADER_LEN + 8 + body.len());
+        encode(
+            &Record::Batch {
+                body_len: body.len() as u64,
+            },
+            &mut buffer,
+        );
+        let header_len = buffer.len() as u64;
+        buffer.extend_from_slice(&body);
+        let start = self.append_bytes(&buffer)?;
+        self.dead += header_len;
+        for (at, op) in written {
+            self.indexed(op, start + header_len + at);
         }
         self.compact_if_due();
         Ok(())
+    }
+
+    /// Updates the index and the dead bytes for a Set or Delete record now
+    /// durable at `offset`. A Delete's key must be live.
+    fn indexed(&mut self, record: &Record, offset: u64) {
+        match record {
+            Record::Set { key, value } => {
+                let old = self.index.insert(
+                    key.as_bytes(),
+                    Entry {
+                        offset,
+                        value_len: u32::try_from(value.as_bytes().len())
+                            .expect("Value guarantees len fits u32"),
+                        key_len: entry_key_len(key),
+                    },
+                );
+                if let Some(old) = old {
+                    self.dead += record_len(key.as_bytes().len(), old.value_len);
+                }
+            }
+            Record::Delete { key } => {
+                let key_len = key.as_bytes().len();
+                let old = self
+                    .index
+                    .remove(key.as_bytes())
+                    .expect("deleted keys are live");
+                self.dead += record_len(key_len, old.value_len) + (HEADER_LEN + key_len) as u64;
+            }
+            Record::Batch { .. } => unreachable!("not an index operation"),
+        }
     }
 
     /// Returns the value for `key`, or `None` if it isn't live.
@@ -452,16 +519,7 @@ impl<F: Fs> Store<F> {
         if self.index.contains(key.as_bytes()) {
             let record = Record::Delete { key };
             let offset = self.append(&record)?;
-            if let Record::Delete { key } = record {
-                let key_len = key.as_bytes().len();
-                let old = self
-                    .index
-                    .remove(key.as_bytes())
-                    .expect("checked live above");
-                self.dead += record_len(key_len, old.value_len) + (self.end - offset);
-            } else {
-                unreachable!();
-            }
+            self.indexed(&record, offset);
             self.compact_if_due();
         };
         Ok(())
@@ -622,60 +680,120 @@ fn read_hint(file: &impl LogFile, log_len: u64) -> Result<(Index, u64), hint::In
 }
 
 /// Applies the records from `start` to `len` to `index`. Returns where the
-/// valid records end: `len`, or the start of a torn or zero-filled tail.
+/// valid records end: `len`, or the start of a torn or zero-filled tail. A
+/// batch is applied only once all of it has been read and checked; a torn
+/// one is a torn tail from its start, and an error inside one is reported
+/// at its start, so `repair` moves the whole batch.
 fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<u64, Error> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    let mut payload_buf = vec![];
-    let mut offset: u64 = start;
-    let mut buffer = BufReader::new(file.reader_at(start));
-
+    let mut reader = Reader {
+        inner: BufReader::new(file.reader_at(start)),
+        header_buf: [0u8; HEADER_LEN],
+        payload_buf: Vec::new(),
+    };
+    let mut batch = Vec::new();
+    let mut offset = start;
     while offset < len {
-        if len - offset < HEADER_LEN as u64 {
+        let Next::Op(record_len, op) = reader.next(offset, len)? else {
+            return Ok(offset);
+        };
+        let IndexOp::Batch { body_len } = op else {
+            apply(index, offset, op);
+            offset += record_len;
+            continue;
+        };
+        let body_start = offset + record_len;
+        if len - body_start < body_len {
             return Ok(offset);
         }
-        buffer.read_exact(&mut header_buf)?;
-        let header = match decode_header(&header_buf) {
+        let body_end = body_start + body_len;
+        let mut at = body_start;
+        while at < body_end {
+            let next = reader.next(at, len).map_err(|err| err.moved_to(offset))?;
+            let Next::Op(len_here, op) = next else {
+                return Ok(offset);
+            };
+            if matches!(op, IndexOp::Batch { .. }) || len_here > body_end - at {
+                return Err(Error::Corruption {
+                    offset,
+                    reason: CorruptionReason::BadBatch,
+                });
+            }
+            batch.push((at, op));
+            at += len_here;
+        }
+        for (at, op) in batch.drain(..) {
+            apply(index, at, op);
+        }
+        offset = body_end;
+    }
+    Ok(offset)
+}
+
+fn apply(index: &mut Index, offset: u64, op: IndexOp) {
+    match op {
+        IndexOp::Set { key, value_len } => {
+            let key_len = entry_key_len(&key);
+            index.insert(
+                key.as_bytes(),
+                Entry {
+                    offset,
+                    value_len,
+                    key_len,
+                },
+            );
+        }
+        IndexOp::Delete { key } => {
+            index.remove(key.as_bytes());
+        }
+        IndexOp::Batch { .. } => unreachable!("scan handles batches"),
+    }
+}
+
+/// Reads records one after another for `scan`.
+struct Reader<R> {
+    inner: BufReader<R>,
+    header_buf: [u8; HEADER_LEN],
+    payload_buf: Vec<u8>,
+}
+
+enum Next {
+    /// A valid record and its length.
+    Op(u64, IndexOp),
+    /// The log from here to `len` is a torn or zero-filled tail.
+    Torn,
+}
+
+impl<R: Read> Reader<R> {
+    /// Reads the record at `offset`, which must be where the reader is.
+    fn next(&mut self, offset: u64, len: u64) -> Result<Next, Error> {
+        if len - offset < HEADER_LEN as u64 {
+            return Ok(Next::Torn);
+        }
+        self.inner.read_exact(&mut self.header_buf)?;
+        let header = match decode_header(&self.header_buf) {
             Ok(header) => header,
             Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum))
-                if all_zero(&header_buf) && rest_is_zero(&mut buffer)? =>
+                if all_zero(&self.header_buf) && rest_is_zero(&mut self.inner)? =>
             {
-                return Ok(offset);
+                return Ok(Next::Torn);
             }
             Err(err) => return Err(err.at(offset)),
         };
         if len - offset < header.record_len() {
-            return Ok(offset);
+            return Ok(Next::Torn);
         }
-        payload_buf.resize(header.payload_len(), 0u8);
-        buffer.read_exact(&mut payload_buf)?;
-        let op = match decode_index_op(header, &payload_buf) {
-            Ok(op) => op,
+        self.payload_buf.resize(header.payload_len(), 0u8);
+        self.inner.read_exact(&mut self.payload_buf)?;
+        match decode_index_op(header, &self.payload_buf) {
+            Ok(op) => Ok(Next::Op(header.record_len(), op)),
             Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
-                if all_zero(&payload_buf) && rest_is_zero(&mut buffer)? =>
+                if all_zero(&self.payload_buf) && rest_is_zero(&mut self.inner)? =>
             {
-                return Ok(offset);
+                Ok(Next::Torn)
             }
-            Err(err) => return Err(err.at(offset)),
-        };
-        match op {
-            IndexOp::Set { key, value_len } => {
-                let key_len = entry_key_len(&key);
-                index.insert(
-                    key.as_bytes(),
-                    Entry {
-                        offset,
-                        value_len,
-                        key_len,
-                    },
-                );
-            }
-            IndexOp::Delete { key } => {
-                index.remove(key.as_bytes());
-            }
+            Err(err) => Err(err.at(offset)),
         }
-        offset += header.record_len();
     }
-    Ok(offset)
 }
 
 fn entry_key_len(key: &Key) -> u16 {
@@ -1501,6 +1619,194 @@ mod tests {
                 reason: CorruptionReason::IndexMismatch
             })
         ));
+    }
+
+    // batches
+
+    fn batch(ops: &[(&[u8], Option<&[u8]>)]) -> Batch {
+        let mut batch = Batch::new();
+        for (k, v) in ops {
+            match v {
+                Some(v) => batch.set(key(k), value(v)),
+                None => batch.delete(key(k)),
+            };
+        }
+        batch
+    }
+
+    fn delete_record(k: &[u8]) -> Record {
+        Record::Delete { key: key(k) }
+    }
+
+    #[test]
+    fn write_appends_one_batch_and_applies_it_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store
+            .write(batch(&[
+                (b"a", Some(b"1")),
+                (b"b", Some(b"2")),
+                (b"a", Some(b"hi")),
+                (b"b", None),
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[
+                Record::Batch { body_len: 68 },
+                set_record(b"a", b"1"),
+                set_record(b"b", b"2"),
+                set_record(b"a", b"hi"),
+                delete_record(b"b"),
+            ])
+        );
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+        assert_eq!(store.dead, 23 + 17 + 17 + 16);
+        drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+        assert_eq!(store.dead, 23 + 17 + 17 + 16);
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn a_batch_deletes_only_keys_live_at_that_point_in_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.write(batch(&[(b"a", None), (b"b", None)])).unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            b"",
+            "nothing to delete, nothing written"
+        );
+
+        store.write(Batch::new()).unwrap();
+        assert_eq!(log_bytes(tmp.path()), b"");
+
+        store
+            .write(batch(&[(b"a", Some(b"1")), (b"a", None), (b"a", None)]))
+            .unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[
+                Record::Batch { body_len: 33 },
+                set_record(b"a", b"1"),
+                delete_record(b"a"),
+            ])
+        );
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+    }
+
+    /// b=2, then a batch setting a=1 and deleting b.
+    fn log_with_a_batch() -> (Vec<u8>, usize) {
+        let before = encoded(&[set_record(b"b", b"2")]);
+        let mut log = before.clone();
+        log.extend(encoded(&[
+            Record::Batch { body_len: 33 },
+            set_record(b"a", b"1"),
+            delete_record(b"b"),
+        ]));
+        (log, before.len())
+    }
+
+    #[test]
+    fn a_batch_cut_anywhere_is_dropped_whole() {
+        let (log, before) = log_with_a_batch();
+        for cut in before..log.len() {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(log_path(tmp.path()), &log[..cut]).unwrap();
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(store.get(&key(b"a")).unwrap(), None, "cut at {cut}");
+            assert_eq!(
+                store.get(&key(b"b")).unwrap(),
+                Some(value(b"2")),
+                "cut at {cut}"
+            );
+            assert_eq!(log_bytes(tmp.path()).len(), before, "cut at {cut}");
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(log_path(tmp.path()), &log).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"1")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_batch_whose_last_record_landed_as_zeros_is_dropped_whole() {
+        let (mut log, before) = log_with_a_batch();
+        let len = log.len();
+        log[len - 16..].fill(0);
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(log_path(tmp.path()), &log).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(log_bytes(tmp.path()).len(), before);
+    }
+
+    #[test]
+    fn corruption_inside_a_batch_is_reported_and_repaired_at_the_batch() {
+        let (mut log, before) = log_with_a_batch();
+        log[before + 23 + 16] ^= 0x01;
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(log_path(tmp.path()), &log).unwrap();
+        assert!(matches!(
+            Store::open(tmp.path()),
+            Err(Error::Corruption {
+                offset: 17,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+
+        let repaired = Store::repair(tmp.path()).unwrap().unwrap();
+        assert_eq!((repaired.offset, repaired.dropped), (17, 56));
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), None);
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+    }
+
+    #[test]
+    fn a_batch_inside_a_batch_or_a_record_past_its_end_is_corrupt() {
+        let nested = encoded(&[
+            Record::Batch { body_len: 40 },
+            Record::Batch { body_len: 17 },
+            set_record(b"a", b"1"),
+        ]);
+        let short = encoded(&[Record::Batch { body_len: 10 }, set_record(b"a", b"1")]);
+        for log in [nested, short] {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::write(log_path(tmp.path()), &log).unwrap();
+            assert!(matches!(
+                Store::open(tmp.path()),
+                Err(Error::Corruption {
+                    offset: 0,
+                    reason: CorruptionReason::BadBatch
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn compaction_after_a_batch_keeps_only_the_live_sets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store
+            .write(batch(&[
+                (b"a", Some(b"1")),
+                (b"b", Some(b"2")),
+                (b"a", None),
+            ]))
+            .unwrap();
+        store.compact().unwrap();
+        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+        assert_eq!(store.dead, 0);
+        drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        store.verify().unwrap();
     }
 
     // hint file
