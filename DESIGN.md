@@ -5,7 +5,7 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 ## Scope (v1)
 
 - API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `write(batch)`, `compact()`, `verify()`.
-- `open` takes a directory. It holds the log's segments (`tally.<base>.log`), a hint for each segment a compaction wrote (`tally.<base>.hint`), `tally.lock`, and `tally.log`, which holds only a marker that keeps earlier versions out (see Segments).
+- `open` takes a directory. It holds the log's segments (`tally.<base>.log`), a hint for each segment a compaction wrote or `open` read in full (`tally.<base>.hint`), `tally.lock`, and `tally.log`, which holds only a marker that keeps earlier versions out (see Segments).
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
 - One process, one thread. `open` takes an exclusive lock (`flock`) on `tally.lock`, a separate file because compaction removes segments and a lock on one of them would not outlive it. A second `open` fails with `Locked` until the first `Store` is dropped or its process exits.
@@ -126,7 +126,7 @@ The move is one way.
 
 ## Recovery (startup)
 
-`open` reads every segment in log order into one index. For each: if its hint is usable (see Hint file), its entries go into the index and `pos` starts where the hint ends; otherwise `pos` starts at the segment's base. `len` is the segment's end. Loop:
+`open` reads every segment in log order into one index. For each: if its hint is usable (see Hint file), the records it describes are applied to the index in order and `pos` starts where the hint ends; otherwise `pos` starts at the segment's base. `len` is the segment's end. Loop:
 
 1. `pos == len`: clean end, stop.
 2. Fewer than 15 bytes remain, or fewer than the header length byte 4 names (15 or 19): torn header. Truncate at `pos`.
@@ -188,28 +188,41 @@ What cleaning only some segments buys is shorter pauses. Loading 10M keys of 100
 
 ### Hint file
 
-Each segment compaction writes gets a hint, `tally.<base>.hint`, that lets `open` add its entries to the index without reading values. Format (`src/hint.rs`), little-endian:
+A hint, `tally.<base>.hint`, describes the records at the start of a segment, so `open` can apply them to the index without reading values. Compaction writes one for each segment it writes, and `open` for each sealed segment it reads (see Hints written by open). Format (`src/hint.rs`), little-endian:
 
 ```text
 magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc64 u64
 entry: type u8 | key_len u16 | value_len u32 | key
 ```
 
-- Version 2. `type` is the record's type byte, so an entry gives its record's header length; today every entry is a Set in the new format (`0x11`), and any other type rejects the hint. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
+- Version 2. An entry is its record's header without the two checksums (bytes 4 to 11), then the key: Set, Delete and Batch records each have one, in either record format, and an entry must pass the same type, length and validity rules as a header. `type` gives the header's length. A Batch entry has no key; the records of its body follow it as their own entries. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
 - A version 1 hint, from before 64-bit checksums, is rejected like any other bad hint: removed, and its segment read in full. That costs one slow `open` after the upgrade and loses nothing; the next compaction writes version 2.
 
-- Offsets are not stored. A segment compaction wrote starts with exactly the copied records end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after the compaction, and the Delete records step 5 appended) are scanned.
-- The count and log length trail the entries because files are only written at the end and neither is known until compaction finishes. `open` reads the trailer first, with one positioned read, to size the index for `count` keys, never more than the log could hold (`log_len / 17`, the shortest record), since the count is unchecked until every entry is read.
-- The checksum covers every byte before it. Entries go into the index as they are read, into the index every segment shares. If anything fails, what this hint added can't be told apart from what earlier segments did, so the hint is removed and the whole index is built again without it.
-- `open` reads the hint on one thread, checking every entry's lengths, and gathers checked entries into 16 MiB windows cut into chunks of 8,192 entries, recording where each chunk starts in the log. Each window's chunks are then hashed and inserted by up to 8 threads (the calling thread is one), into the sharded index (see Index), while I/O stays on the calling thread. Hints under 100,000 entries are read on one thread. Splitting needs no change to the format, because the walk that checks lengths also finds where entries start; the cost of not storing chunk offsets is the one sequential pass, which was already there.
+- Offsets are not stored. A hint has an entry for every record from the segment's start, end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after a compaction, and the Delete records its step 5 appended) are scanned.
+- `count` is the number of Set entries, at most the keys the hint adds. `open` reads every trailer first, with one positioned read each, and sizes the index for the largest count, never more than the log could hold (its length over 17, the shortest record), since the count is unchecked until every entry is read. Not the sum: a key overwritten in every segment would be counted once per segment. On the store below that sum was about 20M for 10M live keys, and sizing for it took the peak from 854 MB to 1.14 GB; past the largest hint, the map grows a shard at a time.
+- The count and log length trail the entries because files are only written at the end, and neither is known until the hint is done.
+- The checksum covers every byte before it. It is computed under the read buffer, a buffer at a time: fed an entry at a time, CRC-64 took most of the time to read a hint, and moving it took `open` of a compacted 10M-key store from 0.70 to 0.40 s. Entries go into the index as they are read, into the index every segment shares. If anything fails, what this hint changed can't be told apart from what earlier segments did, so the hint is removed and the whole index is built again without it.
+- `open` reads the hint on one thread, checking every entry, and gathers them into windows of 2 MiB. Each window's Sets and Deletes are applied in order with `apply_in_order` (see Index) by up to 8 threads (the calling thread is one), while I/O stays on the calling thread. Hints with fewer than 100,000 Set entries are applied on one thread. Windows were 16 MiB, but their lists of changes, 32 MB each, stayed allocated after use and took the peak from 586 to 913 MB; 2 MiB windows peak at 570 MB in the same time.
 
-On `open`, a hint is used only if its magic, version and checksum hold, every key and value length is in range, the entries add up to `count` distinct keys and exactly `log_len` bytes, and its segment is at least `log_len` long. A hint whose segment is gone is removed. Records after `log_len` are then read as usual. A hint that fails any check is logged, removed and the directory fsynced, and its segment is read in full. The removal must be durable: a hint rejected because the segment is shorter than it says would look valid again once new writes grew the segment past `log_len`.
+On `open`, a hint is used only if its magic, version and checksum hold, every entry passes the record rules, the entries add up to `count` Set entries and exactly `log_len` bytes, and its segment is at least `log_len` long. A hint whose segment is gone is removed. Records after `log_len` are then read as usual. A hint that fails any check is logged, removed and the directory fsynced, and its segment is read in full. The removal must be durable: a hint rejected because the segment is shorter than it says would look valid again once new writes grew the segment past `log_len`.
 
 `repair` removes the segment's hint before it truncates the segment, in the same directory fsync that makes the side file durable.
 
-The cost is that `open` no longer checks the checksums of records the hint covers. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan. This is the Bitcask trade.
+The cost is that `open` no longer checks the checksums of records the hint covers, which, with the hints `open` writes, is every sealed segment after its first `open`. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan, and `verify` checks every record on demand. This is the Bitcask trade.
 
-At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB: the extra 29 MB is the window and per-thread buffers. The hint was 22 bytes per key here (220 MB); version 2's type byte makes it 23. With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB. The hint was 22 bytes per key here (220 MB); version 2's type byte makes it 23. With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+
+### Hints written by open
+
+Compaction's hints cover only what it copied, so a store that compacts a few segments at a time read most of its log in full on every `open`: at 10M keys of 100 bytes after 20M overwrites, 1,955 of the 2,424 MB had no hint, in three segments never compacted and in the writes that compaction segments took after their hints. `open` now writes the hints such segments lack.
+
+- A sealed segment (every one but the newest) that `open` reads past its hint, or that has none, gets a hint for all of it: the scan hands every record it reads, Batch records too, to a hint writer. A sealed segment never changes, so the hint stays valid until compaction removes both. The newest segment still grows, and gets none.
+- A hint that covers only the start of a segment is extended: reading it leaves the checksum's state where its entries end, so the new entries follow the old ones with no rewrite. Its trailer is cut off first and the new entries appended, so the files stay append-only; a write over the old trailer would append anyway on Linux, where `pwrite` ignores the offset of a file opened with `O_APPEND`.
+- Neither the hint nor the directory is fsynced. Every state a crash can leave is either a hint that covers less (the old one, or none) or one whose trailer or checksum fails, which the next `open` removes, with a directory fsync, before reading the segment in full. The power-cut tests cut every write of these hints, in both cases: they check 133,333 disk states, against 13,318 before.
+- Hints are best effort. A hint that can't be created or written is logged and left, and `open` goes on: the next `open` reads that segment again.
+- Entries are applied in order, as the records would be, so a hint can repeat a key and hold Deletes. Hints used to be loaded with `Index::fill`, which is faster only for keys no two threads share and rejected a hint that repeated a key; `apply_in_order`, already used by the parallel scan, is as fast here, and `fill` is gone.
+
+On the store above, `open` went from 1.48 to 1.77 s at 910 MB on `main` to 0.87 to 0.89 s at 854 MB, after one `open` of 2.42 s that wrote 460 MB of hints. Most of what is left is the newest segment, read past its hint every time. Compacted into one segment, the same store opens in 0.40 s, from 0.70 s, at 570 MB, from 586 MB.
 
 ### When it runs
 
@@ -245,9 +258,9 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 - Two keys with the same 128-bit hash would share one entry: a `set` of the second would silently replace the first. The chance is about n²/2¹²⁹, 2 × 10⁻²⁴ at 40M live keys, and no one can aim for it without the random key. `get` checks the key stored in the record, so a collision shows up as `KeyMismatch`, never as another key's value; a test with a deliberately weak hash (a key's length) checks that.
 - `key_len` lets `open` count dead bytes without the keys.
 - The map is 64 maps (shards), chosen by the top 6 bits of the hash. Each shard's map places entries by the low bits, so the shard must come from bits it doesn't use: taking the low bits would give every entry in a shard the same low 6 bits and leave 63 of every 64 home slots empty. No test can see that, as any consistent choice is correct; it would only be slow.
-- Shards let `open` insert from several threads at once (`Index::fill`): each thread holds up to 256 entries per shard and then takes that shard's lock, so locks are taken once per 256 entries. Which thread's entry wins for a key two threads both insert is not defined, so `fill` is only for keys no two jobs share, as a hint's are (a hint that repeats a key is rejected by its count).
+- Shards let `open` apply changes from several threads at once (`Index::apply_in_order`): threads hash the keys of a window of changes, then each applies, in order, the changes that fall in the shards it owns. Every change to a key falls in one shard, so a key's changes still apply in the order they were read.
 - Growing the map now moves one shard at a time, so the old and new tables that coexist during a resize are 1/64 of the index. A full scan of 10M records without a hint peaked at 841 to 931 MB, against 0.98 to 1.11 GB with one map, in the same time. A missing-key `get` went from 12.1 to 13.1 ns.
-- `open` pre-sizes from the hint's count, a 64th per shard. Without a hint it grows the map as it reads.
+- `open` pre-sizes from the largest hint's count, a 64th per shard (see Hint file). Past that, or without a hint, it grows the map as it reads.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction, and counts as dead bytes.
 
 ### Verify
@@ -325,5 +338,6 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 - Group commit across concurrent writers (sharing one fsync between callers, as `write` does within a batch), once there are any.
 - Background compaction, once the TCP server brings concurrency.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
-- A parallel full scan, for logs without a hint. Records must apply in log order, so threads would have to resolve each key to its last record by offset, with deletes in the mix; compaction writes a hint, so this only matters before the first one.
+- A parallel full scan, for logs without a hint. Records must apply in log order, so threads would have to resolve each key to its last record by offset, with deletes in the mix; compaction and `open` write hints, so this only matters for the newest segment and the first `open` of a segment.
+- A hint for the newest segment, extended on each `open`: it only grows, and `open` fsyncs it before reading, so a prefix stays valid. On the 10M-key store it is most of what `open` still reads, up to 256 MiB.
 - A cache of open segment files, for logs of more than a few hundred segments (see Segments).

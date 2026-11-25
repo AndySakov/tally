@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 13,318 possible disk states.
+cut before every disk operation of a workload, across 133,333 possible disk states.
 
 ## Status
 
@@ -12,7 +12,8 @@ v1 is done. tally is an embedded library for one process and one thread:
 - writes of one record, or of a batch that applies all or nothing, each with one fsync;
 - recovery from torn tails on `open`, `repair` for any other damage, and `verify` to check every record;
 - compaction that runs on its own and cleans only the segments with the most dead bytes;
-- hint files, so `open` reads a compacted segment's keys without its values.
+- hint files, written by compaction and by `open` itself, so `open` reads each sealed segment's keys without its
+  values.
 
 ## Use
 
@@ -80,7 +81,8 @@ shares one fsync across its records.
 
 At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random with default
 options: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB segments (9.01 s
-when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 1.8 s.
+when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s once one `open` has written
+hints for the segments compaction didn't (1.8 s without them).
 
 ## How it's tested
 
