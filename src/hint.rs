@@ -3,9 +3,12 @@
 //! reading values.
 //!
 //! ```text
-//! magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc32c u32
-//! entry: key_len u16 | value_len u32 | key
+//! magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc64 u64
+//! entry: type u8 | key_len u16 | value_len u32 | key
 //! ```
+//!
+//! `type` is the record's type byte, which gives its header's length. Every
+//! entry is a Set in the 64-bit format.
 //!
 //! Little-endian. A compacted log holds exactly the live records end to end,
 //! so offsets aren't stored: each is the sum of the record lengths before
@@ -15,18 +18,20 @@
 
 use std::io::{self, BufReader, Read};
 
+use crc_fast::{CrcAlgorithm, Digest};
+
 use crate::fs::LogFile;
-use crate::record::HEADER_LEN;
+use crate::record::{Format, Kind};
 use crate::{Key, MAX_VALUE_LEN};
 
 pub(crate) const HINT_FILE_NAME: &str = "tally.hint";
 pub(crate) const COMPACT_HINT_FILE_NAME: &str = "tally.hint.compact";
 
 const MAGIC: &[u8; 4] = b"TLYH";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 const PREFIX_LEN: u64 = 5;
-const TRAILER_LEN: u64 = 20;
-const ENTRY_HEADER_LEN: usize = 6;
+const TRAILER_LEN: u64 = 24;
+const ENTRY_HEADER_LEN: usize = 7;
 const FLUSH_AT: usize = 1 << 20;
 
 /// What a hint file covers, from its trailer.
@@ -52,7 +57,7 @@ pub(crate) struct Writer<'a, F: LogFile> {
     file: &'a F,
     buffer: Vec<u8>,
     written: u64,
-    checksum: u32,
+    checksum: Digest,
     count: u64,
 }
 
@@ -65,13 +70,14 @@ impl<'a, F: LogFile> Writer<'a, F> {
             file,
             buffer,
             written: 0,
-            checksum: 0,
+            checksum: Digest::new(CrcAlgorithm::Crc64Nvme),
             count: 0,
         }
     }
 
     pub(crate) fn push(&mut self, key: &[u8], value_len: u32) -> io::Result<()> {
         let key_len = u16::try_from(key.len()).expect("Key guarantees len fits u16");
+        self.buffer.push(SET);
         self.buffer.extend_from_slice(&key_len.to_le_bytes());
         self.buffer.extend_from_slice(&value_len.to_le_bytes());
         self.buffer.extend_from_slice(key);
@@ -86,15 +92,15 @@ impl<'a, F: LogFile> Writer<'a, F> {
     pub(crate) fn finish(mut self, log_len: u64) -> io::Result<()> {
         self.buffer.extend_from_slice(&self.count.to_le_bytes());
         self.buffer.extend_from_slice(&log_len.to_le_bytes());
-        self.checksum = crc32c::crc32c_append(self.checksum, &self.buffer);
-        let checksum = self.checksum;
+        self.checksum.update(&self.buffer);
+        let checksum = self.checksum.finalize();
         self.buffer.extend_from_slice(&checksum.to_le_bytes());
         self.file.write_all_at(&self.buffer, self.written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
         self.file.write_all_at(&self.buffer, self.written)?;
-        self.checksum = crc32c::crc32c_append(self.checksum, &self.buffer);
+        self.checksum.update(&self.buffer);
         self.written += self.buffer.len() as u64;
         self.buffer.clear();
         Ok(())
@@ -145,18 +151,19 @@ impl Window {
         &self.chunks
     }
 
-    /// `(key, offset, value_len)` for each entry in `chunk`.
-    pub(crate) fn entries(&self, chunk: &Chunk) -> impl Iterator<Item = (&[u8], u64, u32)> {
+    /// `(key, offset, value_len, format)` for each entry in `chunk`.
+    pub(crate) fn entries(&self, chunk: &Chunk) -> impl Iterator<Item = (&[u8], u64, u32, Format)> {
         let mut at = chunk.start;
         let mut offset = chunk.offset;
         (0..chunk.count).map(move |_| {
             let bytes = &self.bytes[at..];
-            let key_len = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
-            let value_len = u32::from_le_bytes(bytes[2..6].try_into().unwrap());
+            let format = Format::of(bytes[0]);
+            let key_len = usize::from(u16::from_le_bytes([bytes[1], bytes[2]]));
+            let value_len = u32::from_le_bytes(bytes[3..7].try_into().unwrap());
             let key = &bytes[ENTRY_HEADER_LEN..ENTRY_HEADER_LEN + key_len];
-            let entry = (key, offset, value_len);
+            let entry = (key, offset, value_len, format);
             at += ENTRY_HEADER_LEN + key_len;
-            offset += (HEADER_LEN + key_len) as u64 + u64::from(value_len);
+            offset += record_len(format, key_len, value_len);
             entry
         })
     }
@@ -165,6 +172,15 @@ impl Window {
         self.bytes.clear();
         self.chunks.clear();
     }
+}
+
+/// The type byte of every entry: a Set in the 64-bit format.
+const SET: u8 = 0x11;
+
+const _: () = assert!(SET == (Format::Crc64 as u8) << 4 | Kind::Set as u8);
+
+fn record_len(format: Format, key_len: usize, value_len: u32) -> u64 {
+    (format.header_len() + key_len) as u64 + u64::from(value_len)
 }
 
 /// A read buffer of `most` bytes, or of `len` if that is less: a 1 MiB
@@ -185,7 +201,7 @@ pub(crate) fn read_entries(
     let size = file.size()?;
     let mut reader = Checksummed {
         inner: BufReader::with_capacity(buffer_for(size, FLUSH_AT), file.reader_at(0)),
-        checksum: 0,
+        checksum: Digest::new(CrcAlgorithm::Crc64Nvme),
     };
     let mut prefix = [0u8; PREFIX_LEN as usize];
     reader.read_exact(&mut prefix)?;
@@ -205,8 +221,11 @@ pub(crate) fn read_entries(
             return Err(Invalid("torn entry"));
         }
         reader.read_exact(&mut header)?;
-        let key_len = u16::from_le_bytes([header[0], header[1]]);
-        let value_len = u32::from_le_bytes(header[2..].try_into().unwrap());
+        if header[0] != SET {
+            return Err(Invalid("bad entry type"));
+        }
+        let key_len = u16::from_le_bytes([header[1], header[2]]);
+        let value_len = u32::from_le_bytes(header[3..].try_into().unwrap());
         at += ENTRY_HEADER_LEN as u64;
         if entries_end - at < u64::from(key_len) {
             return Err(Invalid("torn entry"));
@@ -218,7 +237,7 @@ pub(crate) fn read_entries(
             return Err(Invalid("bad value length"));
         }
         Key::try_from(&key[..]).map_err(|_| Invalid("bad key length"))?;
-        let record_len = (HEADER_LEN + usize::from(key_len)) as u64 + u64::from(value_len);
+        let record_len = record_len(Format::Crc64, usize::from(key_len), value_len);
         if offset
             .checked_add(record_len)
             .is_none_or(|end| end > trailer.log_len)
@@ -248,10 +267,10 @@ pub(crate) fn read_entries(
 
     let mut rest = [0u8; 16];
     reader.read_exact(&mut rest)?;
-    let computed = reader.checksum;
-    let mut stored = [0u8; 4];
+    let computed = reader.checksum.finalize();
+    let mut stored = [0u8; 8];
     reader.inner.read_exact(&mut stored)?;
-    if u32::from_le_bytes(stored) != computed {
+    if u64::from_le_bytes(stored) != computed {
         return Err(Invalid("checksum mismatch"));
     }
     if count != trailer.count || offset != trailer.log_len {
@@ -262,13 +281,13 @@ pub(crate) fn read_entries(
 
 struct Checksummed<R> {
     inner: R,
-    checksum: u32,
+    checksum: Digest,
 }
 
 impl<R: Read> Read for Checksummed<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.checksum = crc32c::crc32c_append(self.checksum, &buf[..n]);
+        self.checksum.update(&buf[..n]);
         Ok(n)
     }
 }
@@ -318,7 +337,10 @@ mod tests {
                     .map(|chunk| {
                         window
                             .entries(chunk)
-                            .map(|(key, offset, value_len)| (key.to_vec(), offset, value_len))
+                            .map(|(key, offset, value_len, format)| {
+                                assert_eq!(format, Format::Crc64);
+                                (key.to_vec(), offset, value_len)
+                            })
                             .collect()
                     })
                     .collect(),
@@ -337,31 +359,62 @@ mod tests {
 
     #[test]
     fn the_bytes_of_a_two_entry_hint() {
-        let bytes = write(&[(b"a", 2), (b"bc", 1)], 18 + 18);
-        let mut expected = b"TLYH\x01".to_vec();
-        expected.extend_from_slice(&[1, 0, 2, 0, 0, 0, b'a']);
-        expected.extend_from_slice(&[2, 0, 1, 0, 0, 0, b'b', b'c']);
+        let bytes = write(&[(b"a", 2), (b"bc", 1)], 22 + 22);
+        let mut expected = b"TLYH\x02".to_vec();
+        expected.extend_from_slice(&[0x11, 1, 0, 2, 0, 0, 0, b'a']);
+        expected.extend_from_slice(&[0x11, 2, 0, 1, 0, 0, 0, b'b', b'c']);
         expected.extend_from_slice(&2u64.to_le_bytes());
-        expected.extend_from_slice(&36u64.to_le_bytes());
-        expected.extend_from_slice(&crc32c::crc32c(&expected).to_le_bytes());
+        expected.extend_from_slice(&44u64.to_le_bytes());
+        // CRC-64/NVME of the bytes above, computed in Python.
+        expected.extend_from_slice(&0x211b_e5c0_f2cf_45ab_u64.to_le_bytes());
         assert_eq!(bytes, expected);
     }
 
     #[test]
     fn entries_come_back_with_their_offsets() {
-        let bytes = write(&[(b"a", 2), (b"bc", 1)], 36);
+        let bytes = write(&[(b"a", 2), (b"bc", 1)], 44);
         assert_eq!(
             read(&bytes),
-            Ok(vec![(b"a".to_vec(), 0, 2), (b"bc".to_vec(), 18, 1)])
+            Ok(vec![(b"a".to_vec(), 0, 2), (b"bc".to_vec(), 22, 1)])
         );
     }
 
     #[test]
+    fn a_hint_from_before_64_bit_checksums_is_rejected() {
+        let mut bytes = b"TLYH\x01".to_vec();
+        bytes.extend_from_slice(&[1, 0, 2, 0, 0, 0, b'a']);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&18u64.to_le_bytes());
+        bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+        assert_eq!(read(&bytes), Err(Invalid("not a tally hint file")));
+    }
+
+    #[test]
+    fn an_entry_that_is_not_a_64_bit_set_is_rejected() {
+        for type_byte in [0x01, 0x12, 0x13, 0x00] {
+            let mut bytes = write(&[(b"a", 2)], 22);
+            bytes[5] = type_byte;
+            reseal(&mut bytes);
+            assert_eq!(
+                read(&bytes),
+                Err(Invalid("bad entry type")),
+                "type {type_byte:#x}"
+            );
+        }
+    }
+
+    fn reseal(bytes: &mut [u8]) {
+        let crc_at = bytes.len() - 8;
+        let crc = crc_fast::checksum(CrcAlgorithm::Crc64Nvme, &bytes[..crc_at]);
+        bytes[crc_at..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
     fn entries_are_cut_into_windows_and_chunks_in_log_order() {
-        // Entries of 7, 8, 7, 8 and 7 bytes; windows close at 15 bytes.
+        // Entries of 8, 9, 8, 9 and 8 bytes; windows close at 15 bytes.
         let bytes = write(
             &[(b"a", 2), (b"bc", 1), (b"d", 1), (b"ef", 3), (b"g", 1)],
-            18 + 18 + 17 + 20 + 17,
+            22 + 22 + 21 + 24 + 21,
         );
         let sizes = Sizes {
             window_bytes: 15,
@@ -371,9 +424,9 @@ mod tests {
         assert_eq!(
             windows(&bytes, sizes),
             Ok(vec![
-                vec![vec![e(b"a", 0, 2)], vec![e(b"bc", 18, 1)]],
-                vec![vec![e(b"d", 36, 1)], vec![e(b"ef", 53, 3)]],
-                vec![vec![e(b"g", 73, 1)]],
+                vec![vec![e(b"a", 0, 2)], vec![e(b"bc", 22, 1)]],
+                vec![vec![e(b"d", 44, 1)], vec![e(b"ef", 65, 3)]],
+                vec![vec![e(b"g", 89, 1)]],
             ])
         );
         assert_eq!(read_in(&bytes, sizes), read(&bytes));
@@ -386,7 +439,7 @@ mod tests {
 
     #[test]
     fn every_one_byte_change_is_rejected() {
-        let bytes = write(&[(b"a", 2), (b"bc", 1)], 36);
+        let bytes = write(&[(b"a", 2), (b"bc", 1)], 44);
         for i in 0..bytes.len() {
             let mut bad = bytes.clone();
             bad[i] ^= 0x01;
@@ -396,7 +449,7 @@ mod tests {
 
     #[test]
     fn every_truncation_is_rejected() {
-        let bytes = write(&[(b"a", 2), (b"bc", 1)], 36);
+        let bytes = write(&[(b"a", 2), (b"bc", 1)], 44);
         for len in 0..bytes.len() {
             assert!(read(&bytes[..len]).is_err(), "cut at {len} was accepted");
         }
@@ -405,23 +458,21 @@ mod tests {
     #[test]
     fn entries_must_add_up_to_the_log_length() {
         assert_eq!(
-            read(&write(&[(b"a", 2)], 19)),
+            read(&write(&[(b"a", 2)], 23)),
             Err(Invalid("entries don't match the trailer"))
         );
         assert_eq!(
-            read(&write(&[(b"a", 2)], 17)),
+            read(&write(&[(b"a", 2)], 21)),
             Err(Invalid("entries run past the log length"))
         );
     }
 
     #[test]
     fn a_count_that_disagrees_is_rejected() {
-        let mut bytes = write(&[(b"a", 2)], 18);
-        let at = bytes.len() - 20;
+        let mut bytes = write(&[(b"a", 2)], 22);
+        let at = bytes.len() - 24;
         bytes[at] = 2;
-        let crc_at = bytes.len() - 4;
-        let crc = crc32c::crc32c(&bytes[..crc_at]);
-        bytes[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        reseal(&mut bytes);
         assert_eq!(
             read(&bytes),
             Err(Invalid("entries don't match the trailer"))

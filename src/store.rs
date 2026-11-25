@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::TryLockError;
-use std::io::{self, BufReader, ErrorKind, Read};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -11,7 +11,8 @@ use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
 use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
-    HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
+    Format, HEADER_LEN, Header, IndexOp, Record, SHORTEST_HEADER_LEN, decode_header,
+    decode_index_op, decode_payload, encode, encode_set,
 };
 use crate::segment::{Segment, hint_name, log_name, parse_hint_name, parse_log_name};
 use crate::{Batch, CorruptionReason, DecodeError, Error, Key, Value};
@@ -28,8 +29,8 @@ const MARKER_FILE_NAME: &str = "tally.log.marker";
 /// What `tally.log` holds once the log is in segments: a record header of
 /// type 255 with valid checksums, which every earlier version reads as an
 /// unsupported record at offset 0 instead of starting an empty log.
-pub(crate) fn marker() -> [u8; HEADER_LEN] {
-    let mut bytes = [0u8; HEADER_LEN];
+pub(crate) fn marker() -> [u8; SHORTEST_HEADER_LEN] {
+    let mut bytes = [0u8; SHORTEST_HEADER_LEN];
     bytes[4] = 0xff;
     bytes[11..15].copy_from_slice(&crc32c::crc32c(&[]).to_le_bytes());
     let checksum = crc32c::crc32c(&bytes[4..]);
@@ -243,8 +244,7 @@ impl<F: Fs> Store<F> {
     fn count_dead(&mut self) {
         let mut live = vec![0u64; self.segments.len()];
         for entry in self.index.values() {
-            live[self.segment_of(entry.offset)] +=
-                record_len(usize::from(entry.key_len), entry.value_len);
+            live[self.segment_of(entry.offset)] += entry.record_len();
         }
         for (segment, live) in self.segments.iter_mut().zip(live) {
             segment.dead = segment.len - live;
@@ -379,21 +379,34 @@ impl<F: Fs> Store<F> {
             );
             let mut offset = input.base;
             while offset < input.end() {
-                reader.read_exact(&mut header_buf)?;
-                let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+                let header_bytes = read_header(&mut reader, &mut header_buf, input.end() - offset)?
+                    .ok_or(Error::Corruption {
+                        offset,
+                        reason: CorruptionReason::CutShort,
+                    })?;
+                let header = decode_header(header_bytes).map_err(|err| err.at(offset))?;
                 payload_buf.resize(header.payload_len(), 0);
                 reader.read_exact(&mut payload_buf)?;
                 let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
                 match op {
-                    IndexOp::Set { key, value_len } => {
+                    IndexOp::Set { key, value_len, .. } => {
                         if let Some(entry) = self.index.get_mut(key.as_bytes())
                             && entry.offset == offset
                         {
                             entry.offset = output.base + written + buffer.len() as u64;
+                            entry.format = Format::Crc64;
                             moved.push(offset);
                             hint.push(key.as_bytes(), value_len)?;
-                            buffer.extend_from_slice(&header_buf);
-                            buffer.extend_from_slice(&payload_buf);
+                            match header.format() {
+                                Format::Crc64 => {
+                                    buffer.extend_from_slice(header_bytes);
+                                    buffer.extend_from_slice(&payload_buf);
+                                }
+                                Format::Crc32c => {
+                                    let (key, value) = payload_buf.split_at(key.as_bytes().len());
+                                    encode_set(key, value, &mut buffer);
+                                }
+                            }
                             if buffer.len() >= COMPACT_BUFFER {
                                 output.file.write_all_at(&buffer, written)?;
                                 written += buffer.len() as u64;
@@ -440,15 +453,17 @@ impl<F: Fs> Store<F> {
     fn restore_offsets(&mut self, moved: &[u64]) {
         for &offset in moved {
             let segment = &self.segments[self.segment_of(offset)];
-            let (_, record) = load_record(segment, offset)
+            let (header, record) = load_record(segment, offset)
                 .expect("rereading a key after a failed compaction; restart to rebuild the index");
             let Record::Set { key, .. } = record else {
                 unreachable!("only Set records are moved");
             };
-            self.index
+            let entry = self
+                .index
                 .get_mut(key.as_bytes())
-                .expect("a moved key is still live")
-                .offset = offset;
+                .expect("a moved key is still live");
+            entry.offset = offset;
+            entry.format = header.format();
         }
     }
 
@@ -600,14 +615,11 @@ impl<F: Fs> Store<F> {
                         value_len: u32::try_from(value.as_bytes().len())
                             .expect("Value guarantees len fits u32"),
                         key_len: entry_key_len(key),
+                        format: Format::Crc64,
                     },
                 );
                 if let Some(old) = old {
-                    died(
-                        self,
-                        old.offset,
-                        record_len(key.as_bytes().len(), old.value_len),
-                    );
+                    died(self, old.offset, old.record_len());
                 }
             }
             Record::Delete { key } => {
@@ -616,7 +628,7 @@ impl<F: Fs> Store<F> {
                     .index
                     .remove(key.as_bytes())
                     .expect("deleted keys are live");
-                died(self, old.offset, record_len(key_len, old.value_len));
+                died(self, old.offset, old.record_len());
                 died(self, offset, (HEADER_LEN + key_len) as u64);
             }
             Record::Batch { .. } => unreachable!("not an index operation"),
@@ -750,9 +762,39 @@ fn starts_tail(
     }
 }
 
-/// Length on disk of a Set record with these lengths.
-fn record_len(key_len: usize, value_len: u32) -> u64 {
-    (HEADER_LEN + key_len) as u64 + u64::from(value_len)
+/// The shortest record there can be: a Set of one-byte key and value in
+/// the old format.
+const SHORTEST_RECORD: u64 = SHORTEST_HEADER_LEN as u64 + 2;
+
+/// Reads a record's header into `buf` and returns its bytes: the shortest
+/// header, then the rest if its type byte names a longer one. `None` if
+/// that is more than the `remaining` bytes, which must be at least the
+/// shortest header.
+///
+/// Copies a header the buffer already holds instead: two short
+/// `read_exact`s took a scan of 100k records from 12.8 to 14.4 ms.
+fn read_header<'a, R: Read>(
+    reader: &mut BufReader<R>,
+    buf: &'a mut [u8; HEADER_LEN],
+    remaining: u64,
+) -> io::Result<Option<&'a [u8]>> {
+    let buffered = reader.buffer();
+    if buffered.len() >= HEADER_LEN {
+        let len = Format::of(buffered[4]).header_len();
+        if remaining < len as u64 {
+            return Ok(None);
+        }
+        buf[..len].copy_from_slice(&buffered[..len]);
+        reader.consume(len);
+        return Ok(Some(&buf[..len]));
+    }
+    reader.read_exact(&mut buf[..SHORTEST_HEADER_LEN])?;
+    let len = Format::of(buf[4]).header_len();
+    if remaining < len as u64 {
+        return Ok(None);
+    }
+    reader.read_exact(&mut buf[SHORTEST_HEADER_LEN..len])?;
+    Ok(Some(&buf[..len]))
 }
 
 /// How much `compact` buffers before each write.
@@ -788,7 +830,7 @@ fn copy_to_end(mut reader: impl Read, file: &impl LogFile) -> io::Result<()> {
 /// past the end, falls back to `load_record`, which reads the length the
 /// header gives and reports what is actually there.
 fn load_indexed(file: &impl LogFile, entry: &Entry) -> Result<Record, Error> {
-    let len = record_len(usize::from(entry.key_len), entry.value_len);
+    let len = entry.record_len();
     let mut buf = vec![0u8; usize::try_from(len).expect("a record fits in memory")];
     match file.read_exact_at(&mut buf, entry.offset) {
         Ok(()) => {}
@@ -797,20 +839,25 @@ fn load_indexed(file: &impl LogFile, entry: &Entry) -> Result<Record, Error> {
         }
         Err(err) => return Err(err.into()),
     }
-    let header_buf = buf[..HEADER_LEN].try_into().expect("buf holds a header");
-    let header = decode_header(header_buf).map_err(|err| err.at(entry.offset))?;
+    if Format::of(buf[4]) != entry.format {
+        return load_record(file, entry.offset).map(|(_, record)| record);
+    }
+    let header_len = entry.format.header_len();
+    let header = decode_header(&buf[..header_len]).map_err(|err| err.at(entry.offset))?;
     if header.record_len() != len {
         return load_record(file, entry.offset).map(|(_, record)| record);
     }
-    decode_payload(header, &buf[HEADER_LEN..]).map_err(|err| err.at(entry.offset))
+    decode_payload(header, &buf[header_len..]).map_err(|err| err.at(entry.offset))
 }
 
 fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Error> {
     let mut header_buf = [0u8; HEADER_LEN];
-    file.read_exact_at(&mut header_buf, offset)?;
-    let header = decode_header(&header_buf).map_err(|err| err.at(offset))?;
+    let mut reader = BufReader::with_capacity(HEADER_LEN, file.reader_at(offset));
+    let header_bytes = read_header(&mut reader, &mut header_buf, u64::MAX)?
+        .expect("no limit on the bytes it may read");
+    let header = decode_header(header_bytes).map_err(|err| err.at(offset))?;
     let mut payload_buf = vec![0u8; header.payload_len()];
-    let header_boundary = (HEADER_LEN as u64) + offset;
+    let header_boundary = header_bytes.len() as u64 + offset;
     file.read_exact_at(&mut payload_buf, header_boundary)?;
     let record = decode_payload(header, &payload_buf).map_err(|err| err.at(offset))?;
     Ok((header, record))
@@ -903,7 +950,7 @@ fn migrate<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<bool, Error> {
     if has(LOG_FILE_NAME) {
         let file = fs.open_existing(&legacy)?;
         let size = file.size()?;
-        if size <= HEADER_LEN as u64 {
+        if size <= SHORTEST_HEADER_LEN as u64 {
             // Shorter than any record: the marker, or a write of it that a
             // power cut tore or left as zeros.
             let mut bytes = vec![0u8; size as usize];
@@ -991,7 +1038,7 @@ fn try_load<F: Fs>(
     // The counts are unchecked until every entry is read: never reserve
     // more than the log could hold.
     let total: u64 = segments.iter().map(|s| s.len).sum();
-    let capacity = usize::try_from(count.min(total / record_len(1, 1))).unwrap_or(usize::MAX);
+    let capacity = usize::try_from(count.min(total / SHORTEST_RECORD)).unwrap_or(usize::MAX);
     let mut index = Index::with_capacity(capacity);
     let newest = segments.len() - 1;
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
@@ -1057,7 +1104,7 @@ fn read_hint<L: LogFile>(
     let mut replaced = 0;
     hint::read_entries(file, trailer, sizes, |window| {
         replaced += index.fill(threads, window.chunks(), base, |chunk, filler| {
-            for (key, offset, value_len) in window.entries(chunk) {
+            for (key, offset, value_len, format) in window.entries(chunk) {
                 let key_len = u16::try_from(key.len()).expect("read_entries checked it");
                 filler.push(
                     key,
@@ -1065,6 +1112,7 @@ fn read_hint<L: LogFile>(
                         offset: base + offset,
                         value_len,
                         key_len,
+                        format,
                     },
                 );
             }
@@ -1207,12 +1255,17 @@ struct Window {
 impl Window {
     fn push(&mut self, offset: u64, op: IndexOp) {
         let (key, entry) = match op {
-            IndexOp::Set { key, value_len } => {
+            IndexOp::Set {
+                key,
+                value_len,
+                format,
+            } => {
                 let key_len = entry_key_len(&key);
                 let entry = Entry {
                     offset,
                     value_len,
                     key_len,
+                    format,
                 };
                 (key, Some(entry))
             }
@@ -1240,7 +1293,11 @@ impl Window {
 
 fn apply(index: &mut Index, offset: u64, op: IndexOp) {
     match op {
-        IndexOp::Set { key, value_len } => {
+        IndexOp::Set {
+            key,
+            value_len,
+            format,
+        } => {
             let key_len = entry_key_len(&key);
             index.insert(
                 key.as_bytes(),
@@ -1248,6 +1305,7 @@ fn apply(index: &mut Index, offset: u64, op: IndexOp) {
                     offset,
                     value_len,
                     key_len,
+                    format,
                 },
             );
         }
@@ -1275,14 +1333,17 @@ enum Next {
 impl<R: Read> Reader<R> {
     /// Reads the record at `offset`, which must be where the reader is.
     fn next(&mut self, offset: u64, len: u64) -> Result<Next, Error> {
-        if len - offset < HEADER_LEN as u64 {
+        if len - offset < SHORTEST_HEADER_LEN as u64 {
             return Ok(Next::Torn);
         }
-        self.inner.read_exact(&mut self.header_buf)?;
-        let header = match decode_header(&self.header_buf) {
+        let Some(header_bytes) = read_header(&mut self.inner, &mut self.header_buf, len - offset)?
+        else {
+            return Ok(Next::Torn);
+        };
+        let header = match decode_header(header_bytes) {
             Ok(header) => header,
             Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum))
-                if all_zero(&self.header_buf) && rest_is_zero(&mut self.inner)? =>
+                if all_zero(header_bytes) && rest_is_zero(&mut self.inner)? =>
             {
                 return Ok(Next::Torn);
             }
@@ -1353,8 +1414,8 @@ mod tests {
 
     use super::*;
     use crate::mem_fs::MemFs;
-    use crate::record::tests::{DELETE_A, SET_A_HI};
-    use crate::record::{Record, encode};
+    use crate::record::tests::{DELETE_A, OLD_DELETE_A, OLD_SET_A_HI, SET_A_HI};
+    use crate::record::{Record, encode, encode_as};
     use crate::{CorruptionReason, Error, UnsupportedReason};
 
     fn key(bytes: &[u8]) -> Key {
@@ -1434,7 +1495,7 @@ mod tests {
     fn open_fails_on_a_corrupted_record_with_its_offset() {
         let tmp = tempfile::tempdir().unwrap();
         let mut bytes = [SET_A_HI.as_slice(), DELETE_A.as_slice()].concat();
-        bytes[16] ^= 0x01; // first record's value: "hi" -> "ii"
+        bytes[20] ^= 0x01; // first record's value: "hi" -> "ii"
         fs::write(log_path(tmp.path()), bytes).unwrap();
         assert!(matches!(
             Store::open(tmp.path()),
@@ -1475,11 +1536,74 @@ mod tests {
     }
 
     #[test]
+    fn open_truncates_a_header_torn_past_the_shortest_header() {
+        for cut in 15..19 {
+            let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..cut]));
+            let store = Store::open(tmp.path()).unwrap();
+            assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+            assert_eq!(log_bytes(tmp.path()), SET_A_HI, "cut at {cut}");
+        }
+    }
+
+    #[test]
     fn open_truncates_a_torn_payload() {
-        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..15]));
+        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..19]));
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+    }
+
+    #[test]
+    fn a_log_written_before_64_bit_checksums_recovers_reads_and_compacts() {
+        let mut old = Vec::new();
+        encode_as(Format::Crc32c, &set_record(b"a", b"hi"), &mut old);
+        encode_as(Format::Crc32c, &set_record(b"z", b"9"), &mut old);
+        assert_eq!(old[..18], OLD_SET_A_HI);
+        let tmp = store_with_log(&[&old[..], &OLD_DELETE_A[..14]].concat());
+        let mut store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        assert_eq!(log_bytes(tmp.path()), old, "the torn tail is cut");
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        store.set(key(b"b"), value(b"2")).unwrap();
+        drop(store);
+
+        let mut store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        let format = |store: &Store, k: &[u8]| store.index.get(k).unwrap().format;
+        assert_eq!(format(&store, b"a"), Format::Crc32c);
+        assert_eq!(format(&store, b"z"), Format::Crc32c);
+        assert_eq!(format(&store, b"b"), Format::Crc64);
+        assert_eq!(store.dead(), 0);
+        store.set(key(b"z"), value(b"0")).unwrap();
+        assert_eq!(store.dead(), 17, "the old Set of z");
+
+        store.compact().unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[
+                set_record(b"a", b"hi"),
+                set_record(b"b", b"2"),
+                set_record(b"z", b"0"),
+            ]),
+            "a is rewritten in the new format"
+        );
+        assert_eq!(format(&store, b"a"), Format::Crc64);
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(store.get(&key(b"z")).unwrap(), Some(value(b"0")));
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn damage_in_a_record_written_before_64_bit_checksums_is_still_caught() {
+        let mut bytes = [&OLD_SET_A_HI[..], &OLD_DELETE_A].concat();
+        bytes[16] ^= 0x01;
+        assert_open_fails_untouched(&bytes, 0, CorruptionReason::PayloadChecksum);
+        let mut bytes = [&OLD_SET_A_HI[..], &OLD_DELETE_A].concat();
+        bytes[18 + 7] ^= 0x01;
+        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
@@ -1547,8 +1671,8 @@ mod tests {
 
     #[test]
     fn open_fails_on_a_zero_filled_region_before_a_valid_record() {
-        let bytes = [SET_A_HI.as_slice(), &[0u8; 16], DELETE_A.as_slice()].concat();
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
+        let bytes = [SET_A_HI.as_slice(), &[0u8; 20], DELETE_A.as_slice()].concat();
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
@@ -1559,14 +1683,14 @@ mod tests {
             DELETE_A.as_slice(),
         ]
         .concat();
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::PayloadChecksum);
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::PayloadChecksum);
     }
 
     #[test]
     fn open_fails_on_a_garbage_tail_with_its_offset() {
         assert_open_fails_untouched(
-            &set_a_hi_then(&[0xab; 16]),
-            18,
+            &set_a_hi_then(&[0xab; 20]),
+            22,
             CorruptionReason::HeaderChecksum,
         );
     }
@@ -1574,42 +1698,42 @@ mod tests {
     #[test]
     fn open_fails_on_a_corrupted_header_checksum_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
-        bytes[18] ^= 0x01;
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
+        bytes[22] ^= 0x01;
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_length_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
-        bytes[18 + 7] ^= 0x01; // second record's value_len: 0 -> 1
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
+        bytes[22 + 7] ^= 0x01; // second record's value_len: 0 -> 1
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_key_with_its_offset() {
         let mut bytes = set_a_hi_then(&DELETE_A);
-        bytes[18 + 15] ^= 0x01; // second record's key: "a" -> "`"
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::PayloadChecksum);
+        bytes[22 + 19] ^= 0x01; // second record's key: "a" -> "`"
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::PayloadChecksum);
     }
 
     #[test]
     fn open_fails_on_an_unsupported_tail_record_and_leaves_it() {
         let mut bytes = set_a_hi_then(&DELETE_A);
-        bytes[18 + 4] = 9; // second record's type: unknown
-        fix_header_checksum(&mut bytes[18..18 + HEADER_LEN]);
+        bytes[22 + 4] = 0x19; // second record's type: unknown
+        fix_header_checksum(&mut bytes[22..22 + HEADER_LEN]);
         let tmp = store_with_log(&bytes);
         assert!(matches!(
             Store::open(tmp.path()),
             Err(Error::Unsupported {
-                offset: 18,
-                reason: UnsupportedReason::UnknownType(9)
+                offset: 22,
+                reason: UnsupportedReason::UnknownType(0x19)
             })
         ));
         assert_eq!(log_bytes(tmp.path()), bytes);
     }
 
     fn fix_header_checksum(header: &mut [u8]) {
-        let checksum = crc32c::crc32c(&header[4..HEADER_LEN]);
+        let checksum = crc32c::crc32c(&header[4..]);
         header[..4].copy_from_slice(&checksum.to_le_bytes());
     }
 
@@ -1620,7 +1744,7 @@ mod tests {
     }
 
     /// SET_A_HI, then a Delete of "a" with its key corrupted, then a Set of
-    /// "b": the bad record at 18 hides the valid one after it.
+    /// "b": the bad record at 22 hides the valid one after it.
     fn log_with_a_corrupt_middle() -> Vec<u8> {
         let mut delete = DELETE_A.to_vec();
         delete[HEADER_LEN] ^= 0x01;
@@ -1662,13 +1786,13 @@ mod tests {
         assert_eq!(
             Store::repair(tmp.path()).unwrap(),
             Some(Repaired {
-                offset: 18,
-                dropped: 33,
-                side_file: side_file(tmp.path(), 18),
+                offset: 22,
+                dropped: 41,
+                side_file: side_file(tmp.path(), 22),
             })
         );
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
-        assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+        assert_eq!(fs::read(side_file(tmp.path(), 22)).unwrap(), &bytes[22..]);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -1681,49 +1805,49 @@ mod tests {
         Store::repair(tmp.path()).unwrap();
         assert_eq!(Store::repair(tmp.path()).unwrap(), None);
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
-        assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+        assert_eq!(fs::read(side_file(tmp.path(), 22)).unwrap(), &bytes[22..]);
     }
 
     #[test]
     fn repair_rewrites_a_side_file_a_crashed_repair_left() {
         let bytes = log_with_a_corrupt_middle();
-        let zeroed_middle = [&bytes[18..20], &[0; 5], &bytes[25..30]].concat();
+        let zeroed_middle = [&bytes[22..24], &[0; 5], &bytes[29..34]].concat();
         for left in [
-            &bytes[18..18],
-            &bytes[18..25],
-            &bytes[18..],
-            &[0; 33],
+            &bytes[22..22],
+            &bytes[22..29],
+            &bytes[22..],
+            &[0; 41],
             &zeroed_middle,
         ] {
             let tmp = store_with_log(&bytes);
-            fs::write(side_file(tmp.path(), 18), left).unwrap();
+            fs::write(side_file(tmp.path(), 22), left).unwrap();
             assert_eq!(
                 Store::repair(tmp.path()).unwrap(),
                 Some(Repaired {
-                    offset: 18,
-                    dropped: 33,
-                    side_file: side_file(tmp.path(), 18),
+                    offset: 22,
+                    dropped: 41,
+                    side_file: side_file(tmp.path(), 22),
                 }),
                 "side file left with {} bytes",
                 left.len()
             );
             assert_eq!(log_bytes(tmp.path()), SET_A_HI);
-            assert_eq!(fs::read(side_file(tmp.path(), 18)).unwrap(), &bytes[18..]);
+            assert_eq!(fs::read(side_file(tmp.path(), 22)).unwrap(), &bytes[22..]);
         }
     }
 
     #[test]
     fn repair_refuses_to_overwrite_bytes_an_earlier_repair_saved() {
         let bytes = log_with_a_corrupt_middle();
-        let longer = [&bytes[18..], b"!"].concat();
-        let changed_first_byte = [&[bytes[18] ^ 1][..], &bytes[19..]].concat();
+        let longer = [&bytes[22..], b"!"].concat();
+        let changed_first_byte = [&[bytes[22] ^ 1][..], &bytes[23..]].concat();
         for earlier in [
             &b"saved by an earlier repair"[..],
             &longer,
             &changed_first_byte,
         ] {
             let tmp = store_with_log(&bytes);
-            let path = side_file(tmp.path(), 18);
+            let path = side_file(tmp.path(), 22);
             fs::write(&path, earlier).unwrap();
             assert!(matches!(
                 Store::repair(tmp.path()),
@@ -1737,12 +1861,12 @@ mod tests {
     #[test]
     fn repair_refuses_an_unsupported_record() {
         let mut bytes = set_a_hi_then(&DELETE_A);
-        bytes[18 + 4] = 9;
-        fix_header_checksum(&mut bytes[18..18 + HEADER_LEN]);
+        bytes[22 + 4] = 0x19;
+        fix_header_checksum(&mut bytes[22..22 + HEADER_LEN]);
         let tmp = store_with_log(&bytes);
         assert!(matches!(
             Store::repair(tmp.path()),
-            Err(Error::Unsupported { offset: 18, .. })
+            Err(Error::Unsupported { offset: 22, .. })
         ));
         assert_eq!(log_bytes(tmp.path()), bytes);
     }
@@ -1786,7 +1910,7 @@ mod tests {
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"a"), value(b"yo")).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"yo")));
-        assert_eq!(log_bytes(tmp.path()).len(), 36);
+        assert_eq!(log_bytes(tmp.path()).len(), 44);
     }
 
     #[test]
@@ -1829,7 +1953,7 @@ mod tests {
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.delete(key(b"a")).unwrap();
         store.delete(key(b"a")).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 34);
+        assert_eq!(log_bytes(tmp.path()).len(), 42);
     }
 
     // reopen
@@ -1880,11 +2004,11 @@ mod tests {
         let mut store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"hi")).unwrap();
-        write_log_at(tmp.path(), 18 + 17, b"x"); // b's value: "hi" -> "hx"
+        write_log_at(tmp.path(), 22 + 21, b"x"); // b's value: "hi" -> "hx"
         assert!(matches!(
             store.get(&key(b"b")),
             Err(Error::Corruption {
-                offset: 18,
+                offset: 22,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -1977,12 +2101,12 @@ mod tests {
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.delete(key(b"b")).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 85);
+        assert_eq!(log_bytes(tmp.path()).len(), 105);
 
         store.compact().unwrap();
 
         let expected = encoded(&[set_record(b"c", b"3"), set_record(b"a", b"hi")]);
-        assert_eq!(expected[17..], SET_A_HI);
+        assert_eq!(expected[21..], SET_A_HI);
         assert_eq!(log_bytes(tmp.path()), expected);
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -2048,8 +2172,8 @@ mod tests {
         assert_eq!(
             file_names(tmp.path()),
             [
-                "tally.00000000000000000018.hint",
-                "tally.00000000000000000018.log",
+                "tally.00000000000000000022.hint",
+                "tally.00000000000000000022.log",
                 "tally.lock",
                 "tally.log"
             ]
@@ -2068,7 +2192,7 @@ mod tests {
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
-                offset: 17,
+                offset: 21,
                 reason: CorruptionReason::KeyMismatch
             })
         ));
@@ -2117,12 +2241,12 @@ mod tests {
     fn verify_finds_damage_that_open_skipped_because_of_the_hint() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        write_log_at(tmp.path(), 16, b"X");
+        write_log_at(tmp.path(), 20, b"X");
         let store = Store::open(tmp.path()).unwrap();
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 35,
+                offset: 43,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -2137,15 +2261,15 @@ mod tests {
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 53,
+                offset: 65,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
-        store.index.get_mut(b"a").unwrap().offset = 53;
+        store.index.get_mut(b"a").unwrap().offset = 65;
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 35,
+                offset: 43,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
@@ -2160,12 +2284,12 @@ mod tests {
             .write(true)
             .open(log_path(tmp.path()))
             .unwrap()
-            .set_len(18)
+            .set_len(22)
             .unwrap();
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
-                offset: 53,
+                offset: 65,
                 reason: CorruptionReason::IndexMismatch
             })
         ));
@@ -2191,48 +2315,48 @@ mod tests {
     #[test]
     fn writes_go_to_a_new_segment_once_one_is_full() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(20)).unwrap();
+        let mut store = Store::open_with(tmp.path(), segmented(24)).unwrap();
         put(&mut store, b"a", b"hi");
         put(&mut store, b"b", b"2");
-        assert_eq!(segment_bases(tmp.path()), [0], "18 bytes is not full yet");
+        assert_eq!(segment_bases(tmp.path()), [0], "22 bytes is not full yet");
         put(&mut store, b"c", b"3");
-        assert_eq!(segment_bases(tmp.path()), [0, 35], "35 bytes is full");
+        assert_eq!(segment_bases(tmp.path()), [0, 43], "43 bytes is full");
         store
             .write(batch(&[(b"d", Some(b"4")), (b"a", None)]))
             .unwrap();
-        assert_eq!(segment_bases(tmp.path()), [0, 35]);
+        assert_eq!(segment_bases(tmp.path()), [0, 43]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(35))).unwrap(),
+            fs::read(tmp.path().join(log_name(43))).unwrap(),
             encoded(&[
                 set_record(b"c", b"3"),
-                Record::Batch { body_len: 33 },
+                Record::Batch { body_len: 41 },
                 set_record(b"d", b"4"),
                 delete_record(b"a"),
             ]),
-            "17 bytes is not full: the whole batch goes after c=3"
+            "21 bytes is not full: the whole batch goes after c=3"
         );
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
         assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
         drop(store);
 
-        let store = Store::open_with(tmp.path(), segmented(20)).unwrap();
+        let store = Store::open_with(tmp.path(), segmented(24)).unwrap();
         assert_eq!(read(&store, b"a"), None);
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
         assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
         assert_eq!(read(&store, b"d").as_deref(), Some(&b"4"[..]));
-        assert_eq!(store.dead(), 18 + 23 + 16);
+        assert_eq!(store.dead(), 22 + 27 + 20);
         store.verify().unwrap();
     }
 
-    /// One record per segment: a=1 at 0, b=2 at 17, a deleted at 34, c=3
-    /// at 50.
+    /// One record per segment: a=1 at 0, b=2 at 21, a deleted at 42, c=3
+    /// at 62.
     fn one_record_per_segment(dir: &Path) -> Store {
         let mut store = Store::open_with(dir, segmented(1)).unwrap();
         put(&mut store, b"a", b"1");
         put(&mut store, b"b", b"2");
         store.delete(key(b"a")).unwrap();
         put(&mut store, b"c", b"3");
-        assert_eq!(segment_bases(dir), [0, 17, 34, 50]);
+        assert_eq!(segment_bases(dir), [0, 21, 42, 62]);
         store
     }
 
@@ -2240,10 +2364,10 @@ mod tests {
     fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = one_record_per_segment(tmp.path());
-        store.clean(&[34]).unwrap();
-        assert_eq!(segment_bases(tmp.path()), [0, 17, 50, 67]);
+        store.clean(&[42]).unwrap();
+        assert_eq!(segment_bases(tmp.path()), [0, 21, 62, 83]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(67))).unwrap(),
+            fs::read(tmp.path().join(log_name(83))).unwrap(),
             encoded(&[delete_record(b"a")])
         );
         drop(store);
@@ -2258,14 +2382,14 @@ mod tests {
     fn cleaning_a_delete_with_every_older_segment_drops_it() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = one_record_per_segment(tmp.path());
-        store.clean(&[0, 17, 34]).unwrap();
-        assert_eq!(segment_bases(tmp.path()), [50, 67]);
+        store.clean(&[0, 21, 42]).unwrap();
+        assert_eq!(segment_bases(tmp.path()), [62, 83]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(67))).unwrap(),
+            fs::read(tmp.path().join(log_name(83))).unwrap(),
             encoded(&[set_record(b"b", b"2")]),
             "only b=2 is copied; the Delete has nothing left to hide"
         );
-        assert!(tmp.path().join(hint_name(67)).exists());
+        assert!(tmp.path().join(hint_name(83)).exists());
         drop(store);
 
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
@@ -2280,13 +2404,13 @@ mod tests {
     fn get_reads_each_key_from_its_own_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let store = one_record_per_segment(tmp.path());
-        assert_eq!(store.index.get(b"b").unwrap().offset, 17);
-        assert_eq!(store.index.get(b"c").unwrap().offset, 50);
-        write_log_at(tmp.path(), 15, b"X");
+        assert_eq!(store.index.get(b"b").unwrap().offset, 21);
+        assert_eq!(store.index.get(b"c").unwrap().offset, 62);
+        write_log_at(tmp.path(), 19, b"X");
         assert!(matches!(
             store.get(&key(b"c")),
             Err(Error::Corruption {
-                offset: 50,
+                offset: 62,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -2331,14 +2455,14 @@ mod tests {
         put(&mut store, b"a", b"1");
         put(&mut store, b"b", b"2");
         put(&mut store, b"b", b"3");
-        // b=3 at 34 made b=2 at 17 dead: 17 of 51, not due. Deleting b
-        // makes 17 + 17 + 16 of 67 dead. Cleaning the segment at 17 leaves
-        // 33 of 50, still due; then 34 leaves 16 of 33, not due. Neither has
+        // b=3 at 42 made b=2 at 21 dead: 21 of 63, not due. Deleting b
+        // makes 21 + 21 + 20 of 83 dead. Cleaning the segment at 21 leaves
+        // 41 of 62, still due; then 42 leaves 20 of 41, not due. Neither has
         // a live record, and a=1 at 0 is never read.
         store.delete(key(b"b")).unwrap();
-        assert_eq!(segment_bases(tmp.path()), [0, 51, 67]);
-        assert_eq!(fs::read(tmp.path().join(log_name(67))).unwrap(), b"");
-        assert_eq!(store.dead(), 16);
+        assert_eq!(segment_bases(tmp.path()), [0, 63, 83]);
+        assert_eq!(fs::read(tmp.path().join(log_name(83))).unwrap(), b"");
+        assert_eq!(store.dead(), 20);
         drop(store);
         let store = Store::open_with(tmp.path(), options).unwrap();
         assert_eq!(read(&store, b"a").as_deref(), Some(&b"1"[..]));
@@ -2349,18 +2473,18 @@ mod tests {
     fn a_sealed_segment_cut_short_is_corruption_that_repair_moves() {
         let tmp = tempfile::tempdir().unwrap();
         drop(one_record_per_segment(tmp.path()));
-        let second = tmp.path().join(log_name(17));
+        let second = tmp.path().join(log_name(21));
         fs::write(&second, &fs::read(&second).unwrap()[..10]).unwrap();
         assert!(matches!(
             Store::open_with(tmp.path(), segmented(1)),
             Err(Error::Corruption {
-                offset: 17,
+                offset: 21,
                 reason: CorruptionReason::CutShort
             })
         ));
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!((repaired.offset, repaired.dropped), (17, 10));
+        assert_eq!((repaired.offset, repaired.dropped), (21, 10));
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
         assert_eq!(read(&store, b"b"), None);
         assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
@@ -2402,8 +2526,8 @@ mod tests {
         // The hint's one entry for "a" now names "c": its lengths still add
         // up, so "c" goes into the index before the checksum fails.
         let mut hint = fs::read(hint_path(tmp.path())).unwrap();
-        assert_eq!(hint[11], b'a');
-        hint[11] = b'c';
+        assert_eq!(hint[12], b'a');
+        hint[12] = b'c';
         fs::write(hint_path(tmp.path()), hint).unwrap();
 
         let store = Store::open(tmp.path()).unwrap();
@@ -2419,17 +2543,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
         fs::rename(
-            tmp.path().join(log_name(35)),
+            tmp.path().join(log_name(43)),
             tmp.path().join(LOG_FILE_NAME),
         )
         .unwrap();
         fs::rename(
-            tmp.path().join(hint_name(35)),
+            tmp.path().join(hint_name(43)),
             tmp.path().join(HINT_FILE_NAME),
         )
         .unwrap();
         fs::write(tmp.path().join(COMPACT_FILE_NAME), b"left by a crash").unwrap();
-        write_log_at(tmp.path(), 16, b"X");
+        write_log_at(tmp.path(), 20, b"X");
 
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(
@@ -2460,11 +2584,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
         fs::rename(
-            tmp.path().join(log_name(35)),
+            tmp.path().join(log_name(43)),
             tmp.path().join(LOG_FILE_NAME),
         )
         .unwrap();
-        fs::remove_file(tmp.path().join(hint_name(35))).unwrap();
+        fs::remove_file(tmp.path().join(hint_name(43))).unwrap();
         fs::hard_link(tmp.path().join(LOG_FILE_NAME), tmp.path().join(log_name(0))).unwrap();
 
         let store = Store::open(tmp.path()).unwrap();
@@ -2491,7 +2615,7 @@ mod tests {
     fn a_torn_or_zeroed_marker_is_written_again() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        for torn in [&marker()[..7], &[], &[0; HEADER_LEN]] {
+        for torn in [&marker()[..7], &[], &[0; SHORTEST_HEADER_LEN]] {
             fs::write(tmp.path().join(LOG_FILE_NAME), torn).unwrap();
             let store = Store::open(tmp.path()).unwrap();
             assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
@@ -2541,7 +2665,7 @@ mod tests {
         assert_eq!(
             log_bytes(tmp.path()),
             encoded(&[
-                Record::Batch { body_len: 68 },
+                Record::Batch { body_len: 84 },
                 set_record(b"a", b"1"),
                 set_record(b"b", b"2"),
                 set_record(b"a", b"hi"),
@@ -2550,12 +2674,12 @@ mod tests {
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
-        assert_eq!(store.dead(), 23 + 17 + 17 + 16);
+        assert_eq!(store.dead(), 27 + 21 + 21 + 20);
         drop(store);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
-        assert_eq!(store.dead(), 23 + 17 + 17 + 16);
+        assert_eq!(store.dead(), 27 + 21 + 21 + 20);
         store.verify().unwrap();
     }
 
@@ -2579,7 +2703,7 @@ mod tests {
         assert_eq!(
             log_bytes(tmp.path()),
             encoded(&[
-                Record::Batch { body_len: 33 },
+                Record::Batch { body_len: 41 },
                 set_record(b"a", b"1"),
                 delete_record(b"a"),
             ])
@@ -2592,7 +2716,7 @@ mod tests {
         let before = encoded(&[set_record(b"b", b"2")]);
         let mut log = before.clone();
         log.extend(encoded(&[
-            Record::Batch { body_len: 33 },
+            Record::Batch { body_len: 41 },
             set_record(b"a", b"1"),
             delete_record(b"b"),
         ]));
@@ -2625,7 +2749,7 @@ mod tests {
     fn a_batch_whose_last_record_landed_as_zeros_is_dropped_whole() {
         let (mut log, before) = log_with_a_batch();
         let len = log.len();
-        log[len - 16..].fill(0);
+        log[len - 20..].fill(0);
         let tmp = tempfile::tempdir().unwrap();
         fs::write(log_path(tmp.path()), &log).unwrap();
         let store = Store::open(tmp.path()).unwrap();
@@ -2637,19 +2761,19 @@ mod tests {
     #[test]
     fn corruption_inside_a_batch_is_reported_and_repaired_at_the_batch() {
         let (mut log, before) = log_with_a_batch();
-        log[before + 23 + 16] ^= 0x01;
+        log[before + 27 + 20] ^= 0x01;
         let tmp = tempfile::tempdir().unwrap();
         fs::write(log_path(tmp.path()), &log).unwrap();
         assert!(matches!(
             Store::open(tmp.path()),
             Err(Error::Corruption {
-                offset: 17,
+                offset: 21,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!((repaired.offset, repaired.dropped), (17, 56));
+        assert_eq!((repaired.offset, repaired.dropped), (21, 68));
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -2658,8 +2782,8 @@ mod tests {
     #[test]
     fn a_batch_inside_a_batch_or_a_record_past_its_end_is_corrupt() {
         let nested = encoded(&[
-            Record::Batch { body_len: 40 },
-            Record::Batch { body_len: 17 },
+            Record::Batch { body_len: 48 },
+            Record::Batch { body_len: 21 },
             set_record(b"a", b"1"),
         ]);
         let short = encoded(&[Record::Batch { body_len: 10 }, set_record(b"a", b"1")]);
@@ -2703,8 +2827,8 @@ mod tests {
         dir.join(hint_name(*segment_bases(dir).last().unwrap()))
     }
 
-    /// a=hi at 0 and b=2 at 18, compacted into the segment at 35, so a is
-    /// at 35, b at 53, and the segment's hint covers both.
+    /// a=hi at 0 and b=2 at 22, compacted into the segment at 43, so a is
+    /// at 43, b at 65, and the segment's hint covers both.
     fn compacted_a_and_b(dir: &Path) {
         let mut store = Store::open(dir).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
@@ -2726,10 +2850,10 @@ mod tests {
         let mut store = one_record_per_segment(tmp.path());
         assert_eq!(
             mapped(&store),
-            [(0, true), (17, true), (34, true), (50, false)]
+            [(0, true), (21, true), (42, true), (62, false)]
         );
         put(&mut store, b"d", b"4");
-        assert_eq!(mapped(&store)[3..], [(50, true), (67, false)]);
+        assert_eq!(mapped(&store)[3..], [(62, true), (83, false)]);
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
         assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
         drop(store);
@@ -2737,7 +2861,7 @@ mod tests {
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
         assert_eq!(
             mapped(&store),
-            [(0, true), (17, true), (34, true), (50, true), (67, false)]
+            [(0, true), (21, true), (42, true), (62, true), (83, false)]
         );
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
         assert_eq!(read(&store, b"a"), None);
@@ -2752,17 +2876,17 @@ mod tests {
         drop(store);
         let file = OpenOptions::new()
             .write(true)
-            .open(tmp.path().join(log_name(35)))
+            .open(tmp.path().join(log_name(43)))
             .unwrap();
-        file.write_all_at(b"X", 16).unwrap();
+        file.write_all_at(b"X", 20).unwrap();
         drop(file);
 
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        assert_eq!(mapped(&store), [(35, true), (70, false)]);
+        assert_eq!(mapped(&store), [(43, true), (86, false)]);
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
-                offset: 35,
+                offset: 43,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -2773,13 +2897,13 @@ mod tests {
     fn open_after_compact_reads_keys_from_the_hint_not_the_log() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        write_log_at(tmp.path(), 16, b"X");
+        write_log_at(tmp.path(), 20, b"X");
 
         let store = Store::open(tmp.path()).unwrap();
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
-                offset: 35,
+                offset: 43,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -2938,7 +3062,7 @@ mod tests {
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"22")));
         assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
-        assert_eq!(store.dead(), 18 + 16 + 17);
+        assert_eq!(store.dead(), 22 + 20 + 21);
     }
 
     #[test]
@@ -2952,7 +3076,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.00000000000000000035.log", "tally.lock", "tally.log"]
+            ["tally.00000000000000000043.log", "tally.lock", "tally.log"]
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -2963,12 +3087,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
         let log = log_bytes(tmp.path());
-        fs::write(log_path(tmp.path()), &log[..18]).unwrap();
+        fs::write(log_path(tmp.path()), &log[..22]).unwrap();
 
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.00000000000000000035.log", "tally.lock", "tally.log"]
+            ["tally.00000000000000000043.log", "tally.lock", "tally.log"]
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -2978,10 +3102,10 @@ mod tests {
     fn repair_removes_the_hint_before_truncating() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        write_log_at(tmp.path(), 33, b"X");
+        write_log_at(tmp.path(), 41, b"X");
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!(repaired.offset, 53);
+        assert_eq!(repaired.offset, 65);
         assert!(!hint_path(tmp.path()).exists());
         let mut store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -3015,13 +3139,13 @@ mod tests {
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
-        write_log_at(tmp.path(), 33, b"X");
+        write_log_at(tmp.path(), 41, b"X");
         let before = log_bytes(tmp.path());
 
         assert!(matches!(
             store.compact(),
             Err(Error::Corruption {
-                offset: 17,
+                offset: 21,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -3058,7 +3182,7 @@ mod tests {
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.delete(key(b"b")).unwrap();
-        write_log_at(tmp.path(), 17, b"X");
+        write_log_at(tmp.path(), 21, b"X");
         let before = log_bytes(tmp.path());
 
         assert!(matches!(
@@ -3081,12 +3205,12 @@ mod tests {
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"c"), value(b"3")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
-        write_log_at(tmp.path(), 49, b"X");
+        write_log_at(tmp.path(), 61, b"X");
 
         assert!(matches!(
             store.compact(),
             Err(Error::Corruption {
-                offset: 34,
+                offset: 42,
                 reason: CorruptionReason::PayloadChecksum
             })
         ));
@@ -3104,8 +3228,8 @@ mod tests {
         store.set(key(b"a"), value(&big)).unwrap();
         store.set(key(b"b"), value(&big)).unwrap();
         store.set(key(b"c"), value(b"3")).unwrap();
-        let c = 2 * (15 + 1 + (700 << 10));
-        write_log_at(tmp.path(), c + 16, b"X");
+        let c = 2 * (19 + 1 + (700 << 10));
+        write_log_at(tmp.path(), c + 20, b"X");
 
         // More than the 1 MiB compaction buffer is copied before c fails.
         assert!(matches!(
@@ -3113,7 +3237,7 @@ mod tests {
             Err(Error::Corruption { offset, reason: CorruptionReason::PayloadChecksum })
                 if offset == c
         ));
-        let end = c + 17;
+        let end = c + 21;
         assert_eq!(segment_bases(tmp.path()), [0, end]);
         assert_eq!(fs::read(tmp.path().join(log_name(end))).unwrap(), b"");
         assert!(!tmp.path().join(hint_name(end)).exists());
@@ -3141,7 +3265,7 @@ mod tests {
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"3")).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 51, "17 of 51 dead");
+        assert_eq!(log_bytes(tmp.path()).len(), 63, "21 of 63 dead");
 
         store.set(key(b"b"), value(b"4")).unwrap();
         assert_eq!(
@@ -3152,8 +3276,8 @@ mod tests {
         store.set(key(b"a"), value(b"5")).unwrap();
         assert_eq!(
             log_bytes(tmp.path()).len(),
-            51,
-            "compaction left nothing dead, so 17 of 51 now"
+            63,
+            "compaction left nothing dead, so 21 of 63 now"
         );
     }
 
@@ -3170,10 +3294,10 @@ mod tests {
     #[test]
     fn a_log_below_the_minimum_size_is_not_compacted() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), auto(50, 35)).unwrap();
+        let mut store = Store::open_with(tmp.path(), auto(50, 43)).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"2")).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 34);
+        assert_eq!(log_bytes(tmp.path()).len(), 42);
         store.set(key(b"a"), value(b"3")).unwrap();
         assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
     }
@@ -3192,7 +3316,7 @@ mod tests {
         store.delete(key(b"a")).unwrap();
         drop(store);
         Store::open_with(tmp.path(), options).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 67);
+        assert_eq!(log_bytes(tmp.path()).len(), 83);
     }
 
     #[test]
@@ -3232,7 +3356,7 @@ mod tests {
         drop(store);
 
         let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
-        assert_eq!(log_bytes(tmp.path()).len(), 51, "17 of 51 dead");
+        assert_eq!(log_bytes(tmp.path()).len(), 63, "21 of 63 dead");
         store.set(key(b"b"), value(b"4")).unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
@@ -3246,14 +3370,14 @@ mod tests {
         let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
-        write_log_at(tmp.path(), 17, b"X");
+        write_log_at(tmp.path(), 21, b"X");
         store.set(key(b"b"), value(b"3")).unwrap();
         store.set(key(b"b"), value(b"4")).unwrap();
-        assert_eq!(store.auto_compact, AutoCompact::new(50, 0), "34 of 69 dead");
+        assert_eq!(store.auto_compact, AutoCompact::new(50, 0), "42 of 85 dead");
 
         store.set(key(b"b"), value(b"5")).unwrap();
         assert_eq!(store.auto_compact, None);
-        assert_eq!(log_bytes(tmp.path()).len(), 86);
+        assert_eq!(log_bytes(tmp.path()).len(), 106);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"5")));
     }
 }

@@ -54,7 +54,7 @@ fn open_warns_with_the_offset_and_bytes_dropped() {
         *LOGGER.0.lock().unwrap(),
         [(
             Level::Warn,
-            "truncated a torn tail at offset 18: dropped 14 bytes".to_string()
+            "truncated a torn tail at offset 22: dropped 14 bytes".to_string()
         )]
     );
 }

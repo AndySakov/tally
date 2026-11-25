@@ -242,7 +242,7 @@ fn log_with_a_corrupt_middle() -> Vec<u8> {
         },
         &mut bytes,
     );
-    bytes[corrupt_at + 15] ^= 0x01;
+    bytes[corrupt_at + 19] ^= 0x01;
     encode(
         &Record::Set {
             key: Key::try_from(&b"b"[..]).unwrap(),
@@ -257,9 +257,9 @@ fn log_with_a_corrupt_middle() -> Vec<u8> {
 fn a_power_cut_during_repair_never_loses_a_byte() {
     let dir = Path::new(DIR);
     let log_path = dir.join(log_name(0));
-    let side_path = dir.join(format!("{LOG_FILE_NAME}.corrupt-18"));
+    let side_path = dir.join(format!("{LOG_FILE_NAME}.corrupt-22"));
     let original = log_with_a_corrupt_middle();
-    let (kept, moved) = original.split_at(18);
+    let (kept, moved) = original.split_at(22);
 
     let fs = MemFs::new();
     fs.put(&log_path, &original);
@@ -292,7 +292,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
                 assert_eq!(
                     rerun,
                     Some(Repaired {
-                        offset: 18,
+                        offset: 22,
                         dropped: moved.len() as u64,
                         side_file: side_path.clone(),
                     }),
@@ -372,20 +372,20 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
         .unwrap();
     store.compact().unwrap();
     drop(store);
-    let compacted = 19 + 18;
+    let compacted = 23 + 22;
     let hint = fs.read(&dir.join(hint_name(compacted))).unwrap();
     let log = fs.read(&dir.join(log_name(compacted))).unwrap();
-    assert_eq!(log.len(), 19 + 18);
+    assert_eq!(log.len(), 23 + 22);
 
     let fs = MemFs::new();
-    fs.put(&dir.join(log_name(0)), &log[..19]);
+    fs.put(&dir.join(log_name(0)), &log[..23]);
     fs.put(&dir.join(hint_name(0)), &hint);
     let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(3), Value::try_from(&b"3"[..]).unwrap())
         .unwrap();
     drop(store);
-    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), 19 + 18);
+    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), 23 + 22);
 
     let disk = fs.disk();
     for cut in disk.cuts() {
@@ -415,8 +415,8 @@ fn a_power_cut_while_moving_to_segments_loses_nothing() {
         .unwrap();
     store.compact().unwrap();
     drop(store);
-    let log = fs.read(&dir.join(log_name(37))).unwrap();
-    let hint = fs.read(&dir.join(hint_name(37))).unwrap();
+    let log = fs.read(&dir.join(log_name(45))).unwrap();
+    let hint = fs.read(&dir.join(hint_name(45))).unwrap();
     let legacy = || {
         let fs = MemFs::new();
         fs.put(&dir.join(LOG_FILE_NAME), &log);

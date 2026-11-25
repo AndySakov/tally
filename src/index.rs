@@ -20,12 +20,22 @@ use std::thread;
 
 use siphasher::sip128::SipHasher13;
 
+use crate::record::Format;
+
 /// Where a live key's latest Set record sits in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Entry {
     pub offset: u64,
     pub value_len: u32,
     pub key_len: u16,
+    pub format: Format,
+}
+
+impl Entry {
+    /// Length on disk of the record the entry points at.
+    pub fn record_len(&self) -> u64 {
+        (self.format.header_len() + usize::from(self.key_len)) as u64 + u64::from(self.value_len)
+    }
 }
 
 const SHARD_BITS: u32 = 6;
@@ -296,6 +306,7 @@ mod tests {
             offset,
             value_len: 1,
             key_len: 1,
+            format: Format::Crc64,
         }
     }
 

@@ -12,21 +12,31 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 
 ## On-disk format
 
-The log is a sequence of append-only segment files (see Segments). Every record is a 15-byte prefix followed by the payload.
+The log is a sequence of append-only segment files (see Segments). Every record is a 19-byte header followed by the payload.
 
 | Offset         | Size        | Field              | Notes                            |
 | -------------- | ----------- | ------------------ | -------------------------------- |
-| 0              | 4           | `header_checksum`  | CRC32C of bytes 4..15            |
-| 4              | 1           | `type`             | `0` invalid, `1` Set, `2` Delete, `3` Batch |
+| 0              | 4           | `header_checksum`  | CRC32C of bytes 4..19            |
+| 4              | 1           | `type`             | `0x11` Set, `0x12` Delete, `0x13` Batch |
 | 5              | 2           | `key_len`          | u16                              |
 | 7              | 4           | `value_len`        | u32                              |
-| 11             | 4           | `payload_checksum` | CRC32C of key + value            |
-| 15             | `key_len`   | key                |                                  |
-| 15 + `key_len` | `value_len` | value              | empty for Delete                 |
+| 11             | 8           | `payload_checksum` | CRC-64/NVME of key + value       |
+| 19             | `key_len`   | key                |                                  |
+| 19 + `key_len` | `value_len` | value              | empty for Delete                 |
 
 - All integers are little-endian.
-- The checksum is CRC32C (Castagnoli). The variant is part of the format.
+- The header checksum is CRC32C (Castagnoli), the payload checksum CRC-64/NVME (the NVMe and S3 CRC-64). The variants are part of the format.
 - `header_checksum` covers `payload_checksum`, so the payload checksum is itself protected.
+- The payload checksum is 64 bits because it is what stands between bit rot and a wrong value. A corrupted payload passes CRC32C 1 time in 2³², and passes CRC-64 1 time in 2⁶⁴; CRC-64 also catches every error confined to 64 bits, against 32. The header stays at CRC32C: a damaged header that passes it gives wrong lengths, and the payload checksum over the wrong bytes then fails, so the damage is still reported, not returned. With `crc-fast`, CRC-64 is faster than CRC32C from about 100 bytes (15 against 20 ns at 117, 34 against 77 ns at 1 KiB on an M1 Pro).
+
+### Old records
+
+Records written before 64-bit checksums have a 15-byte header: the same fields with a 4-byte CRC32C `payload_checksum` at 11, and types `1`, `2` and `3`. The high nibble of `type` names the format (`0` old, `1` new) and the low nibble the kind, so a reader takes the header's length from byte 4 before checking anything: it reads 15 bytes, then 4 more if the type names the new format. A damaged type byte gives the wrong length, and the header checksum then fails. Type `0` is invalid in either format.
+
+- Old records are read and checked as before, wherever they are. Every write is in the new format, so a segment can hold both.
+- Compaction rewrites each old record it copies in the new format, checking its CRC32C on the way, so a store moves to 64-bit checksums as it compacts. A record already in the new format is copied byte for byte: rewriting every record took 100k live records' compaction from 44.1 to 47.5 ms.
+- Each index entry records its record's format, in what was padding, so `get` reads it in one read either way and dead bytes are counted exactly.
+- A version from before 64-bit checksums fails on a new record with `Unsupported` (unknown type `0x11`) instead of misreading it, and `repair` refuses it the same way. Like the move to segments, the change is one way once a new record is written.
 - The header has its own checksum so lengths can be trusted before they are used. A single record checksum cannot tell a torn tail from a mid-file record with a corrupted length, and treating the second as the first would silently drop acknowledged records.
 - Type `0` is invalid so a zero-filled region can never parse as a record.
 - A Batch record has no key and an 8-byte "value", `body_len` (u64): the byte length of the Set and Delete records that follow it and belong to the batch. Those records are ordinary records with their own checksums, so `get` reads one the same way whether or not it was written in a batch. A version without Batch fails on one with `Unsupported` (unknown type 3) instead of misreading it.
@@ -119,13 +129,13 @@ The move is one way.
 `open` reads every segment in log order into one index. For each: if its hint is usable (see Hint file), its entries go into the index and `pos` starts where the hint ends; otherwise `pos` starts at the segment's base. `len` is the segment's end. Loop:
 
 1. `pos == len`: clean end, stop.
-2. Fewer than 15 bytes remain: torn header. Truncate at `pos`.
-3. Read the prefix. If `header_checksum` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
+2. Fewer than 15 bytes remain, or fewer than the header length byte 4 names (15 or 19): torn header. Truncate at `pos`.
+3. Read the header. If `header_checksum` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
 4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version). Validity violations: fail with corruption.
-5. Fewer than `15 + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
-6. Read the payload. If `payload_checksum` fails: if every byte from `pos + 15` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
-7. Set inserts `key -> Entry { offset: pos, value_len }`. Delete removes the key. A Batch is handled as described below.
-8. `pos += 15 + key_len + value_len`. Repeat.
+5. Fewer than `header_len + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
+6. Read the payload. If `payload_checksum` fails: if every byte from `pos + header_len` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
+7. Set inserts `key -> Entry { offset: pos, value_len, format }`. Delete removes the key. A Batch is handled as described below.
+8. `pos += header_len + key_len + value_len`. Repeat.
 
 A Batch record at `pos` is followed by `body_len` bytes of records, and the batch is all or nothing:
 
@@ -181,9 +191,12 @@ What cleaning only some segments buys is shorter pauses. Loading 10M keys of 100
 Each segment compaction writes gets a hint, `tally.<base>.hint`, that lets `open` add its entries to the index without reading values. Format (`src/hint.rs`), little-endian:
 
 ```text
-magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc32c u32
-entry: key_len u16 | value_len u32 | key
+magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc64 u64
+entry: type u8 | key_len u16 | value_len u32 | key
 ```
+
+- Version 2. `type` is the record's type byte, so an entry gives its record's header length; today every entry is a Set in the new format (`0x11`), and any other type rejects the hint. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
+- A version 1 hint, from before 64-bit checksums, is rejected like any other bad hint: removed, and its segment read in full. That costs one slow `open` after the upgrade and loses nothing; the next compaction writes version 2.
 
 - Offsets are not stored. A segment compaction wrote starts with exactly the copied records end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after the compaction, and the Delete records step 5 appended) are scanned.
 - The count and log length trail the entries because files are only written at the end and neither is known until compaction finishes. `open` reads the trailer first, with one positioned read, to size the index for `count` keys, never more than the log could hold (`log_len / 17`, the shortest record), since the count is unchecked until every entry is read.
@@ -196,7 +209,7 @@ On `open`, a hint is used only if its magic, version and checksum hold, every ke
 
 The cost is that `open` no longer checks the checksums of records the hint covers. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan. This is the Bitcask trade.
 
-At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB: the extra 29 MB is the window and per-thread buffers. The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB: the extra 29 MB is the window and per-thread buffers. The hint was 22 bytes per key here (220 MB); version 2's type byte makes it 23. With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
 
 ### When it runs
 
@@ -224,7 +237,7 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 
 ## Index
 
-`src/index.rs`: `HashMap<u128, Entry>` where `Entry { offset: u64, value_len: u32, key_len: u16 }` (16 bytes, `key_len` filling what was padding). Keys are not stored: each is replaced by its 128-bit SipHash-1-3 under a key drawn at random for every `open`, from std's `RandomState`, which is seeded from the OS. The map hashes that `u128` by taking its low 64 bits.
+`src/index.rs`: `HashMap<u128, Entry>` where `Entry { offset: u64, value_len: u32, key_len: u16, format: Format }` (16 bytes, `key_len` and the record's format filling what was padding). Keys are not stored: each is replaced by its 128-bit SipHash-1-3 under a key drawn at random for every `open`, from std's `RandomState`, which is seeded from the OS. The map hashes that `u128` by taking its low 64 bits.
 
 - No allocation per key, and 32 bytes per slot whatever the key's length. At 10M keys of 16 bytes, building the index alone went from 78 to 58 ns per key and from 681 to 528 MB, and `open` from the hint from 718 to 557 MB at peak. The saving grows with key length.
 - The keyed hash also restores HashDoS resistance, which foldhash (the hasher before) did not claim: without the key, no one can choose keys that land in the same slot. That was a prerequisite for keys arriving over the network.
@@ -246,7 +259,7 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 `get` always verifies:
 
 1. Look up the key. Missing: return `None` with no I/O.
-2. Read the record at `offset` in one positioned read of `15 + key_len + value_len` bytes, both from the index entry. If the header there gives other lengths, or the read runs past the end, read it again the old way (header, then the payload length the header gives), so errors report what is actually on disk. One read instead of two took a 1 KiB hit from 1.30 µs to 0.82 µs.
+2. Read the record at `offset` in one positioned read of `header_len + key_len + value_len` bytes, all from the index entry (`header_len` from its format). If the header there gives other lengths, or the read runs past the end, read it again the old way (header, then the payload length the header gives), so errors report what is actually on disk. One read instead of two took a 1 KiB hit from 1.30 µs to 0.82 µs.
 3. Verify both checksums and that the stored key equals the requested key.
 4. Return the value. Any failure returns a corruption error, never `None`.
 
@@ -292,6 +305,7 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 | Crate                      | Why                               |
 | -------------------------- | --------------------------------- |
 | `crc32c`                   | CRC32C with hardware acceleration |
+| `crc-fast`                 | CRC-64/NVME for payloads and hints, with hardware acceleration; default features off, which drops its C API (26 exported `extern "C"` symbols and the unsafe code behind them) |
 | `siphasher`                | 128-bit SipHash-1-3 for the index |
 | `log`                      | the recovery warning; the caller picks the logger |
 | `memmap2`                  | read-only maps of sealed segments: the one `unsafe` call, with its argument in `src/fs.rs` |

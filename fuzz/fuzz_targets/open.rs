@@ -7,8 +7,10 @@
 //! - Truncated anywhere, or zero bytes appended: `open` succeeds with the
 //!   state of the complete records and truncates the log after the last one.
 //! - One byte changed: the record holding it fails its header checksum (if
-//!   the byte is in its first 15 bytes) or its payload checksum. CRC32C
-//!   catches any change confined to 32 bits. If every byte that checksum
+//!   the byte is in its first 19 bytes) or its payload checksum. CRC32C
+//!   catches any change confined to 32 bits, and CRC-64 any confined to 64.
+//!   A changed type byte that names the old format makes the header read
+//!   15 bytes long, and its checksum still fails. If every byte that checksum
 //!   covers, through to the end of the log, is zero, the record is a torn
 //!   tail and is truncated; otherwise `open` fails with corruption at the
 //!   start of the record and leaves the log alone.
