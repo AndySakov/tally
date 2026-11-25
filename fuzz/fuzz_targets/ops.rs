@@ -1,7 +1,10 @@
 //! Coverage-guided version of `tests/model.rs`: arbitrary operations against
 //! a `Store` and a `HashMap`, which must agree after every step and across
-//! reopens, with the log exactly as long as the writes that reached it.
-//! fsync is skipped under `cfg(fuzzing)`.
+//! reopens. With automatic compaction off, the log must be exactly as long
+//! as the writes that reached it; with it on, at least as long as the live
+//! records.
+//! On the in-memory disk: on the real one, file syscalls took most of the
+//! time.
 
 #![no_main]
 
@@ -10,8 +13,9 @@ use std::path::Path;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use tally::fuzz::HEADER_LEN;
-use tally::{Batch, Key, Options, Store, Value};
+use tally::fs::Fs;
+use tally::fuzz::{HEADER_LEN, MemFs, open_in_memory};
+use tally::{AutoCompact, Batch, Key, Options, Value};
 
 /// Few distinct keys, so overwrites and deletes hit live keys often.
 const KEY_SPACE: u8 = 8;
@@ -28,11 +32,20 @@ enum Op {
 }
 
 /// Small segments, so writes roll into new ones and reads and reopens
-/// cross several.
-fn options() -> Options {
+/// cross several. Automatic compaction, if on, at half dead with no floor,
+/// so it cleans some segments and keeps others.
+fn options(auto: bool) -> Options {
     let mut options = Options::default();
     options.segment_bytes = 100;
+    options.auto_compact = auto.then(|| AutoCompact::new(50, 0)).flatten();
     options
+}
+
+fn live_len(model: &HashMap<u8, Vec<u8>>) -> u64 {
+    model
+        .iter()
+        .map(|(&k, v)| (HEADER_LEN + key_bytes(k).len() + v.len()) as u64)
+        .sum()
 }
 
 fn key_bytes(k: u8) -> [u8; 2] {
@@ -44,22 +57,20 @@ fn key(k: u8) -> Key {
 }
 
 /// Bytes across the log's segment files, `tally.<20 digits>.log`.
-fn log_len(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
+fn log_len(fs: &MemFs, dir: &Path) -> u64 {
+    fs.list(dir)
         .unwrap()
-        .map(Result::unwrap)
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
-        })
-        .map(|e| e.metadata().unwrap().len())
+        .into_iter()
+        .filter(|name| name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log"))
+        .map(|name| fs.read(&dir.join(name)).unwrap().len() as u64)
         .sum()
 }
 
-fuzz_target!(|ops: Vec<Op>| {
-    let dir = tempfile::tempdir().unwrap();
-    let mut store = Store::open_with(dir.path(), options()).unwrap();
+fuzz_target!(|input: (bool, Vec<Op>)| {
+    let (auto, ops) = input;
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let mut store = open_in_memory(fs.clone(), dir, options(auto)).unwrap();
     let mut model: HashMap<u8, Vec<u8>> = HashMap::new();
     let mut expected_len = 0u64;
 
@@ -91,7 +102,7 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::Reopen => {
                 drop(store);
-                store = Store::open_with(dir.path(), options()).unwrap();
+                store = open_in_memory(fs.clone(), dir, options(auto)).unwrap();
             }
             Op::Batch(ops) => {
                 let mut batch = Batch::new();
@@ -122,17 +133,18 @@ fuzz_target!(|ops: Vec<Op>| {
             }
             Op::Compact => {
                 store.compact().unwrap();
-                expected_len = model
-                    .iter()
-                    .map(|(&k, v)| (HEADER_LEN + key_bytes(k).len() + v.len()) as u64)
-                    .sum();
+                expected_len = live_len(&model);
             }
         }
-        assert_eq!(log_len(dir.path()), expected_len);
+        if auto {
+            assert!(log_len(&fs, dir) >= live_len(&model));
+        } else {
+            assert_eq!(log_len(&fs, dir), expected_len);
+        }
     }
 
     drop(store);
-    let store = Store::open_with(dir.path(), options()).unwrap();
+    let store = open_in_memory(fs.clone(), dir, options(auto)).unwrap();
     for k in 0..KEY_SPACE {
         let got = store.get(&key(k)).unwrap();
         assert_eq!(

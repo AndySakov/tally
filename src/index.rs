@@ -8,8 +8,8 @@
 //! up as a corruption error, never as another key's value.
 //!
 //! The map is split into 64 shards by the top bits of the hash, so `fill`
-//! can insert from several threads at once, and growing the map moves one
-//! shard at a time instead of the whole index.
+//! and `apply_in_order` can insert from several threads at once, and
+//! growing the map moves one shard at a time instead of the whole index.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
@@ -172,6 +172,62 @@ impl Index {
             .collect();
         replaced.into_inner()
     }
+
+    /// Applies `changes` in order, an insert for `Some` and a remove for
+    /// `None`, with the result of applying them one after another. On up to
+    /// `threads` threads: they hash the keys, then each applies the changes
+    /// that fall in its own shards. Every change to a key falls in the same
+    /// shard, so each key's changes still apply in order.
+    pub(crate) fn apply_in_order(&mut self, threads: usize, changes: &[(&[u8], Option<Entry>)]) {
+        let Index { shards, hasher } = self;
+        let apply = |map: &mut Map, hash: u128, change: &Option<Entry>| match change {
+            Some(entry) => {
+                map.insert(hash, *entry);
+            }
+            None => {
+                map.remove(&hash);
+            }
+        };
+        if threads <= 1 {
+            for (key, change) in changes {
+                let hash = hasher.hash(key);
+                apply(&mut shards[shard_of(hash)], hash, change);
+            }
+            return;
+        }
+        let mut hashes = vec![0u128; changes.len()];
+        let per_thread = changes.len().div_ceil(threads).max(1);
+        thread::scope(|scope| {
+            for (hashes, changes) in hashes
+                .chunks_mut(per_thread)
+                .zip(changes.chunks(per_thread))
+            {
+                let hasher = &*hasher;
+                scope.spawn(move || {
+                    for (hash, (key, _)) in hashes.iter_mut().zip(changes) {
+                        *hash = hasher.hash(key);
+                    }
+                });
+            }
+        });
+        let mut owned: Vec<Vec<&mut Map>> = (0..threads).map(|_| Vec::new()).collect();
+        for (shard, map) in shards.iter_mut().enumerate() {
+            owned[shard % threads].push(map);
+        }
+        let hashes = &hashes;
+        thread::scope(|scope| {
+            for (thread, mut maps) in owned.into_iter().enumerate() {
+                scope.spawn(move || {
+                    for (&hash, (_, change)) in hashes.iter().zip(changes) {
+                        let shard = shard_of(hash);
+                        if shard % threads == thread {
+                            apply(maps[shard / threads], hash, change);
+                        }
+                    }
+                });
+            }
+        });
+    }
 }
 
 /// Where one `fill` thread puts entries. Holds a few per shard so it takes
@@ -294,6 +350,37 @@ mod tests {
             assert_eq!(filled.get(key), Some(&entry(i as u64)), "key {i}");
         }
         assert_eq!(filled.get(&10_000u32.to_le_bytes()), None);
+    }
+
+    #[test]
+    fn apply_in_order_on_many_threads_ends_as_one_change_after_another_would() {
+        let keys: Vec<[u8; 4]> = (0..5_000u32).map(u32::to_le_bytes).collect();
+        let mut changes: Vec<(&[u8], Option<Entry>)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            changes.push((key, Some(entry(i as u64))));
+        }
+        for (i, key) in keys.iter().enumerate().step_by(2) {
+            changes.push((key, None));
+            if i % 4 == 0 {
+                changes.push((key, Some(entry(10_000 + i as u64))));
+            }
+        }
+        changes.push((b"older", None));
+        for threads in [1, 3, 8] {
+            let mut index = Index::new();
+            index.insert(b"older", entry(3));
+            index.insert(b"kept", entry(4));
+            index.apply_in_order(threads, &changes);
+
+            assert_eq!(index.len(), 3_751, "{threads} threads");
+            assert_eq!(index.get(b"older"), None);
+            assert_eq!(index.get(b"kept"), Some(&entry(4)));
+            assert_eq!(index.get(&keys[0]), Some(&entry(10_000)));
+            assert_eq!(index.get(&keys[1]), Some(&entry(1)));
+            assert_eq!(index.get(&keys[2]), None);
+            assert_eq!(index.get(&keys[4]), Some(&entry(10_004)));
+            assert_eq!(index.get(&keys[4_999]), Some(&entry(4_999)));
+        }
     }
 
     #[test]
