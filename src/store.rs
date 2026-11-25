@@ -1,10 +1,10 @@
-use std::collections::HashMap;
 use std::fs::TryLockError;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
+use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Record, decode_header, decode_index_op, decode_payload, encode,
@@ -14,15 +14,6 @@ use crate::{CorruptionReason, DecodeError, Error, Key, Value};
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 pub(crate) const COMPACT_FILE_NAME: &str = "tally.log.compact";
-
-type Index = HashMap<Box<[u8]>, Entry, foldhash::quality::RandomState>;
-
-/// Where a live key's latest Set record sits in the log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Entry {
-    offset: u64,
-    value_len: u32,
-}
 
 /// What `Store::repair` moved out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,8 +127,8 @@ impl<F: Fs> Store<F> {
             );
         }
         let live: u64 = index
-            .iter()
-            .map(|(key, entry)| record_len(key.len(), entry.value_len))
+            .values()
+            .map(|entry| record_len(usize::from(entry.key_len), entry.value_len))
             .sum();
         let mut store = Store {
             fs,
@@ -361,11 +352,12 @@ impl<F: Fs> Store<F> {
         if let Record::Set { key, value } = record {
             let key_len = key.as_bytes().len();
             let old = self.index.insert(
-                key.into_bytes(),
+                key.as_bytes(),
                 Entry {
                     offset,
                     value_len: u32::try_from(value.as_bytes().len())
                         .expect("Value guarantees len fits u32"),
+                    key_len: entry_key_len(&key),
                 },
             );
             if let Some(old) = old {
@@ -419,14 +411,14 @@ impl<F: Fs> Store<F> {
     /// Deleting a key that isn't live is a no-op: nothing is written and it
     /// returns `Ok`. Failed writes are handled as in `set`.
     pub fn delete(&mut self, key: Key) -> Result<(), Error> {
-        if self.index.contains_key(key.as_bytes()) {
+        if self.index.contains(key.as_bytes()) {
             let record = Record::Delete { key };
             let offset = self.append(&record)?;
             if let Record::Delete { key } = record {
                 let key_len = key.as_bytes().len();
                 let old = self
                     .index
-                    .remove(&key.into_bytes())
+                    .remove(key.as_bytes())
                     .expect("checked live above");
                 self.dead += record_len(key_len, old.value_len) + (self.end - offset);
             } else {
@@ -515,7 +507,7 @@ fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Err
 /// Reads every record in `file` from offset 0 to `len` and returns the index
 /// they describe.
 fn load_index(file: &impl LogFile, len: u64) -> Result<(Index, u64), Error> {
-    let mut index = Index::default();
+    let mut index = Index::new();
     let end = scan(file, &mut index, 0, len)?;
     Ok((index, end))
 }
@@ -527,7 +519,7 @@ fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Er
     let path = dir.join(HINT_FILE_NAME);
     let file = match fs.open_existing(&path) {
         Ok(file) => file,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Index::default(), 0)),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Index::new(), 0)),
         Err(err) => return Err(err.into()),
     };
     match read_hint(&file, log_len) {
@@ -537,7 +529,7 @@ fn load_hint<F: Fs>(fs: &F, dir: &Path, log_len: u64) -> Result<(Index, u64), Er
             drop(file);
             fs.remove(&path)?;
             fs.sync_dir(dir)?;
-            Ok((Index::default(), 0))
+            Ok((Index::new(), 0))
         }
     }
 }
@@ -551,9 +543,17 @@ fn read_hint(file: &impl LogFile, log_len: u64) -> Result<(Index, u64), hint::In
     // than the log could hold.
     let most = log_len / record_len(1, 1);
     let capacity = usize::try_from(trailer.count.min(most)).unwrap_or(usize::MAX);
-    let mut index = Index::with_capacity_and_hasher(capacity, Default::default());
+    let mut index = Index::with_capacity(capacity);
     hint::read_entries(file, trailer, |key, offset, value_len| {
-        index.insert(key.into_bytes(), Entry { offset, value_len });
+        let key_len = entry_key_len(&key);
+        index.insert(
+            key.as_bytes(),
+            Entry {
+                offset,
+                value_len,
+                key_len,
+            },
+        );
     })?;
     if index.len() as u64 != trailer.count {
         return Err(hint::Invalid("a key appears twice"));
@@ -599,7 +599,15 @@ fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<
         };
         match op {
             IndexOp::Set { key, value_len } => {
-                index.insert(key.into_bytes(), Entry { offset, value_len });
+                let key_len = entry_key_len(&key);
+                index.insert(
+                    key.as_bytes(),
+                    Entry {
+                        offset,
+                        value_len,
+                        key_len,
+                    },
+                );
             }
             IndexOp::Delete { key } => {
                 index.remove(key.as_bytes());
@@ -608,6 +616,10 @@ fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<
         offset += header.record_len();
     }
     Ok(offset)
+}
+
+fn entry_key_len(key: &Key) -> u16 {
+    u16::try_from(key.as_bytes().len()).expect("Key guarantees len fits u16")
 }
 
 /// Removes `path`. Returns whether it was there.
@@ -1315,6 +1327,25 @@ mod tests {
             file_names(tmp.path()),
             ["tally.hint", "tally.lock", "tally.log"]
         );
+    }
+
+    #[test]
+    fn keys_sharing_a_hash_read_as_corruption_never_as_each_others_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.index = Index::weak();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+
+        assert!(matches!(
+            store.get(&key(b"a")),
+            Err(Error::Corruption {
+                offset: 17,
+                reason: CorruptionReason::KeyMismatch
+            })
+        ));
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(store.get(&key(b"cc")).unwrap(), None);
     }
 
     // hint file
