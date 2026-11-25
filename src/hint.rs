@@ -167,6 +167,12 @@ impl Window {
     }
 }
 
+/// A read buffer of `most` bytes, or of `len` if that is less: a 1 MiB
+/// buffer is zeroed before its first read.
+pub(crate) fn buffer_for(len: u64, most: usize) -> usize {
+    usize::try_from(len).map_or(most, |len| len.min(most))
+}
+
 /// Checks each entry's lengths and passes them to `window` a window at a
 /// time, then checks the checksum and that the entries account for exactly
 /// `trailer`. On `Err`, whatever `window` saw must be thrown away.
@@ -178,7 +184,7 @@ pub(crate) fn read_entries(
 ) -> Result<(), Invalid> {
     let size = file.size()?;
     let mut reader = Checksummed {
-        inner: BufReader::with_capacity(FLUSH_AT, file.reader_at(0)),
+        inner: BufReader::with_capacity(buffer_for(size, FLUSH_AT), file.reader_at(0)),
         checksum: 0,
     };
     let mut prefix = [0u8; PREFIX_LEN as usize];
@@ -420,5 +426,11 @@ mod tests {
             read(&bytes),
             Err(Invalid("entries don't match the trailer"))
         );
+    }
+
+    #[test]
+    fn a_read_buffer_is_no_larger_than_what_it_reads() {
+        assert_eq!(buffer_for(53, 1 << 20), 53);
+        assert_eq!(buffer_for(5 << 20, 1 << 20), 1 << 20);
     }
 }
