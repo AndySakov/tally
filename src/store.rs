@@ -195,12 +195,42 @@ impl<F: Fs> Store<F> {
     /// the directory fsync after the rename fails, as for any failed fsync.
     pub fn compact(&mut self) -> Result<(), Error> {
         let compact_path = self.dir.join(COMPACT_FILE_NAME);
-        let new = self.fs.open_or_create(&compact_path)?;
-        new.set_len(0)?;
+        let mut moved = Vec::with_capacity(self.index.len());
+        let copied = self
+            .copy_live(&compact_path, &mut moved)
+            .and_then(|copied| {
+                self.fs
+                    .rename(&compact_path, &self.dir.join(LOG_FILE_NAME))?;
+                Ok(copied)
+            });
+        let (new, written) = match copied {
+            Ok(copied) => copied,
+            Err(err) => {
+                self.restore_offsets(&moved);
+                return Err(err);
+            }
+        };
+        self.file = new;
+        self.end = written;
+        self.dead = 0;
+        self.fs
+            .sync_dir(&self.dir)
+            .expect("directory fsync failed after compaction; restart to recover from the log");
+        Ok(())
+    }
 
-        // One buffered pass from the first live record to the end, copying
-        // each record the index still points at. Reading the dead records in
-        // between costs less than two positioned reads per live one.
+    /// Writes each live record to a fresh `compact_path` and fsyncs it,
+    /// pointing its index entry at the new offset as it goes and pushing the
+    /// old offset to `moved`, so a failure can put them back. One buffered
+    /// pass from the first live record: reading the dead records in between
+    /// costs less than a positioned read per live one.
+    fn copy_live(
+        &mut self,
+        compact_path: &Path,
+        moved: &mut Vec<u64>,
+    ) -> Result<(F::File, u64), Error> {
+        let new = self.fs.open_or_create(compact_path)?;
+        new.set_len(0)?;
         let first = self
             .index
             .values()
@@ -208,7 +238,6 @@ impl<F: Fs> Store<F> {
             .min()
             .unwrap_or(self.end);
         let mut reader = BufReader::with_capacity(COMPACT_BUFFER, self.file.reader_at(first));
-        let mut index = Index::with_capacity_and_hasher(self.index.len(), Default::default());
         let mut header_buf = [0u8; HEADER_LEN];
         let mut payload_buf = Vec::new();
         let mut buffer = Vec::new();
@@ -220,19 +249,14 @@ impl<F: Fs> Store<F> {
             payload_buf.resize(header.payload_len(), 0);
             reader.read_exact(&mut payload_buf)?;
             let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
-            if let IndexOp::Set { key, value_len } = op
-                && self.index.get(key.as_bytes()).map(|e| e.offset) == Some(offset)
+            if let IndexOp::Set { key, .. } = op
+                && let Some(entry) = self.index.get_mut(key.as_bytes())
+                && entry.offset == offset
             {
-                let new_offset = written + buffer.len() as u64;
+                entry.offset = written + buffer.len() as u64;
+                moved.push(offset);
                 buffer.extend_from_slice(&header_buf);
                 buffer.extend_from_slice(&payload_buf);
-                index.insert(
-                    key.into_bytes(),
-                    Entry {
-                        offset: new_offset,
-                        value_len,
-                    },
-                );
                 if buffer.len() >= COMPACT_BUFFER {
                     new.write_all_at(&buffer, written)?;
                     written += buffer.len() as u64;
@@ -241,22 +265,30 @@ impl<F: Fs> Store<F> {
             }
             offset += header.record_len();
         }
-        assert_eq!(index.len(), self.index.len(), "every live key is copied");
+        assert_eq!(moved.len(), self.index.len(), "every live key is copied");
         drop(reader);
         new.write_all_at(&buffer, written)?;
         written += buffer.len() as u64;
         sync(&new);
+        Ok((new, written))
+    }
 
-        self.fs
-            .rename(&compact_path, &self.dir.join(LOG_FILE_NAME))?;
-        self.file = new;
-        self.end = written;
-        self.dead = 0;
-        self.index = index;
-        self.fs
-            .sync_dir(&self.dir)
-            .expect("directory fsync failed after compaction; restart to recover from the log");
-        Ok(())
+    /// Points the entries `copy_live` moved back at their records in the
+    /// old log, rereading each key from there. Each was read and checked
+    /// moments before, so a failure here panics: the old log is untouched,
+    /// and a restart rebuilds the index from it.
+    fn restore_offsets(&mut self, moved: &[u64]) {
+        for &offset in moved {
+            let (_, record) = load_record(&self.file, offset)
+                .expect("rereading a key after a failed compaction; restart to rebuild the index");
+            let Record::Set { key, .. } = record else {
+                unreachable!("only Set records are moved");
+            };
+            self.index
+                .get_mut(key.as_bytes())
+                .expect("a moved key is still live")
+                .offset = offset;
+        }
     }
 
     /// Compacts if automatic compaction is on and due. The caller's write
@@ -1258,6 +1290,29 @@ mod tests {
         assert_eq!(log_bytes(tmp.path()), before);
         store.set(key(b"c"), value(b"3")).unwrap();
         assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
+    }
+
+    #[test]
+    fn a_failed_compaction_points_every_key_back_at_the_old_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        write_log_at(tmp.path(), 49, b"X");
+
+        assert!(matches!(
+            store.compact(),
+            Err(Error::Corruption {
+                offset: 34,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
+        store.set(key(b"d"), value(b"4")).unwrap();
+        assert_eq!(store.get(&key(b"d")).unwrap(), Some(value(b"4")));
     }
 
     fn auto(dead_percent: u8, min_log_bytes: u64) -> Options {
