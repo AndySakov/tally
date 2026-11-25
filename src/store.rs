@@ -93,8 +93,21 @@ pub struct Store<F: Fs = OsFs> {
 
 type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
 
-/// Evidence that the caller holds `Store::writing`.
-type Writing<'a> = MutexGuard<'a, ()>;
+/// Holds `Store::writing`, and is the evidence that the caller does. A
+/// thread that panics holding it may have left the log half changed, so
+/// the store is poisoned.
+struct Writing<'a> {
+    _guard: MutexGuard<'a, ()>,
+    poisoned: &'a AtomicBool,
+}
+
+impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// A write a caller asked for: one record, or a batch.
 pub(crate) enum Write {
@@ -235,7 +248,7 @@ impl<F: Fs> Store<F> {
             commits: std::sync::atomic::AtomicU64::new(0),
         };
         {
-            let writing = hold(&store.writing);
+            let writing = store.writer();
             store.count_dead(&writing);
             store.compact_if_due(&writing);
         }
@@ -333,6 +346,13 @@ impl<F: Fs> Store<F> {
         }
     }
 
+    fn writer(&self) -> Writing<'_> {
+        Writing {
+            _guard: hold(&self.writing),
+            poisoned: &self.poisoned,
+        }
+    }
+
     fn writable(&self) -> Result<(), Error> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::Poisoned);
@@ -362,7 +382,7 @@ impl<F: Fs> Store<F> {
     /// than being copied. Reads go on while it runs; writes wait for it. A
     /// failed fsync of the log or the directory poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
-        let writing = hold(&self.writing);
+        let writing = self.writer();
         self.writable()?;
         let all: Vec<u64> = self
             .segments()
@@ -420,6 +440,7 @@ impl<F: Fs> Store<F> {
             }
         };
         if let Err(err) = output.file.sync() {
+            self.undo_copy(output, &hint_path);
             return Err(self.poison(err));
         }
         if let Err(err) = hint_file.sync() {
@@ -474,18 +495,20 @@ impl<F: Fs> Store<F> {
         Ok(())
     }
 
-    /// Throws away a compaction's copy: empties `output` and removes its
-    /// hint. Poisons the store if it can't, since the next write would land
-    /// after the copy's bytes.
+    /// Throws away a compaction's copy: removes its hint, then empties
+    /// `output`, each whether or not the other worked. Poisons the store if
+    /// either fails, since the next write would land after the copy's
+    /// bytes. The hint goes first: it must never vouch for bytes that may
+    /// not be on disk.
     fn undo_copy(&self, output: &Segment<F::File>, hint_path: &Path) {
-        let undone = output.file.set_len(0).and_then(|()| output.file.sync());
-        let undone = undone.and_then(|()| {
-            if remove_if_present(&self.fs, hint_path)? {
+        let hint_gone = remove_if_present(&self.fs, hint_path).and_then(|removed| {
+            if removed {
                 self.fs.sync_dir(&self.dir)?;
             }
             Ok(())
         });
-        if let Err(err) = undone {
+        let emptied = output.file.set_len(0).and_then(|()| output.file.sync());
+        if let Err(err) = hint_gone.and(emptied) {
             self.poison(err);
         }
     }
@@ -666,8 +689,8 @@ impl<F: Fs> Store<F> {
     /// Writes `buffer` at the end of the log in one write and fsyncs it,
     /// first starting a new segment if the active one is full, so a write
     /// never spans two segments. Returns where it landed. A failed write is
-    /// truncated away; a failed truncate, or a failed fsync, poisons the
-    /// store.
+    /// truncated away and the truncation fsynced; if that fails, or the
+    /// write's fsync does, the store is poisoned.
     fn append_bytes(&self, writing: &Writing, buffer: &[u8]) -> Result<u64, Error> {
         let full = self.active().len();
         if full > 0 && full >= self.segment_bytes {
@@ -676,7 +699,7 @@ impl<F: Fs> Store<F> {
         let active = self.active();
         let offset = active.end();
         if let Err(err) = active.write_all_at(buffer, offset) {
-            if let Err(truncate) = active.set_len(offset) {
+            if let Err(truncate) = active.set_len(offset).and_then(|()| active.sync()) {
                 self.poison(truncate);
             }
             return Err(err.into());
@@ -730,9 +753,9 @@ impl<F: Fs> Store<F> {
     }
 
     /// Queues `write` and waits until it is done. If no group is being
-    /// written, this thread leads: it takes the writes waiting, its own
-    /// first among them, writes them with one append and one fsync, and
-    /// wakes their threads.
+    /// written, this thread leads: it takes the oldest writes waiting,
+    /// writes them with one append and one fsync, and wakes their threads,
+    /// then leads again if its own write was not among them.
     fn submit(&self, write: Write) -> Result<(), Error> {
         self.writable()?;
         let mut queue = hold(&self.queue);
@@ -753,24 +776,44 @@ impl<F: Fs> Store<F> {
             queue.leading = true;
             let group = queue.take_group();
             drop(queue);
-            let mut leader = Leader {
+            let leader = Leader {
                 store: self,
                 tickets: group.iter().map(|&(ticket, _)| ticket).collect(),
                 results: None,
             };
             let writes: Vec<Write> = group.into_iter().map(|(_, write)| write).collect();
-            leader.results = Some(self.commit(&writes));
-            drop(leader);
+            self.commit_then(&writes, move |results| leader.finish(results));
             queue = hold(&self.queue);
         }
     }
 
-    /// Writes a group with one append and one fsync, then updates the index,
-    /// and returns each write's result in order.
+    /// Writes `writes` as one group and returns each one's result, in order,
+    /// then compacts if that is due.
+    #[cfg(test)]
     pub(crate) fn commit(&self, writes: &[Write]) -> Vec<Result<(), Error>> {
-        let writing = hold(&self.writing);
+        let mut out = None;
+        self.commit_then(writes, |results| out = Some(results));
+        out.expect("commit_then hands the results over")
+    }
+
+    /// Writes `writes` as one group, hands `done` each one's result in
+    /// order, then compacts if the group wrote something and that is due.
+    /// The results go out first: the writes are durable, and neither a slow
+    /// nor a failed compaction changes that.
+    fn commit_then(&self, writes: &[Write], done: impl FnOnce(Vec<Result<(), Error>>)) {
+        let writing = self.writer();
+        let (results, wrote) = self.write_group(&writing, writes);
+        done(results);
+        if wrote {
+            self.compact_if_due(&writing);
+        }
+    }
+
+    /// Writes a group with one append and one fsync, then updates the index.
+    /// Returns each write's result in order, and whether it wrote anything.
+    fn write_group(&self, writing: &Writing, writes: &[Write]) -> (Vec<Result<(), Error>>, bool) {
         if let Err(err) = self.writable() {
-            return each(err, writes.len());
+            return (each(err, writes.len()), false);
         }
         let mut live = HashMap::new();
         let mut buffer = Vec::new();
@@ -814,10 +857,11 @@ impl<F: Fs> Store<F> {
                 }
             }
         }
-        if !ops.is_empty() {
-            let start = match self.append_bytes(&writing, &buffer) {
+        let wrote = !ops.is_empty();
+        if wrote {
+            let start = match self.append_bytes(writing, &buffer) {
                 Ok(start) => start,
-                Err(err) => return each(err, writes.len()),
+                Err(err) => return (each(err, writes.len()), false),
             };
             let segments = self.segments();
             segments[segment_of(&segments, start)].add_dead(batch_headers);
@@ -825,8 +869,7 @@ impl<F: Fs> Store<F> {
                 self.indexed(&segments, op, start + at);
             }
         }
-        self.compact_if_due(&writing);
-        writes.iter().map(|_| Ok(())).collect()
+        (writes.iter().map(|_| Ok(())).collect(), wrote)
     }
 
     /// Updates the index and the dead bytes for a Set or Delete record now
@@ -919,7 +962,7 @@ impl<F: Fs> Store<F> {
     /// Fails with the first bad record's error, or `IndexMismatch` at the
     /// first offset where the log and the index disagree.
     pub fn verify(&self) -> Result<(), Error> {
-        let _writing = hold(&self.writing);
+        let _writing = self.writer();
         let mismatch = |offset| Error::Corruption {
             offset,
             reason: CorruptionReason::IndexMismatch,
@@ -972,6 +1015,12 @@ struct Leader<'a, F: Fs> {
     store: &'a Store<F>,
     tickets: Vec<u64>,
     results: Option<Vec<Result<(), Error>>>,
+}
+
+impl<F: Fs> Leader<'_, F> {
+    fn finish(mut self, results: Vec<Result<(), Error>>) {
+        self.results = Some(results);
+    }
 }
 
 impl<F: Fs> Drop for Leader<'_, F> {
@@ -2750,7 +2799,7 @@ mod tests {
     fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
         let tmp = tempfile::tempdir().unwrap();
         let store = one_record_per_segment(tmp.path());
-        store.clean(&hold(&store.writing), &[42]).unwrap();
+        store.clean(&store.writer(), &[42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [0, 21, 62, 83]);
         assert_eq!(
             fs::read(tmp.path().join(log_name(83))).unwrap(),
@@ -2768,7 +2817,7 @@ mod tests {
     fn cleaning_a_delete_with_every_older_segment_drops_it() {
         let tmp = tempfile::tempdir().unwrap();
         let store = one_record_per_segment(tmp.path());
-        store.clean(&hold(&store.writing), &[0, 21, 42]).unwrap();
+        store.clean(&store.writer(), &[0, 21, 42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [62, 83]);
         assert_eq!(
             fs::read(tmp.path().join(log_name(83))).unwrap(),
@@ -4089,7 +4138,7 @@ mod tests {
     fn writes_waiting_for_the_writer_share_one_fsync() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
-        let writing = hold(&store.writing);
+        let writing = store.writer();
         thread::scope(|scope| {
             for i in 0..8u8 {
                 let store = &store;
@@ -4264,6 +4313,11 @@ mod tests {
         assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
         drop(store);
 
+        assert_eq!(
+            fs.read(&Path::new("/db").join(hint_name(63))),
+            None,
+            "no hint vouches for copies whose fsync failed"
+        );
         let store = open_on(&fs, segmented(1));
         assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
         assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
@@ -4341,5 +4395,47 @@ mod tests {
         let store = Store::open_with(tmp.path(), segmented(256)).unwrap();
         assert_eq!(read(&store, &[b's', 7]), Some(vec![7, 7]));
         store.verify().unwrap();
+    }
+
+    #[test]
+    fn a_thread_that_panics_holding_the_writer_lock_poisons_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        put(&store, b"a", b"1");
+        let panicked = thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _writing = store.writer();
+                    panic!("halfway through changing the log");
+                })
+                .join()
+                .is_err()
+        });
+        assert!(panicked);
+        assert!(matches!(
+            store.set(key(b"b"), value(b"2")),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(store.compact(), Err(Error::Poisoned)));
+        assert_eq!(read(&store, b"a").as_deref(), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn a_group_that_writes_nothing_does_not_compact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        store.auto_failed.store(true, Ordering::Relaxed);
+        put(&store, b"a", b"1");
+        put(&store, b"a", b"2");
+        store.auto_failed.store(false, Ordering::Relaxed);
+        let results = store.commit(&[Write::One(delete_record(b"b"))]);
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            log_bytes(tmp.path()).len(),
+            42,
+            "half dead and not compacted"
+        );
+        store.commit(&[Write::One(set_record(b"a", b"3"))]);
+        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
     }
 }
