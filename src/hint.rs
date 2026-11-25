@@ -37,6 +37,9 @@ const FLUSH_AT: usize = 1 << 20;
 pub(crate) struct Trailer {
     pub count: u64,
     pub log_len: u64,
+    /// The most Set entries the file is big enough to hold, to size an
+    /// index by before `count` is checked.
+    pub most_sets: u64,
 }
 
 /// Where a valid hint's entries end, so more can be written after them.
@@ -140,6 +143,7 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     Ok(Trailer {
         count: u64::from_le_bytes(buf[..8].try_into().unwrap()),
         log_len: u64::from_le_bytes(buf[8..].try_into().unwrap()),
+        most_sets: (size - PREFIX_LEN - TRAILER_LEN) / (FIELDS_LEN as u64 + 1),
     })
 }
 
@@ -527,6 +531,15 @@ mod tests {
             read(&write(&[set(b"a", 2)], 21)),
             Err(Invalid("entries run past the log length"))
         );
+    }
+
+    #[test]
+    fn the_trailer_bounds_the_count_by_the_file_size() {
+        let fs = MemFs::new();
+        let path = Path::new("/h");
+        fs.put(path, &write(&[set(b"a", 2), set(b"bc", 1)], 64));
+        let file = fs.open_existing(path).unwrap();
+        assert_eq!(trailer(&file).unwrap().most_sets, 2);
     }
 
     #[test]
