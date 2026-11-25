@@ -438,10 +438,11 @@ fn a_power_cut_while_moving_to_segments_loses_nothing() {
             let context = format!("cut before step {step} {cut:?}");
             let after = MemFs::after(&snapshot, cut);
             let legacy_log = after.read(&dir.join(LOG_FILE_NAME));
-            let segment = after.read(&dir.join(log_name(0)));
             assert!(
-                legacy_log.as_deref() == Some(&log[..]) || segment.as_deref() == Some(&log[..]),
-                "{context}: the records are in neither place"
+                legacy_log.as_deref() == Some(&log[..])
+                    || legacy_log.as_deref() == Some(&crate::store::marker()[..])
+                        && after.read(&dir.join(log_name(0))).as_deref() == Some(&log[..]),
+                "{context}: an earlier version would not find the records, or would not be refused"
             );
             let store = Store::open_in(after.clone(), dir, Options::default()).unwrap();
             assert_eq!(read_state(&store), expected, "{context}");
