@@ -75,24 +75,6 @@ pub trait LogFile: sealed::Sealed {
 
     /// Takes an exclusive lock, released when the file is dropped.
     fn try_lock(&self) -> Result<(), TryLockError>;
-
-    /// The file's first `len` bytes mapped into memory, or `None` where
-    /// they can't be. The file must not be written to or truncated while
-    /// the map lives.
-    #[doc(hidden)]
-    fn map(&self, _len: u64) -> Option<Map> {
-        None
-    }
-}
-
-/// The first bytes of a file, mapped read-only.
-#[doc(hidden)]
-pub struct Map(memmap2::Mmap);
-
-impl Map {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.0
-    }
 }
 
 /// The operating system's file system.
@@ -201,21 +183,6 @@ impl LogFile for OsFile {
 
     fn try_lock(&self) -> Result<(), TryLockError> {
         self.0.try_lock()
-    }
-
-    fn map(&self, len: u64) -> Option<Map> {
-        if len == 0 {
-            return None;
-        }
-        let len = usize::try_from(len).ok()?;
-        // SAFETY: a map is undefined behaviour if the file changes under
-        // it. tally maps only sealed segments, which it never writes to or
-        // truncates while a `Store` holds them; `repair`, which truncates
-        // them, takes the same lock as `open`. Another process changing the
-        // file anyway is outside what tally can guard against, as for any
-        // file in its directory.
-        let map = unsafe { memmap2::MmapOptions::new().len(len).map(&self.0) };
-        map.ok().map(Map)
     }
 }
 

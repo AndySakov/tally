@@ -239,10 +239,6 @@ impl<F: Fs> Store<F> {
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let index = load(&fs, dir, &mut segments)?;
-        let sealed = segments.len() - 1;
-        for segment in &segments[..sealed] {
-            segment.seal();
-        }
         let store = Store {
             fs,
             dir: dir.to_path_buf(),
@@ -697,7 +693,6 @@ impl<F: Fs> Store<F> {
             // tell about this failure.
             return Err(self.poison(err));
         }
-        active.seal();
         let mut next = segments.to_vec();
         next.push(Arc::new(Segment::new(base, file, 0)));
         self.replace_segments(writing, next);
@@ -3324,39 +3319,8 @@ mod tests {
         store.compact().unwrap();
     }
 
-    fn mapped(store: &Store) -> Vec<(u64, bool)> {
-        store
-            .segments()
-            .iter()
-            .map(|s| (s.base, s.is_mapped()))
-            .collect()
-    }
-
     #[test]
-    fn every_segment_but_the_active_one_is_mapped() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = one_record_per_segment(tmp.path());
-        assert_eq!(
-            mapped(&store),
-            [(0, true), (21, true), (42, true), (62, false)]
-        );
-        put(&store, b"d", b"4");
-        assert_eq!(mapped(&store)[3..], [(62, true), (83, false)]);
-        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
-        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
-        drop(store);
-
-        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        assert_eq!(
-            mapped(&store),
-            [(0, true), (21, true), (42, true), (62, true), (83, false)]
-        );
-        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
-        assert_eq!(read(&store, b"a"), None);
-    }
-
-    #[test]
-    fn a_value_damaged_in_a_mapped_segment_fails_its_checksum() {
+    fn a_value_damaged_in_a_sealed_segment_fails_its_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
@@ -3370,7 +3334,6 @@ mod tests {
         drop(file);
 
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        assert_eq!(mapped(&store), [(43, true), (86, false)]);
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
