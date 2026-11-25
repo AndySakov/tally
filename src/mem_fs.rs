@@ -2,11 +2,14 @@
 //!
 //! Each file keeps what reads see now apart from what was synced, plus the
 //! changes made since the last sync. Directory entries likewise exist now,
-//! and become durable only when their directory is synced. A power cut
-//! keeps the durable entries, and for each file its synced contents plus a
-//! prefix of the pending changes, the last one possibly torn: cut short, or
-//! left as zeros because the file's new size reached the disk before its
-//! data did.
+//! and are durable once their directory is synced. A power cut keeps, for
+//! each file, its synced contents plus a prefix of the pending changes, the
+//! last one possibly torn: cut short, or left as zeros because the file's
+//! new size reached the disk before its data did. It keeps the durable
+//! entries plus any of the changes to entries made since (a create, remove
+//! or rename, each landing whole), in any combination that keeps the
+//! changes to each name in order. Directories themselves are created
+//! durable only by a sync of their parent.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
@@ -37,6 +40,15 @@ struct Inode {
     pending: Vec<Change>,
 }
 
+/// Names a create, remove or rename sets, to a file or to nothing. They land
+/// together or not at all.
+#[derive(Debug, Clone)]
+struct EntryChange(Vec<(PathBuf, Option<usize>)>);
+
+/// Above this many unsynced entry changes, `cuts` would try too many
+/// combinations to be worth running.
+const MOST_ENTRY_CHANGES: usize = 12;
+
 /// The whole disk at one moment.
 #[derive(Debug, Clone)]
 pub(crate) struct Disk {
@@ -44,16 +56,21 @@ pub(crate) struct Disk {
     files: BTreeMap<PathBuf, usize>,
     durable_dirs: BTreeSet<PathBuf>,
     durable_files: BTreeMap<PathBuf, usize>,
+    /// Changes to `files` since `durable_files`, oldest first.
+    entry_changes: Vec<EntryChange>,
     inodes: Vec<Inode>,
 }
 
-/// What a power cut keeps of each file's pending changes.
+/// What a power cut keeps of each file's pending changes, and of the
+/// directories'.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Cut {
     /// How many pending changes land whole.
     pub keep: usize,
     /// What lands of the next one, if it is a write.
     pub torn: Torn,
+    /// Bit `i` set: the `i`th unsynced entry change lands.
+    pub entries: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -71,14 +88,47 @@ impl Disk {
             files: BTreeMap::new(),
             durable_dirs: root,
             durable_files: BTreeMap::new(),
+            entry_changes: Vec::new(),
             inodes: Vec::new(),
         }
     }
 
+    /// Each set of unsynced entry changes that can land: any, as long as no
+    /// change lands after one to the same name that didn't.
+    fn entry_landings(&self) -> Vec<u16> {
+        let changes = &self.entry_changes;
+        assert!(
+            changes.len() <= MOST_ENTRY_CHANGES,
+            "{} unsynced entry changes",
+            changes.len()
+        );
+        let shares_a_name = |a: &EntryChange, b: &EntryChange| {
+            a.0.iter().any(|(p, _)| b.0.iter().any(|(q, _)| p == q))
+        };
+        (0..1u16 << changes.len())
+            .filter(|mask| {
+                (0..changes.len()).all(|i| {
+                    mask & (1 << i) != 0
+                        || (i + 1..changes.len()).all(|j| {
+                            mask & (1 << j) == 0 || !shares_a_name(&changes[i], &changes[j])
+                        })
+                })
+            })
+            .collect()
+    }
+
     /// Every cut worth trying on this disk: each number of whole changes,
     /// and for a following write, landing short, half, almost whole, or as
-    /// zeros.
+    /// zeros; each with every set of entry changes that can land.
     pub(crate) fn cuts(&self) -> Vec<Cut> {
+        let landings = self.entry_landings();
+        self.file_cuts()
+            .into_iter()
+            .flat_map(|cut| landings.iter().map(move |&entries| Cut { entries, ..cut }))
+            .collect()
+    }
+
+    fn file_cuts(&self) -> Vec<Cut> {
         let most = self
             .inodes
             .iter()
@@ -90,6 +140,7 @@ impl Disk {
             cuts.push(Cut {
                 keep,
                 torn: Torn::Nothing,
+                entries: 0,
             });
             let next_write = self
                 .inodes
@@ -104,12 +155,14 @@ impl Disk {
                         cuts.push(Cut {
                             keep,
                             torn: Torn::Bytes(n),
+                            entries: 0,
                         });
                     }
                 }
                 cuts.push(Cut {
                     keep,
                     torn: Torn::Zeros(len),
+                    entries: 0,
                 });
             }
         }
@@ -162,17 +215,25 @@ impl Disk {
             .filter(|d| reachable(d))
             .cloned()
             .collect();
-        let files: BTreeMap<PathBuf, usize> = self
-            .durable_files
-            .iter()
-            .filter(|(p, _)| reachable(p))
-            .map(|(p, &ino)| (p.clone(), ino))
-            .collect();
+        let mut landed = self.durable_files.clone();
+        for (i, change) in self.entry_changes.iter().enumerate() {
+            if cut.entries & (1 << i) != 0 {
+                for (path, entry) in &change.0 {
+                    match entry {
+                        Some(ino) => landed.insert(path.clone(), *ino),
+                        None => landed.remove(path),
+                    };
+                }
+            }
+        }
+        let files: BTreeMap<PathBuf, usize> =
+            landed.into_iter().filter(|(p, _)| reachable(p)).collect();
         Disk {
             durable_dirs: dirs.clone(),
             durable_files: files.clone(),
             dirs,
             files,
+            entry_changes: Vec::new(),
             inodes,
         }
     }
@@ -320,6 +381,8 @@ impl Fs for MemFs {
         disk.inodes.push(Inode::default());
         let ino = disk.inodes.len() - 1;
         disk.files.insert(path.to_path_buf(), ino);
+        disk.entry_changes
+            .push(EntryChange(vec![(path.to_path_buf(), Some(ino))]));
         drop(state);
         Ok(self.file(ino))
     }
@@ -339,20 +402,24 @@ impl Fs for MemFs {
         self.step();
         let mut state = self.0.borrow_mut();
         let disk = &mut state.disk;
+        assert_eq!(from.parent(), to.parent(), "renames stay in one directory");
         let ino = disk.files.remove(from).ok_or(ErrorKind::NotFound)?;
         disk.files.insert(to.to_path_buf(), ino);
+        disk.entry_changes.push(EntryChange(vec![
+            (from.to_path_buf(), None),
+            (to.to_path_buf(), Some(ino)),
+        ]));
         Ok(())
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.step();
         let mut state = self.0.borrow_mut();
-        state
-            .disk
-            .files
-            .remove(path)
-            .map(|_| ())
-            .ok_or(ErrorKind::NotFound.into())
+        let disk = &mut state.disk;
+        disk.files.remove(path).ok_or(ErrorKind::NotFound)?;
+        disk.entry_changes
+            .push(EntryChange(vec![(path.to_path_buf(), None)]));
+        Ok(())
     }
 
     fn list(&self, path: &Path) -> io::Result<Vec<String>> {
@@ -385,6 +452,8 @@ impl Fs for MemFs {
                 .filter(|(p, _)| in_dir(p))
                 .map(|(p, &ino)| (p.clone(), ino)),
         );
+        disk.entry_changes
+            .retain(|change| !change.0.iter().all(|(p, _)| in_dir(p)));
         Ok(())
     }
 }
