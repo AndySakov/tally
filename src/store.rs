@@ -703,7 +703,8 @@ impl<F: Fs> Store<F> {
 }
 
 /// Whether `side` holds a prefix of `file`'s bytes from `offset` to `len`,
-/// as a repair that crashed partway through copying them leaves it.
+/// as a repair that crashed partway through copying them leaves it: each
+/// byte is the one it copies, or zero where that write never landed.
 fn starts_tail(
     side: &impl LogFile,
     file: &impl LogFile,
@@ -726,7 +727,11 @@ fn starts_tail(
             Err(err) => return Err(err),
         };
         theirs.read_exact(&mut b[..n])?;
-        if a[..n] != b[..n] {
+        if a[..n]
+            .iter()
+            .zip(&b[..n])
+            .any(|(&ours, &theirs)| ours != 0 && ours != theirs)
+        {
             return Ok(false);
         }
     }
@@ -879,17 +884,16 @@ fn migrate<F: Fs>(fs: &F, dir: &Path) -> Result<bool, Error> {
     if names.iter().any(|n| n == LOG_FILE_NAME) {
         let file = fs.open_existing(&legacy)?;
         let size = file.size()?;
+        // Shorter than any record: the marker, or a write of it that a
+        // power cut tore or left as zeros.
         if size <= HEADER_LEN as u64 {
             let mut bytes = vec![0u8; size as usize];
             file.read_exact_at(&mut bytes, 0)?;
             if bytes[..] == marker[..] {
                 return Ok(false);
             }
-            // A torn marker, or an empty log with nothing to move.
-            if bytes[..] == marker[..bytes.len()] {
-                write_marker(fs, &legacy, &marker)?;
-                return Ok(true);
-            }
+            write_marker(fs, &legacy, &marker)?;
+            return Ok(true);
         }
         if names.iter().any(|n| parse_log_name(n).is_some()) {
             return Err(Error::Io(io::Error::other(
@@ -1544,7 +1548,14 @@ mod tests {
     #[test]
     fn repair_rewrites_a_side_file_a_crashed_repair_left() {
         let bytes = log_with_a_corrupt_middle();
-        for left in [&bytes[18..18], &bytes[18..25], &bytes[18..]] {
+        let zeroed_middle = [&bytes[18..20], &[0; 5], &bytes[25..30]].concat();
+        for left in [
+            &bytes[18..18],
+            &bytes[18..25],
+            &bytes[18..],
+            &[0; 33],
+            &zeroed_middle,
+        ] {
             let tmp = store_with_log(&bytes);
             fs::write(side_file(tmp.path(), 18), left).unwrap();
             assert_eq!(
@@ -2316,10 +2327,10 @@ mod tests {
     }
 
     #[test]
-    fn a_torn_marker_is_written_again() {
+    fn a_torn_or_zeroed_marker_is_written_again() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        for torn in [&marker()[..7], &[]] {
+        for torn in [&marker()[..7], &[], &[0; HEADER_LEN]] {
             fs::write(tmp.path().join(LOG_FILE_NAME), torn).unwrap();
             let store = Store::open(tmp.path()).unwrap();
             assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
