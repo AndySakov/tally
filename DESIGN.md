@@ -1,6 +1,6 @@
 # tally design
 
-A single-node, crash-safe, log-structured key-value store. Version 1 is an embedded library plus a small CLI.
+A single-node, crash-safe, log-structured key-value store. Version 1 is an embedded library.
 
 ## Scope (v1)
 
@@ -93,7 +93,7 @@ The log is split into segment files, each named for the log offset of its first 
 - Writes go to the last segment. Before a write, if that segment holds at least `Options::segment_bytes` (default 256 MiB), a new one is created at the end of the log and the directory fsynced, so its name is durable before any acknowledged write lands in it. A write is one append, so a batch never spans two segments; a segment can exceed `segment_bytes` by one write, and a compaction's output by any amount.
 - Only the newest segment can have a torn tail: every other was complete and fsynced before the next was written. In any other segment, a tail `open` would truncate is `CutShort` corruption instead, for `repair`.
 - Segments must not overlap: a segment that starts before the previous one ends fails `open` with `SegmentsOverlap`. Nothing tally does can produce one; it means files were copied in from elsewhere.
-- Every segment stays open for the life of the `Store`, one file descriptor each. At 256 MiB that is 4 per GiB of log; macOS's default limit of 256 per process is reached around 60 GiB.
+- Every segment stays open for the life of the `Store`, one file descriptor each. At 256 MiB that is 4 per GiB of log: the default soft limit of 256 per process on macOS is reached around 60 GiB, and Linux's 1,024 around 250 GiB. Past that, `open` or the write that starts a segment fails with the OS's "too many open files"; raise `ulimit -n` or `segment_bytes`. A cache of open files would lift the limit but give every read path a handle to open and evict behind `&self`; RocksDB's default (`max_open_files = -1`) makes the same trade of keeping everything open.
 
 ### From one file to segments
 
