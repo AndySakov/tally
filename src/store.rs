@@ -142,12 +142,17 @@ impl<F: Fs> Store<F> {
                 file,
                 len: 0,
                 dead: 0,
+                map: None,
             });
         }
         sync(&segments.last().expect("one was just made").file);
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let index = load(&fs, dir, &mut segments)?;
+        let sealed = segments.len() - 1;
+        for segment in &mut segments[..sealed] {
+            segment.seal();
+        }
         let mut store = Store {
             fs,
             dir: dir.to_path_buf(),
@@ -477,11 +482,16 @@ impl<F: Fs> Store<F> {
         let base = self.end();
         let file = self.fs.open_or_create(&self.dir.join(log_name(base)))?;
         self.fs.sync_dir(&self.dir)?;
+        self.segments
+            .last_mut()
+            .expect("there is always a segment")
+            .seal();
         self.segments.push(Segment {
             base,
             file,
             len: 0,
             dead: 0,
+            map: None,
         });
         Ok(())
     }
@@ -873,6 +883,7 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
             file,
             len,
             dead: 0,
+            map: None,
         });
     }
     Ok(segments)
@@ -2701,6 +2712,63 @@ mod tests {
         store.compact().unwrap();
     }
 
+    fn mapped(store: &Store) -> Vec<(u64, bool)> {
+        store
+            .segments
+            .iter()
+            .map(|s| (s.base, s.map.is_some()))
+            .collect()
+    }
+
+    #[test]
+    fn every_segment_but_the_active_one_is_mapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = one_record_per_segment(tmp.path());
+        assert_eq!(
+            mapped(&store),
+            [(0, true), (17, true), (34, true), (50, false)]
+        );
+        put(&mut store, b"d", b"4");
+        assert_eq!(mapped(&store)[3..], [(50, true), (67, false)]);
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+        drop(store);
+
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(
+            mapped(&store),
+            [(0, true), (17, true), (34, true), (50, true), (67, false)]
+        );
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(read(&store, b"a"), None);
+    }
+
+    #[test]
+    fn a_value_damaged_in_a_mapped_segment_fails_its_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        compacted_a_and_b(tmp.path());
+        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&mut store, b"c", b"3");
+        drop(store);
+        let file = OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join(log_name(35)))
+            .unwrap();
+        file.write_all_at(b"X", 16).unwrap();
+        drop(file);
+
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        assert_eq!(mapped(&store), [(35, true), (70, false)]);
+        assert!(matches!(
+            store.get(&key(b"a")),
+            Err(Error::Corruption {
+                offset: 35,
+                reason: CorruptionReason::PayloadChecksum
+            })
+        ));
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
     #[test]
     fn open_after_compact_reads_keys_from_the_hint_not_the_log() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2750,6 +2818,7 @@ mod tests {
             file: fs.open_existing(&tmp.path().join(log_name(base))).unwrap(),
             len: log_bytes(tmp.path()).len() as u64,
             dead: 0,
+            map: None,
         };
         let mut one = Index::new();
         let len_one = read_hint(&file, &segment, &mut one, HINT_SIZES, u64::MAX).unwrap();
