@@ -153,6 +153,7 @@ entry: key_len u16 | value_len u32 | key
 - Offsets are not stored. A compacted log holds exactly the live records end to end, so each offset is the sum of the record lengths before it, and the sum of them all must equal `log_len`. That doubles as a check that the hint and the log agree.
 - The count and log length trail the entries because files are only written at the end and neither is known until compaction finishes. `open` reads the trailer first, with one positioned read, to size the index for `count` keys, never more than the log could hold (`log_len / 17`, the shortest record), since the count is unchecked until every entry is read.
 - The checksum covers every byte before it. Entries go into the index as they are read; if anything fails, that index is thrown away.
+- `open` reads the hint on one thread, checking every entry's lengths, and gathers checked entries into 16 MiB windows cut into chunks of 8,192 entries, recording where each chunk starts in the log. Each window's chunks are then hashed and inserted by up to 8 threads (the calling thread is one), into the sharded index (see Index), while I/O stays on the calling thread. Hints under 100,000 entries are read on one thread. Splitting needs no change to the format, because the walk that checks lengths also finds where entries start; the cost of not storing chunk offsets is the one sequential pass, which was already there.
 
 On `open`, a hint is used only if its magic, version and checksum hold, every key and value length is in range, the entries add up to `count` distinct keys and exactly `log_len` bytes, and the log is at least `log_len` long. Records after `log_len` are then read as usual. A hint that fails any check is logged, removed and the directory fsynced, and the whole log is read. The removal must be durable: a hint rejected because the log is shorter than it says would look valid again once new writes grew the log past `log_len`.
 
@@ -160,7 +161,7 @@ On `open`, a hint is used only if its magic, version and checksum hold, every ke
 
 The cost is that `open` no longer checks the checksums of records the hint covers. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan. This is the Bitcask trade.
 
-At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB: the extra 29 MB is the window and per-thread buffers. The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
 
 ### When it runs
 
@@ -192,10 +193,13 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 
 - No allocation per key, and 32 bytes per slot whatever the key's length. At 10M keys of 16 bytes, building the index alone went from 78 to 58 ns per key and from 681 to 528 MB, and `open` from the hint from 718 to 557 MB at peak. The saving grows with key length.
 - The keyed hash also restores HashDoS resistance, which foldhash (the hasher before) did not claim: without the key, no one can choose keys that land in the same slot. That was a prerequisite for keys arriving over the network.
-- The cost is a missing-key `get`, which now hashes 128 bits: 4.8 ns before, 10.9 ns now. A hit is dominated by the read and checksum, 1.26 µs.
+- The cost is a missing-key `get`, which now hashes 128 bits: 4.8 ns before, 10.9 ns after. A hit is dominated by the read and checksum, 1.26 µs.
 - Two keys with the same 128-bit hash would share one entry: a `set` of the second would silently replace the first. The chance is about n²/2¹²⁹, 2 × 10⁻²⁴ at 40M live keys, and no one can aim for it without the random key. `get` checks the key stored in the record, so a collision shows up as `KeyMismatch`, never as another key's value; a test with a deliberately weak hash (a key's length) checks that.
 - `key_len` lets `open` count dead bytes without the keys.
-- `open` pre-sizes from the hint's count. Without a hint it grows the map as it reads, and peaks higher because old and new tables coexist during each resize: 1.11 GB against 557 MB for 10M keys of 16 bytes.
+- The map is 64 maps (shards), chosen by the top 6 bits of the hash. Each shard's map places entries by the low bits, so the shard must come from bits it doesn't use: taking the low bits would give every entry in a shard the same low 6 bits and leave 63 of every 64 home slots empty. No test can see that, as any consistent choice is correct; it would only be slow.
+- Shards let `open` insert from several threads at once (`Index::fill`): each thread holds up to 256 entries per shard and then takes that shard's lock, so locks are taken once per 256 entries. Which thread's entry wins for a key two threads both insert is not defined, so `fill` is only for keys no two jobs share, as a hint's are (a hint that repeats a key is rejected by its count).
+- Growing the map now moves one shard at a time, so the old and new tables that coexist during a resize are 1/64 of the index. A full scan of 10M records without a hint peaked at 841 to 931 MB, against 0.98 to 1.11 GB with one map, in the same time. A missing-key `get` went from 12.1 to 13.1 ns.
+- `open` pre-sizes from the hint's count, a 64th per shard. Without a hint it grows the map as it reads.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction, and counts as dead bytes.
 
 ### Verify
@@ -267,3 +271,4 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 - Group commit across concurrent writers (sharing one fsync between callers, as `write` does within a batch), once there are any.
 - Background compaction, once the TCP server brings concurrency.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
+- A parallel full scan, for logs without a hint. Records must apply in log order, so threads would have to resolve each key to its last record by offset, with deletes in the mix; compaction writes a hint, so this only matters before the first one.
