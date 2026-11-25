@@ -836,8 +836,11 @@ fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
 /// before segments into the first one, putting the marker in `tally.log`,
 /// and removing hints whose segment is gone. Fails if two segments overlap.
 fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
-    let mut changed = migrate(fs, dir)?;
-    let names = fs.list(dir)?;
+    let mut names = fs.list(dir)?;
+    let mut changed = migrate(fs, dir, &names)?;
+    if changed {
+        names = fs.list(dir)?;
+    }
     let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
     bases.sort_unstable();
     for base in names.iter().filter_map(|n| parse_hint_name(n)) {
@@ -876,8 +879,7 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
 /// changed anything the directory must make durable. Fails if `tally.log`
 /// holds records while segments exist: an earlier version wrote them after
 /// the log was split, and they can't be put in order.
-fn migrate<F: Fs>(fs: &F, dir: &Path) -> Result<bool, Error> {
-    let names = fs.list(dir)?;
+fn migrate<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<bool, Error> {
     let legacy = dir.join(LOG_FILE_NAME);
     let marker = marker();
     if names.iter().any(|n| n == LOG_FILE_NAME) {
