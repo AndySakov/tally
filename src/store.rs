@@ -3421,6 +3421,90 @@ mod tests {
         store.verify().unwrap();
     }
 
+    fn open_on(fs: &MemFs, options: Options) -> Store<MemFs> {
+        Store::open_in(fs.clone(), Path::new("/db"), options).unwrap()
+    }
+
+    fn get_on(store: &Store<MemFs>, k: &[u8]) -> Option<Vec<u8>> {
+        store.get(&key(k)).unwrap().map(|v| v.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_hint_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
+        let fs = MemFs::new();
+        let mut store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        drop(store);
+        let hint = Path::new("/db").join(hint_name(0));
+
+        fs.limit_free_space(Some(10));
+        let store = open_on(&fs, segmented(1));
+        assert_eq!(fs.read(&hint).unwrap(), b"TLYH\x02\x11\x01\x00\x01\x00");
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+        drop(store);
+
+        fs.limit_free_space(None);
+        let store = open_on(&fs, segmented(1));
+        assert_eq!(
+            fs.read(&hint).unwrap(),
+            hint_bytes(
+                &[&[0x11, 1, 0, 1, 0, 0, 0, b'a']],
+                1,
+                21,
+                0xeba4_83e6_d395_4202
+            )
+        );
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_hint_extension_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
+        let fs = MemFs::new();
+        let mut store = open_on(&fs, segmented(50));
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.compact().unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        store.set(key(b"d"), value(b"4")).unwrap();
+        drop(store);
+        let hint = Path::new("/db").join(hint_name(43));
+        let compacted = fs.read(&hint).unwrap();
+        assert_eq!(compacted.len(), 5 + 16 + 24);
+
+        // Cutting the old trailer frees 24 bytes; the new entry and trailer
+        // need 32.
+        fs.limit_free_space(Some(0));
+        let store = open_on(&fs, segmented(50));
+        let cut = fs.read(&hint).unwrap();
+        assert_eq!(cut.len(), 5 + 16 + 24);
+        assert_eq!(cut[..21], compacted[..21]);
+        assert_eq!(cut[21..29], [0x11, 1, 0, 1, 0, 0, 0, b'c']);
+        assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+        drop(store);
+
+        fs.limit_free_space(None);
+        let store = open_on(&fs, segmented(50));
+        assert_eq!(
+            fs.read(&hint).unwrap(),
+            hint_bytes(
+                &[
+                    &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x11, 1, 0, 1, 0, 0, 0, b'c'],
+                ],
+                3,
+                64,
+                0x4390_d75d_52fc_839d
+            )
+        );
+        for (k, v) in [(b"a", &b"hi"[..]), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
+            assert_eq!(get_on(&store, k).as_deref(), Some(v));
+        }
+    }
+
     #[test]
     fn open_succeeds_when_it_cannot_write_a_hint() {
         use std::os::unix::fs::PermissionsExt;

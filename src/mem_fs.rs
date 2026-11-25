@@ -11,6 +11,10 @@
 //! changes to each name in order. Directories themselves are created
 //! durable only by a sync of their parent.
 //!
+//! `limit_free_space` makes the disk fill up: a write that doesn't fit
+//! lands what does and fails with `StorageFull`, as a full disk does, and
+//! truncating a file frees what it cut.
+//!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
 //! carries on unaffected, so one run yields a snapshot at any point.
@@ -265,6 +269,8 @@ struct State {
     steps: u64,
     cut_before: Option<u64>,
     snapshot: Option<Disk>,
+    /// Bytes writes can still add, or `None` for no limit.
+    free: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -287,6 +293,7 @@ impl MemFs {
             steps: 0,
             cut_before: None,
             snapshot: None,
+            free: None,
         })))
     }
 
@@ -313,6 +320,29 @@ impl MemFs {
         let state = self.0.borrow();
         let ino = *state.disk.files.get(path)?;
         Some(state.disk.inodes[ino].data.clone())
+    }
+
+    /// From now on, writes can add only `bytes` more, or any amount for
+    /// `None`.
+    pub(crate) fn limit_free_space(&self, bytes: Option<u64>) {
+        self.0.borrow_mut().free = bytes;
+    }
+
+    /// How much of a `len`-byte write fits, taking that space.
+    fn take_space(&self, len: usize) -> usize {
+        let mut state = self.0.borrow_mut();
+        let Some(free) = &mut state.free else {
+            return len;
+        };
+        let fits = len.min(usize::try_from(*free).unwrap_or(usize::MAX));
+        *free -= fits as u64;
+        fits
+    }
+
+    fn free_space(&self, bytes: u64) {
+        if let Some(free) = &mut self.0.borrow_mut().free {
+            *free += bytes;
+        }
     }
 
     pub(crate) fn cut_before(&self, step: u64) {
@@ -511,6 +541,7 @@ impl LogFile for MemFile {
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.fs.step();
+        let fits = self.fs.take_space(buf.len());
         self.fs.with_inode(self.ino, |inode| {
             assert_eq!(
                 offset,
@@ -519,16 +550,23 @@ impl LogFile for MemFile {
             );
             let change = Change::Write {
                 offset,
-                bytes: buf.to_vec(),
+                bytes: buf[..fits].to_vec(),
             };
             apply(&mut inode.data, &change);
             inode.pending.push(change);
         });
+        if fits < buf.len() {
+            return Err(ErrorKind::StorageFull.into());
+        }
         Ok(())
     }
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.fs.step();
+        let cut = self.fs.with_inode(self.ino, |inode| {
+            (inode.data.len() as u64).saturating_sub(len)
+        });
+        self.fs.free_space(cut);
         self.fs.with_inode(self.ino, |inode| {
             let change = Change::SetLen(len);
             apply(&mut inode.data, &change);
@@ -568,5 +606,33 @@ impl Read for MemReader<'_> {
         });
         self.offset += n as u64;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_write_that_does_not_fit_lands_what_does() {
+        let fs = MemFs::new();
+        let path = Path::new("/f");
+        let file = fs.open_or_create(path).unwrap();
+        fs.limit_free_space(Some(5));
+        file.write_all_at(b"abc", 0).unwrap();
+        let err = file.write_all_at(b"defg", 3).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::StorageFull);
+        assert_eq!(fs.read(path).unwrap(), b"abcde");
+
+        file.set_len(2).unwrap();
+        file.write_all_at(b"xyz", 2).unwrap();
+        assert_eq!(fs.read(path).unwrap(), b"abxyz");
+        let err = file.write_all_at(b"!", 5).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::StorageFull);
+        assert_eq!(fs.read(path).unwrap(), b"abxyz");
+
+        fs.limit_free_space(None);
+        file.write_all_at(b"!", 5).unwrap();
+        assert_eq!(fs.read(path).unwrap(), b"abxyz!");
     }
 }
