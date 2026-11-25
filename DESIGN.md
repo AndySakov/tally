@@ -1,6 +1,6 @@
 # tally design
 
-A single-node, crash-safe, log-structured key-value store. Version 1 is an embedded library plus a small CLI.
+A single-node, crash-safe, log-structured key-value store. Version 1 is an embedded library.
 
 ## Scope (v1)
 
@@ -93,7 +93,7 @@ The log is split into segment files, each named for the log offset of its first 
 - Writes go to the last segment. Before a write, if that segment holds at least `Options::segment_bytes` (default 256 MiB), a new one is created at the end of the log and the directory fsynced, so its name is durable before any acknowledged write lands in it. A write is one append, so a batch never spans two segments; a segment can exceed `segment_bytes` by one write, and a compaction's output by any amount.
 - Only the newest segment can have a torn tail: every other was complete and fsynced before the next was written. In any other segment, a tail `open` would truncate is `CutShort` corruption instead, for `repair`.
 - Segments must not overlap: a segment that starts before the previous one ends fails `open` with `SegmentsOverlap`. Nothing tally does can produce one; it means files were copied in from elsewhere.
-- Every segment stays open for the life of the `Store`, one file descriptor each. At 256 MiB that is 4 per GiB of log; macOS's default limit of 256 per process is reached around 60 GiB.
+- Every segment stays open for the life of the `Store`, one file descriptor each. At 256 MiB that is 4 per GiB of log: the default soft limit of 256 per process on macOS is reached around 60 GiB, and Linux's 1,024 around 250 GiB. Past that, `open` or the write that starts a segment fails with the OS's "too many open files"; raise `ulimit -n` or `segment_bytes`. A cache of open files would lift the limit but give every read path a handle to open and evict behind `&self`; RocksDB's default (`max_open_files = -1`) makes the same trade of keeping everything open.
 
 ### From one file to segments
 
@@ -272,7 +272,7 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 - **Model test** (`tests/model.rs`): random sequences of set, get, delete, batch and reopen against a `HashMap`, with 100-byte segments, checking every read after every step. Half the cases run with automatic compaction at 50% dead and no floor, so it cleans some segments and keeps others, and check the log is at least as long as the live records; the rest check the log is exactly as long as the writes. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
 - **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
 - **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records and batches, then damaged), `ops` (the model test, coverage-guided, on the in-memory disk, where it runs about 4 times faster than on files; the input chooses whether automatic compaction runs), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
-- **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `set` next to a bare append + `sync_all` baseline, `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
+- **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `set` next to a bare append + `sync_all` baseline and with overwrites of 1,000 keys under the default automatic compaction (which fails if the log outgrows twice its live size, so compaction must have run), `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
 

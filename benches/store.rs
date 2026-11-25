@@ -98,7 +98,38 @@ fn set(c: &mut Criterion) {
             file.sync_all().unwrap();
         })
     });
+
+    // Overwrites keep half the log dead, so the default trigger compacts
+    // every 1,000 writes and its pauses land in the measurement.
+    const KEYS: u64 = 1000;
+    let churn = tempfile::tempdir().unwrap();
+    let mut store = Store::open(churn.path()).unwrap();
+    let mut writes = 0;
+    group.bench_function("1KiB value, overwriting 1,000 keys", |b| {
+        b.iter_batched(
+            || {
+                writes += 1;
+                (key(writes % KEYS), value(VALUE_LEN))
+            },
+            |(k, v)| store.set(k, v).unwrap(),
+            BatchSize::SmallInput,
+        )
+    });
     group.finish();
+    let log_len: u64 = fs::read_dir(churn.path())
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
+        })
+        .map(|e| e.metadata().unwrap().len())
+        .sum();
+    assert!(
+        log_len <= 2 * KEYS * record.len() as u64,
+        "{writes} overwrites left a {log_len}-byte log: compaction never ran"
+    );
 }
 
 fn get(c: &mut Criterion) {
