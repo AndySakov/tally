@@ -308,9 +308,6 @@ impl<F: Fs> Store<F> {
             .last_mut()
             .expect("there is always a segment")
             .len = written;
-        self.fs
-            .sync_dir(&self.dir)
-            .expect("directory fsync failed after compaction; restart to recover from the log");
         for segment in &mut self.segments {
             if chosen.contains(&segment.base) {
                 segment.dead = segment.len;
