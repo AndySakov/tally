@@ -15,6 +15,8 @@
 //! disk just before step `n` runs, as if power failed there, and the run
 //! carries on unaffected, so one run yields a snapshot at any point.
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::TryLockError;
@@ -266,11 +268,11 @@ struct State {
 }
 
 #[derive(Clone)]
-pub(crate) struct MemFs(Rc<RefCell<State>>);
+pub struct MemFs(Rc<RefCell<State>>);
 
 impl MemFs {
     /// An empty disk holding only the root directory `/`.
-    pub(crate) fn new() -> MemFs {
+    pub fn new() -> MemFs {
         MemFs::on(Disk::new())
     }
 
@@ -307,7 +309,7 @@ impl MemFs {
     }
 
     /// The current contents of `path`, if it exists.
-    pub(crate) fn read(&self, path: &Path) -> Option<Vec<u8>> {
+    pub fn read(&self, path: &Path) -> Option<Vec<u8>> {
         let state = self.0.borrow();
         let ino = *state.disk.files.get(path)?;
         Some(state.disk.inodes[ino].data.clone())
@@ -456,7 +458,7 @@ impl Fs for MemFs {
     }
 }
 
-pub(crate) struct MemFile {
+pub struct MemFile {
     fs: MemFs,
     ino: usize,
 }

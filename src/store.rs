@@ -3,7 +3,8 @@ use std::fs::TryLockError;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::thread;
+use std::sync::mpsc;
+use std::{mem, thread};
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
@@ -368,7 +369,10 @@ impl<F: Fs> Store<F> {
         let mut written = 0u64;
         let mut expected = 0usize;
         for input in inputs.iter().filter(|s| chosen.contains(&s.base)) {
-            let mut reader = BufReader::with_capacity(COMPACT_BUFFER, input.reader_at(input.base));
+            let mut reader = BufReader::with_capacity(
+                hint::buffer_for(input.len, COMPACT_BUFFER),
+                input.reader_at(input.base),
+            );
             let mut offset = input.base;
             while offset < input.end() {
                 reader.read_exact(&mut header_buf)?;
@@ -837,8 +841,11 @@ fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
 /// before segments into the first one, putting the marker in `tally.log`,
 /// and removing hints whose segment is gone. Fails if two segments overlap.
 fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
-    let mut changed = migrate(fs, dir)?;
-    let names = fs.list(dir)?;
+    let mut names = fs.list(dir)?;
+    let mut changed = migrate(fs, dir, &names)?;
+    if changed {
+        names = fs.list(dir)?;
+    }
     let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
     bases.sort_unstable();
     for base in names.iter().filter_map(|n| parse_hint_name(n)) {
@@ -877,8 +884,7 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
 /// changed anything the directory must make durable. Fails if `tally.log`
 /// holds records while segments exist: an earlier version wrote them after
 /// the log was split, and they can't be put in order.
-fn migrate<F: Fs>(fs: &F, dir: &Path) -> Result<bool, Error> {
-    let names = fs.list(dir)?;
+fn migrate<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<bool, Error> {
     let legacy = dir.join(LOG_FILE_NAME);
     let marker = marker();
     if names.iter().any(|n| n == LOG_FILE_NAME) {
@@ -1050,14 +1056,84 @@ fn read_hint<L: LogFile>(
     Ok(base + trailer.log_len)
 }
 
+/// Scans of fewer bytes than this apply each record as it is read, on one
+/// thread.
+const PARALLEL_SCAN_FROM: u64 = 16 << 20;
+/// Records a parallel scan reads before applying them.
+const SCAN_WINDOW: usize = 1 << 16;
+const SCAN_BUFFER: usize = 1 << 20;
+
 /// Applies the records from `start` to `len` to `index`. Returns where the
 /// valid records end: `len`, or the start of a torn or zero-filled tail. A
 /// batch is applied only once all of it has been read and checked; a torn
 /// one is a torn tail from its start, and an error inside one is reported
-/// at its start, so `repair` moves the whole batch.
+/// at its start, so `repair` moves the whole batch. From
+/// `PARALLEL_SCAN_FROM` bytes, the index takes the records a window at a
+/// time on up to `MAX_THREADS` threads.
 fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<u64, Error> {
+    let threads = if len - start < PARALLEL_SCAN_FROM {
+        1
+    } else {
+        thread::available_parallelism()
+            .map_or(1, NonZero::get)
+            .min(MAX_THREADS)
+    };
+    scan_on(file, index, start, len, threads)
+}
+
+/// On more than one thread, this one reads while another applies what it
+/// read, a window at a time, on `threads` more.
+fn scan_on(
+    file: &impl LogFile,
+    index: &mut Index,
+    start: u64,
+    len: u64,
+    threads: usize,
+) -> Result<u64, Error> {
+    if threads == 1 {
+        return scan_into(file, start, len, &mut |offset, op| apply(index, offset, op));
+    }
+    let (send, receive) = mpsc::sync_channel::<Window>(1);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            for window in receive {
+                window.apply_to(index, threads);
+            }
+        });
+        let mut window = Window::default();
+        let sent = |window| {
+            send.send(window)
+                .expect("the applier runs until the sender is dropped")
+        };
+        let end = scan_into(file, start, len, &mut |offset, op| {
+            window.push(offset, op);
+            if window.changes.len() == SCAN_WINDOW {
+                sent(mem::take(&mut window));
+            }
+        });
+        if end.is_ok() {
+            sent(window);
+        }
+        // The applier stops once the channel closes, and the scope waits
+        // for it.
+        drop(send);
+        end
+    })
+}
+
+/// Calls `sink` with each record from `start` to `len` that is to be
+/// applied, in order, with its offset.
+fn scan_into(
+    file: &impl LogFile,
+    start: u64,
+    len: u64,
+    sink: &mut impl FnMut(u64, IndexOp),
+) -> Result<u64, Error> {
     let mut reader = Reader {
-        inner: BufReader::new(file.reader_at(start)),
+        inner: BufReader::with_capacity(
+            hint::buffer_for(len - start, SCAN_BUFFER),
+            file.reader_at(start),
+        ),
         header_buf: [0u8; HEADER_LEN],
         payload_buf: Vec::new(),
     };
@@ -1068,7 +1144,7 @@ fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<
             return Ok(offset);
         };
         let IndexOp::Batch { body_len } = op else {
-            apply(index, offset, op);
+            sink(offset, op);
             offset += record_len;
             continue;
         };
@@ -1093,11 +1169,53 @@ fn scan(file: &impl LogFile, index: &mut Index, start: u64, len: u64) -> Result<
             at += len_here;
         }
         for (at, op) in batch.drain(..) {
-            apply(index, at, op);
+            sink(at, op);
         }
         offset = body_end;
     }
     Ok(offset)
+}
+
+/// Records a scan has read and not yet applied, with their keys' bytes end
+/// to end in `keys`, and where each key ends.
+#[derive(Default)]
+struct Window {
+    keys: Vec<u8>,
+    changes: Vec<(usize, Option<Entry>)>,
+}
+
+impl Window {
+    fn push(&mut self, offset: u64, op: IndexOp) {
+        let (key, entry) = match op {
+            IndexOp::Set { key, value_len } => {
+                let key_len = entry_key_len(&key);
+                let entry = Entry {
+                    offset,
+                    value_len,
+                    key_len,
+                };
+                (key, Some(entry))
+            }
+            IndexOp::Delete { key } => (key, None),
+            IndexOp::Batch { .. } => unreachable!("scan handles batches"),
+        };
+        self.keys.extend_from_slice(key.as_bytes());
+        self.changes.push((self.keys.len(), entry));
+    }
+
+    fn apply_to(self, index: &mut Index, threads: usize) {
+        let mut start = 0;
+        let changes: Vec<(&[u8], Option<Entry>)> = self
+            .changes
+            .iter()
+            .map(|&(end, entry)| {
+                let key = &self.keys[start..end];
+                start = end;
+                (key, entry)
+            })
+            .collect();
+        index.apply_in_order(threads, &changes);
+    }
 }
 
 fn apply(index: &mut Index, offset: u64, op: IndexOp) {
@@ -1214,6 +1332,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::mem_fs::MemFs;
     use crate::record::tests::{DELETE_A, SET_A_HI};
     use crate::record::{Record, encode};
     use crate::{CorruptionReason, Error, UnsupportedReason};
@@ -2618,6 +2737,91 @@ mod tests {
         }
         let store = Store::open(tmp.path()).unwrap();
         store.verify().unwrap();
+    }
+
+    /// 150,000 records, three windows: sets, overwrites, deletes and
+    /// batches, then a torn tail. Returns the log and the offset of a Set
+    /// in the third window.
+    fn log_of_many_windows() -> (Vec<u8>, u64) {
+        let k = |i: u32| key(format!("k{}", i % 40_000).as_bytes());
+        let mut log = Vec::new();
+        let mut set_at = 0;
+        for i in 0..150_000u32 {
+            if i == 140_001 {
+                set_at = log.len() as u64;
+            }
+            if i % 7 == 3 {
+                encode(&Record::Delete { key: k(i) }, &mut log);
+            } else if i % 1000 == 0 {
+                let mut body = Vec::new();
+                encode(
+                    &Record::Set {
+                        key: k(i),
+                        value: value(b"batched"),
+                    },
+                    &mut body,
+                );
+                encode(&Record::Delete { key: k(i + 1) }, &mut body);
+                encode(
+                    &Record::Batch {
+                        body_len: body.len() as u64,
+                    },
+                    &mut log,
+                );
+                log.extend_from_slice(&body);
+            } else {
+                encode(
+                    &Record::Set {
+                        key: k(i),
+                        value: value(&i.to_le_bytes()),
+                    },
+                    &mut log,
+                );
+            }
+        }
+        log.extend_from_slice(&SET_A_HI[..9]);
+        (log, set_at)
+    }
+
+    #[test]
+    fn a_scan_on_many_threads_builds_the_index_one_thread_would() {
+        let (log, _) = log_of_many_windows();
+        let fs = MemFs::new();
+        fs.put(Path::new("/log"), &log);
+        let file = fs.open_existing(Path::new("/log")).unwrap();
+        let len = log.len() as u64;
+
+        let mut one = Index::new();
+        let mut many = Index::new();
+        assert_eq!(scan_on(&file, &mut one, 0, len, 1).unwrap(), len - 9);
+        assert_eq!(scan_on(&file, &mut many, 0, len, 4).unwrap(), len - 9);
+        assert_eq!(many.len(), one.len());
+        assert_eq!(many.len(), 34_285);
+        for i in 0..40_000u32 {
+            let k = format!("k{i}");
+            assert_eq!(many.get(k.as_bytes()), one.get(k.as_bytes()), "{k}");
+        }
+    }
+
+    #[test]
+    fn a_scan_on_many_threads_reports_corruption_where_one_thread_would() {
+        let (mut log, set_at) = log_of_many_windows();
+        log[set_at as usize + HEADER_LEN] ^= 1;
+        let fs = MemFs::new();
+        fs.put(Path::new("/log"), &log);
+        let file = fs.open_existing(Path::new("/log")).unwrap();
+        for threads in [1, 4] {
+            assert!(
+                matches!(
+                    scan_on(&file, &mut Index::new(), 0, log.len() as u64, threads),
+                    Err(Error::Corruption {
+                        offset,
+                        reason: CorruptionReason::PayloadChecksum,
+                    }) if offset == set_at
+                ),
+                "{threads} threads"
+            );
+        }
     }
 
     #[test]
