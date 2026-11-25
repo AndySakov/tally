@@ -108,6 +108,11 @@ pub enum Error {
     /// are not the start of what `repair` would move: an earlier repair at
     /// the same offset saved them, and the log no longer has them.
     SideFileExists(std::path::PathBuf),
+    /// An fsync of the log failed, or a truncate after a failed write did,
+    /// so what the disk holds is unknown. Every write fails with this until
+    /// the store is reopened, which reads what the disk does hold. Reads
+    /// still work.
+    Poisoned,
 }
 
 impl Display for Error {
@@ -127,6 +132,10 @@ impl Display for Error {
                 offset, reason
             ),
             Error::Locked => write!(f, "store is already open elsewhere"),
+            Error::Poisoned => write!(
+                f,
+                "an earlier write could not be made durable; reopen the store to write again"
+            ),
             Error::SideFileExists(path) => write!(
                 f,
                 "{} already holds bytes from an earlier repair; move it aside and rerun repair",
@@ -309,6 +318,10 @@ mod tests {
     #[test]
     fn locked_message() {
         assert_eq!(Error::Locked.to_string(), "store is already open elsewhere");
+        assert_eq!(
+            Error::Poisoned.to_string(),
+            "an earlier write could not be made durable; reopen the store to write again"
+        );
         assert_eq!(
             Error::SideFileExists("/db/tally.log.corrupt-18".into()).to_string(),
             "/db/tally.log.corrupt-18 already holds bytes from an earlier repair; \

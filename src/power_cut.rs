@@ -13,7 +13,7 @@ use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::record::{Record, encode};
 use crate::segment::{hint_name, log_name};
-use crate::store::LOG_FILE_NAME;
+use crate::store::{LOG_FILE_NAME, Write};
 use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
@@ -37,6 +37,9 @@ enum Op {
     Compact,
     /// Sets (`Some`) and deletes (`None`), as one batch.
     Batch(Vec<(u8, Option<Vec<u8>>)>),
+    /// Sets, deletes and batches written as one group, as writes from
+    /// several threads at once are (DESIGN.md, Group commit).
+    Group(Vec<Op>),
 }
 
 fn key(k: u8) -> Key {
@@ -66,6 +69,13 @@ fn workload() -> Vec<Op> {
         Compact,
         Compact,
         Set(4, vec![b'y'; 40]),
+        Group(vec![
+            Set(5, b"g5".to_vec()),
+            Delete(4),
+            Delete(0),
+            Batch(vec![(6, Some(b"g6".to_vec())), (5, None)]),
+            Set(4, b"g4".to_vec()),
+        ]),
         Batch(vec![(6, None), (4, Some(b"four".to_vec())), (2, None)]),
     ]
 }
@@ -86,7 +96,31 @@ fn apply(state: &mut State, op: &Op) {
                 };
             }
         }
+        Op::Group(ops) => {
+            for op in ops {
+                apply(state, op);
+            }
+        }
         Op::Reopen | Op::Compact => {}
+    }
+}
+
+fn record(k: u8, v: &Option<Vec<u8>>) -> Record {
+    match v {
+        Some(v) => Record::Set {
+            key: key(k),
+            value: Value::try_from(&v[..]).unwrap(),
+        },
+        None => Record::Delete { key: key(k) },
+    }
+}
+
+fn group_write(op: &Op) -> Write {
+    match op {
+        Op::Set(k, v) => Write::One(record(*k, &Some(v.clone()))),
+        Op::Delete(k) => Write::One(record(*k, &None)),
+        Op::Batch(ops) => Write::Batch(ops.iter().map(|(k, v)| record(*k, v)).collect()),
+        _ => unreachable!("a group holds only writes"),
     }
 }
 
@@ -103,16 +137,19 @@ fn read_state(store: &Store<MemFs>) -> State {
 
 /// Runs the workload with power cut before `step`. Returns the disk at the
 /// cut and the states it may hold: every operation finished before the cut,
-/// with the one in progress either applied or not. One past the last step
+/// with the one in progress either applied or not, or for a group, any
+/// number of its writes applied from the first. One past the last step
 /// is a cut after the workload finished. `None` beyond that.
 fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let fs = MemFs::new();
     fs.cut_before(step);
     let dir = Path::new(DIR);
     // states[i] is the state after the first i operations, the open counting
-    // as the first; ends[i] is the step count once operation i has finished.
+    // as the first; ends[i] is the step count once operation i has finished;
+    // partial[i] are the states operation i may leave partway through.
     let mut states = vec![State::new()];
     let mut ends = vec![0];
+    let mut partial = vec![Vec::new(), Vec::new()];
 
     let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
     states.push(State::new());
@@ -139,7 +176,22 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
                 }
                 store.write(batch).unwrap();
             }
+            Op::Group(ops) => {
+                let writes: Vec<Write> = ops.iter().map(group_write).collect();
+                for result in store.commit(&writes) {
+                    result.unwrap();
+                }
+            }
         }
+        let mut prefixes = Vec::new();
+        if let Op::Group(ops) = &op {
+            let mut prefix = state.clone();
+            for op in &ops[..ops.len() - 1] {
+                apply(&mut prefix, op);
+                prefixes.push(prefix.clone());
+            }
+        }
+        partial.push(prefixes);
         apply(&mut state, &op);
         states.push(state.clone());
         ends.push(fs.steps());
@@ -151,8 +203,10 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let snapshot = fs.snapshot()?;
     let in_flight = ends.iter().position(|&end| end >= step).unwrap();
     let mut candidates = vec![states[in_flight - 1].clone()];
-    if states[in_flight] != candidates[0] {
-        candidates.push(states[in_flight].clone());
+    for state in partial[in_flight].iter().chain([&states[in_flight]]) {
+        if !candidates.contains(state) {
+            candidates.push(state.clone());
+        }
     }
     Some((snapshot, candidates))
 }
@@ -186,7 +240,7 @@ fn check_recovery(
     }
 
     let fs = MemFs::after(snapshot, cut);
-    let mut store = Store::open_in(fs.clone(), dir, options())
+    let store = Store::open_in(fs.clone(), dir, options())
         .unwrap_or_else(|err| panic!("{context}: open after the cut failed: {err}"));
     let observed = read_state(&store);
     assert!(
@@ -321,7 +375,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
 fn what_open_reads_survives_a_power_cut() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, options()).unwrap();
     store
         .set(key(1), Value::try_from(&b"synced"[..]).unwrap())
         .unwrap();
@@ -363,7 +417,7 @@ fn what_open_reads_survives_a_power_cut() {
 fn a_removed_hint_stays_removed_after_a_power_cut() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
         .unwrap();
@@ -380,7 +434,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
     let fs = MemFs::new();
     fs.put(&dir.join(log_name(0)), &log[..23]);
     fs.put(&dir.join(hint_name(0)), &hint);
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(3), Value::try_from(&b"3"[..]).unwrap())
         .unwrap();
@@ -406,7 +460,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
 fn a_power_cut_while_moving_to_segments_loses_nothing() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
         .unwrap();

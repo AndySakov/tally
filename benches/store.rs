@@ -6,7 +6,9 @@ use std::fs::{self, OpenOptions};
 use std::hint::black_box;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use tally::{Batch, Key, Options, Store, Value};
@@ -73,7 +75,7 @@ fn set(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut store = Store::open(tmp.path()).unwrap();
+    let store = Store::open(tmp.path()).unwrap();
     let mut i = 0;
     group.bench_function("1KiB value", |b| {
         b.iter_batched(
@@ -105,7 +107,7 @@ fn set(c: &mut Criterion) {
     // every 1,000 writes and its pauses land in the measurement.
     const KEYS: u64 = 1000;
     let churn = tempfile::tempdir().unwrap();
-    let mut store = Store::open(churn.path()).unwrap();
+    let store = Store::open(churn.path()).unwrap();
     let mut writes = 0;
     group.bench_function("1KiB value, overwriting 1,000 keys", |b| {
         b.iter_batched(
@@ -132,6 +134,44 @@ fn set(c: &mut Criterion) {
         log_len <= 2 * KEYS * record.len() as u64,
         "{writes} overwrites left a {log_len}-byte log: compaction never ran"
     );
+}
+
+/// Sets from many threads at once share fsyncs (DESIGN.md, Group commit):
+/// time per set, across all threads.
+fn concurrent_set(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent set");
+    group
+        .throughput(Throughput::Elements(1))
+        .sample_size(samples(10))
+        .measurement_time(Duration::from_secs(10));
+    for threads in [1u64, 4, 16, 64] {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let next = AtomicU64::new(0);
+        group.bench_with_input(
+            BenchmarkId::new("1KiB value, threads", threads),
+            &threads,
+            |b, &threads| {
+                b.iter_custom(|iters| {
+                    let start = Instant::now();
+                    thread::scope(|scope| {
+                        for t in 0..threads {
+                            let (store, next) = (&store, &next);
+                            let share = iters / threads + u64::from(t < iters % threads);
+                            scope.spawn(move || {
+                                for _ in 0..share {
+                                    let i = next.fetch_add(1, Ordering::Relaxed);
+                                    store.set(key(i), value(VALUE_LEN)).unwrap();
+                                }
+                            });
+                        }
+                    });
+                    start.elapsed()
+                })
+            },
+        );
+    }
+    group.finish();
 }
 
 fn get(c: &mut Criterion) {
@@ -207,7 +247,7 @@ fn compact(c: &mut Criterion) {
     for n in [10_000u64, 100_000] {
         let tmp = tempfile::tempdir().unwrap();
         write_fixture(tmp.path(), n, 100);
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(
             BenchmarkId::new("live records, 100B values", n),
@@ -225,7 +265,7 @@ fn write(c: &mut Criterion) {
         .sample_size(samples(20))
         .measurement_time(Duration::from_secs(10));
     let tmp = tempfile::tempdir().unwrap();
-    let mut store = Store::open(tmp.path()).unwrap();
+    let store = Store::open(tmp.path()).unwrap();
     let mut i = 0;
     for size in [10u64, 100, 1000] {
         group.throughput(Throughput::Elements(size));
@@ -251,5 +291,5 @@ fn write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, set, write, get, open, compact);
+criterion_group!(benches, set, concurrent_set, write, get, open, compact);
 criterion_main!(benches);

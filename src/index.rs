@@ -7,13 +7,16 @@
 //! an entry. `get` checks the key stored in the record, so that would show
 //! up as a corruption error, never as another key's value.
 //!
-//! The map is split into 64 shards by the top bits of the hash, so
-//! `apply_in_order` can insert from several threads at once, and
-//! growing the map moves one shard at a time instead of the whole index.
+//! The map is split into 64 shards by the top bits of the hash, each behind
+//! its own lock, so threads reading and writing different keys rarely wait
+//! for each other, `apply_in_order` can insert from several threads at
+//! once, and growing the map moves one shard at a time instead of the whole
+//! index.
 
 use std::collections::HashMap;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread;
 
 use siphasher::sip128::SipHasher13;
@@ -42,7 +45,7 @@ const SHARDS: usize = 1 << SHARD_BITS;
 type Map = HashMap<u128, Entry, BuildHasherDefault<LowBits>>;
 
 pub(crate) struct Index {
-    shards: Vec<Map>,
+    shards: Vec<RwLock<Map>>,
     hasher: KeyHasher,
 }
 
@@ -81,7 +84,12 @@ impl Index {
         let per_shard = capacity.div_ceil(SHARDS);
         Index {
             shards: (0..SHARDS)
-                .map(|_| HashMap::with_capacity_and_hasher(per_shard, Default::default()))
+                .map(|_| {
+                    RwLock::new(HashMap::with_capacity_and_hasher(
+                        per_shard,
+                        Default::default(),
+                    ))
+                })
                 .collect(),
             hasher: KeyHasher::Sip(SipHasher13::new_with_keys(
                 seed.hash_one(0u8),
@@ -93,19 +101,28 @@ impl Index {
     #[cfg(test)]
     pub(crate) fn weak() -> Index {
         Index {
-            shards: (0..SHARDS).map(|_| Map::default()).collect(),
+            shards: (0..SHARDS).map(|_| RwLock::default()).collect(),
             hasher: KeyHasher::Weak,
         }
     }
 
-    pub(crate) fn get(&self, key: &[u8]) -> Option<&Entry> {
-        let hash = self.hasher.hash(key);
-        self.shards[shard_of(hash)].get(&hash)
+    /// A panic while a shard is locked can't leave its map half changed,
+    /// so a poisoned lock is used as it is.
+    fn read(&self, hash: u128) -> RwLockReadGuard<'_, Map> {
+        self.shards[shard_of(hash)]
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub(crate) fn get_mut(&mut self, key: &[u8]) -> Option<&mut Entry> {
+    fn write(&self, hash: u128) -> RwLockWriteGuard<'_, Map> {
+        self.shards[shard_of(hash)]
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn get(&self, key: &[u8]) -> Option<Entry> {
         let hash = self.hasher.hash(key);
-        self.shards[shard_of(hash)].get_mut(&hash)
+        self.read(hash).get(&hash).copied()
     }
 
     pub(crate) fn contains(&self, key: &[u8]) -> bool {
@@ -113,27 +130,50 @@ impl Index {
     }
 
     /// Points `key` at `entry`, returning the entry it replaced.
-    pub(crate) fn insert(&mut self, key: &[u8], entry: Entry) -> Option<Entry> {
+    pub(crate) fn insert(&self, key: &[u8], entry: Entry) -> Option<Entry> {
         let hash = self.hasher.hash(key);
-        self.shards[shard_of(hash)].insert(hash, entry)
+        self.write(hash).insert(hash, entry)
     }
 
-    pub(crate) fn remove(&mut self, key: &[u8]) -> Option<Entry> {
+    pub(crate) fn remove(&self, key: &[u8]) -> Option<Entry> {
         let hash = self.hasher.hash(key);
-        self.shards[shard_of(hash)].remove(&hash)
+        self.write(hash).remove(&hash)
+    }
+
+    /// Points `key` at `entry` if it still points at `offset`. Returns
+    /// whether it did.
+    pub(crate) fn replace(&self, key: &[u8], offset: u64, entry: Entry) -> bool {
+        let hash = self.hasher.hash(key);
+        match self.write(hash).get_mut(&hash) {
+            Some(old) if old.offset == offset => {
+                *old = entry;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.shards.iter().map(Map::len).sum()
+        (0..SHARDS).map(|shard| self.shard(shard).len()).sum()
     }
 
-    pub(crate) fn values(&self) -> impl Iterator<Item = &Entry> {
-        self.shards.iter().flat_map(Map::values)
+    /// Calls `f` with every entry, a shard at a time, each shard as it is
+    /// when it is read.
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&Entry)) {
+        for shard in 0..SHARDS {
+            self.shard(shard).values().for_each(&mut f);
+        }
+    }
+
+    fn shard(&self, shard: usize) -> RwLockReadGuard<'_, Map> {
+        self.shards[shard]
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
-        self.shards.iter().map(Map::capacity).sum()
+        (0..SHARDS).map(|shard| self.shard(shard).capacity()).sum()
     }
 
     /// Applies `changes` in order, an insert for `Some` and a remove for
@@ -143,6 +183,10 @@ impl Index {
     /// shard, so each key's changes still apply in order.
     pub(crate) fn apply_in_order(&mut self, threads: usize, changes: &[(&[u8], Option<Entry>)]) {
         let Index { shards, hasher } = self;
+        let mut shards: Vec<&mut Map> = shards
+            .iter_mut()
+            .map(|shard| shard.get_mut().unwrap_or_else(PoisonError::into_inner))
+            .collect();
         let apply = |map: &mut Map, hash: u128, change: &Option<Entry>| match change {
             Some(entry) => {
                 map.insert(hash, *entry);
@@ -154,7 +198,7 @@ impl Index {
         if threads <= 1 {
             for (key, change) in changes {
                 let hash = hasher.hash(key);
-                apply(&mut shards[shard_of(hash)], hash, change);
+                apply(shards[shard_of(hash)], hash, change);
             }
             return;
         }
@@ -174,7 +218,7 @@ impl Index {
             }
         });
         let mut owned: Vec<Vec<&mut Map>> = (0..threads).map(|_| Vec::new()).collect();
-        for (shard, map) in shards.iter_mut().enumerate() {
+        for (shard, map) in shards.into_iter().enumerate() {
             owned[shard % threads].push(map);
         }
         let hashes = &hashes;
@@ -226,12 +270,12 @@ mod tests {
 
     #[test]
     fn keys_map_to_their_own_entries() {
-        let mut index = Index::new();
+        let index = Index::new();
         assert_eq!(index.insert(b"a", entry(0)), None);
         assert_eq!(index.insert(b"b", entry(17)), None);
         assert_eq!(index.insert(b"a", entry(34)), Some(entry(0)));
-        assert_eq!(index.get(b"a"), Some(&entry(34)));
-        assert_eq!(index.get(b"b"), Some(&entry(17)));
+        assert_eq!(index.get(b"a"), Some(entry(34)));
+        assert_eq!(index.get(b"b"), Some(entry(17)));
         assert_eq!(index.get(b"c"), None);
         assert_eq!(index.remove(b"b"), Some(entry(17)));
         assert!(!index.contains(b"b"));
@@ -271,12 +315,12 @@ mod tests {
 
             assert_eq!(index.len(), 3_751, "{threads} threads");
             assert_eq!(index.get(b"older"), None);
-            assert_eq!(index.get(b"kept"), Some(&entry(4)));
-            assert_eq!(index.get(&keys[0]), Some(&entry(10_000)));
-            assert_eq!(index.get(&keys[1]), Some(&entry(1)));
+            assert_eq!(index.get(b"kept"), Some(entry(4)));
+            assert_eq!(index.get(&keys[0]), Some(entry(10_000)));
+            assert_eq!(index.get(&keys[1]), Some(entry(1)));
             assert_eq!(index.get(&keys[2]), None);
-            assert_eq!(index.get(&keys[4]), Some(&entry(10_004)));
-            assert_eq!(index.get(&keys[4_999]), Some(&entry(4_999)));
+            assert_eq!(index.get(&keys[4]), Some(entry(10_004)));
+            assert_eq!(index.get(&keys[4_999]), Some(entry(4_999)));
         }
     }
 

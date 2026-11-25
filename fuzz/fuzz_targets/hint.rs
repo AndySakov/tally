@@ -40,7 +40,7 @@ fn key(k: u8) -> Key {
     Key::try_from(&[k][..]).unwrap()
 }
 
-fn apply(store: &mut Store, state: &mut HashMap<u8, Vec<u8>>, ops: Vec<Op>) {
+fn apply(store: &Store, state: &mut HashMap<u8, Vec<u8>>, ops: Vec<Op>) {
     for op in ops {
         match op {
             Op::Set { key: k, value } => {
@@ -61,10 +61,10 @@ fn apply(store: &mut Store, state: &mut HashMap<u8, Vec<u8>>, ops: Vec<Op>) {
 fuzz_target!(|input: Input| {
     let dir = tempfile::tempdir().unwrap();
     let mut state = HashMap::new();
-    let mut store = Store::open(dir.path()).unwrap();
-    apply(&mut store, &mut state, input.before);
+    let store = Store::open(dir.path()).unwrap();
+    apply(&store, &mut state, input.before);
     store.compact().unwrap();
-    apply(&mut store, &mut state, input.after);
+    apply(&store, &mut state, input.after);
     drop(store);
 
     // Compaction leaves one segment with a hint, unless there was nothing
