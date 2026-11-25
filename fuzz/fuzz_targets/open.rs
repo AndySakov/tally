@@ -129,7 +129,12 @@ fuzz_target!(|input: Input| {
                 }
                 let body_len = (log.len() - frame.1) as u64;
                 let mut sealed = Vec::new();
-                encode(&Record::Batch { body_len }, Place::Top, start as u64, &mut sealed);
+                encode(
+                    &Record::Batch { body_len },
+                    Place::Top,
+                    start as u64,
+                    &mut sealed,
+                );
                 log[start..frame.1].copy_from_slice(&sealed);
                 records
             }
