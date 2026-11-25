@@ -5,7 +5,7 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 ## Scope (v1)
 
 - API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `compact()`.
-- `open` takes a directory. It holds `tally.log` (the data), `tally.lock` and, during compaction, `tally.log.compact`.
+- `open` takes a directory. It holds `tally.log` (the data), `tally.lock`, `tally.hint` after a compaction, and, during one, `tally.log.compact` and `tally.hint.compact`.
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
 - Keys and values are non-empty byte strings.
 - One process, one thread. `open` takes an exclusive lock (`flock`) on `tally.lock`, a separate file because compaction replaces `tally.log` and a lock on the old file would not cover the new one. A second `open` fails with `Locked` until the first `Store` is dropped or its process exits.
@@ -78,7 +78,7 @@ If the append fails partway (disk full, I/O error), `set` or `delete` truncates 
 
 ## Recovery (startup)
 
-State: `pos = 0`, `len = file length`. Loop:
+If `tally.hint` is usable (see Hint file), the index starts from it and `pos` from the log length it covers. Otherwise the index starts empty. State: `pos` as above (0 without a hint), `len = file length`. Loop:
 
 1. `pos == len`: clean end, stop.
 2. Fewer than 15 bytes remain: torn header. Truncate at `pos`.
@@ -113,13 +113,36 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 
 `compact()` rewrites the log with only the latest record of each live key:
 
-1. Open `tally.log.compact` and truncate it, discarding anything a crashed compaction left.
-2. Read the log in one buffered pass from the first live record to the end, checking every record's checksums, and copy the bytes of each record the index still points at. Each copied record's index entry is pointed at its new offset as it is copied, and its old offset is kept, 8 bytes per live key, so a failure can point them back. Compaction never holds a second index: at 10M live keys that took peak memory from 1.84 GB to 1.38 GB. A corrupt record, live or dead, stops compaction with its offset; nothing on disk has changed yet. One sequential pass beats two positioned reads per live record even counting the dead bytes it reads past: 30 ms against 183 ms for 100k live records.
-3. `fsync` the new file.
-4. Rename it over `tally.log`. The store now reads and appends to the new file.
-5. `fsync` the directory. A failure here panics, as for any failed fsync: the rename may not be durable, and writes after it go to the new file.
+1. Open `tally.log.compact` and `tally.hint.compact` and truncate both, discarding anything a crashed compaction left.
+2. Read the log in one buffered pass from the first live record to the end, checking every record's checksums, and copy the bytes of each record the index still points at. Each copied record's index entry is pointed at its new offset as it is copied, and its old offset is kept, 8 bytes per live key, so a failure can point them back. Compaction never holds a second index: at 10M live keys that took peak memory from 1.84 GB to 1.38 GB. Each copied record's key and value length also go to `tally.hint.compact`. A corrupt record, live or dead, stops compaction with its offset; nothing on disk has changed yet. One sequential pass beats two positioned reads per live record even counting the dead bytes it reads past: 30 ms against 183 ms for 100k live records.
+3. `fsync` the new log and the new hint.
+4. Remove the old `tally.hint` if there is one, and `fsync` the directory. It describes the old log, so it must be gone for good before the new log takes the name.
+5. Rename the new log over `tally.log`. The store now reads and appends to the new file.
+6. `fsync` the directory. A failure here panics, as for any failed fsync: the rename may not be durable, and writes after it go to the new file.
+7. Rename `tally.hint.compact` to `tally.hint`, without a directory fsync: if the name is lost, the next `open` reads the whole log. A failure here is logged, not returned; the compaction has already happened.
 
-Before the rename the old log is untouched, so any failure or crash leaves the store as it was; after a failure the moved entries are pointed back at it, rereading each key from the old log, and a failed reread panics so a restart rebuilds the index. After a crash between the rename and the directory fsync, either name survives, and both hold the same live state. Running it twice writes the same log.
+Before the rename the old log is untouched, so any failure or crash leaves the store as it was; after a failure the moved entries are pointed back at it, rereading each key from the old log, and a failed reread panics so a restart rebuilds the index. After a crash between the rename and the directory fsync, either name survives, and both hold the same live state. A crash anywhere leaves either no hint or one that matches the log. Running it twice writes the same log.
+
+### Hint file
+
+`tally.hint` lets `open` rebuild the index without reading values. Format (`src/hint.rs`), little-endian:
+
+```text
+magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc32c u32
+entry: key_len u16 | value_len u32 | key
+```
+
+- Offsets are not stored. A compacted log holds exactly the live records end to end, so each offset is the sum of the record lengths before it, and the sum of them all must equal `log_len`. That doubles as a check that the hint and the log agree.
+- The count and log length trail the entries because files are only written at the end and neither is known until compaction finishes. `open` reads the trailer first, with one positioned read, to size the index for `count` keys, never more than the log could hold (`log_len / 17`, the shortest record), since the count is unchecked until every entry is read.
+- The checksum covers every byte before it. Entries go into the index as they are read; if anything fails, that index is thrown away.
+
+On `open`, a hint is used only if its magic, version and checksum hold, every key and value length is in range, the entries add up to `count` distinct keys and exactly `log_len` bytes, and the log is at least `log_len` long. Records after `log_len` are then read as usual. A hint that fails any check is logged, removed and the directory fsynced, and the whole log is read. The removal must be durable: a hint rejected because the log is shorter than it says would look valid again once new writes grew the log past `log_len`.
+
+`repair` removes the hint before it truncates the log, in the same directory fsync that makes the side file durable.
+
+The cost is that `open` no longer checks the checksums of records the hint covers. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan. This is the Bitcask trade.
+
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan. The hint is 22 bytes per key here (220 MB). With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
 
 ### When it runs
 
@@ -140,7 +163,7 @@ An automatic compaction never turns a successful write or `open` into an error: 
 
 `Store<F: Fs = OsFs>` reaches the disk only through two traits in `tally::fs`, so the power-cut tests can swap in an in-memory disk:
 
-- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `sync_dir`, with `type File: LogFile`.
+- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `sync_dir`, with `type File: LogFile`.
 - `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, `try_lock`. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
 
 Both traits are sealed: public because `Store`'s type parameter is, but implementable only inside tally. `Store::open` and `Store::repair` are defined on `Store<OsFs>` (a default type parameter is not used for inference, so a generic `open` would need annotations); the generic versions are crate-private. The traits return errors; the panic on a failed fsync stays in `Store`.
@@ -152,7 +175,7 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 - `Box<[u8]>` instead of `Vec<u8>`: keys never grow, so the capacity field is waste. Saves 8 bytes per slot.
 - foldhash instead of the default SipHash: `open` on 100k records went from 15.5 ms to 12.1 ms and a missing-key `get` from 12.9 ns to 4.8 ns. The `quality` variant costs the same as `fast` within noise.
 - The cost is HashDoS resistance. foldhash defeats only trivial collision attacks and "does not claim to provide HashDoS resistance against interactive attackers" (its README). SipHash does. That is acceptable while keys come from the embedding process. Before keys arrive over the network (the TCP server), switch back to SipHash or put a limit on what one client can insert.
-- Measured with a pre-sized map: about 877 MB for 10M keys of 32 bytes. `open` does not pre-size yet (see Deferred ideas), so it peaks higher: old and new tables coexist during each resize.
+- Measured with a pre-sized map: about 877 MB for 10M keys of 32 bytes. `open` pre-sizes from the hint's count. Without a hint it grows the map as it reads, and peaks higher because old and new tables coexist during each resize: 1.23 GB against 718 MB for 10M keys of 16 bytes.
 - Deletes remove the key from the map. The Delete record stays on disk until compaction, and counts as dead bytes.
 
 ### Reads
@@ -181,11 +204,11 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 ## Testing
 
 - **Kill test** (`tests/kill.rs`): the test binary runs itself as a child that applies a seeded sequence of set, delete, reopen and compact, with automatic compaction at 50% dead and no size floor, printing an ack after each `Ok`. The parent `kill -9`s it after a random delay, three times on the same directory without opening it in between, so kills also land in the next child's `open` and recovery. Then the parent opens the store and checks that `open` succeeds, that the state is that of every acknowledged operation with each round's in-flight operation applied or not, and that a write after recovery survives a reopen. `TALLY_KILL_RUNS` (default 20) and `TALLY_KILL_SEED`; CI runs 1,000 on Linux. This cannot detect a missing `fsync`, because the OS page cache survives process death.
-- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions and runs with automatic compaction at 50% dead and no size floor, and the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn or as zeros, and only directory entries made durable by a directory sync surviving (with everything under a lost directory). A directory sync makes the directory's entries exactly what they are now, so a rename and the name it replaced land together. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file) and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests.
+- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions and runs with automatic compaction at 50% dead and no size floor, and the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn or as zeros, and only directory entries made durable by a directory sync surviving (with everything under a lost directory). A directory sync makes the directory's entries exactly what they are now, so a rename and the name it replaced land together. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file) and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests, with two exceptions, both from the hint file. The hint's own fsync: a torn hint fails its checksum and `open` reads the whole log, so correctness never rests on it, and it is kept so that no 32-bit checksum ever has to vouch for one. The directory fsync between removing the old hint and renaming the new log: the fake makes a directory's unsynced changes durable all at once, so it cannot produce the rename without the removal. A separate test (`a_removed_hint_stays_removed_after_a_power_cut`) checks that `open`'s removal of a rejected hint survives a cut.
 - **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
 - **Model test** (`tests/model.rs`): random sequences of set, get, delete and reopen against a `HashMap`, checking every read and the log length after every step. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run.
 - **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
-- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records, then damaged), and `ops` (the model test, coverage-guided). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
+- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records, then damaged), `ops` (the model test, coverage-guided), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
 - **Benchmarks** (`cargo bench`): `set` next to a bare append + `sync_all` baseline, `get` hit and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
@@ -218,7 +241,6 @@ Core logic (format, recovery, index, crash tests) is hand-written. Commodity and
 ## Deferred ideas
 
 - `Interval` sync policy with group commit, once there are concurrent writers.
-- Compaction writes the live key count so the next startup can pre-size the index.
 - Background compaction, once the TCP server brings concurrency.
 - Smaller index: a seeded 128-bit hash per key instead of the key itself (about 37% less memory, estimated), with a collision test using a deliberately weak hash.
 - Benchmark-driven `get_unverified` if checksum cost shows up in profiles.
