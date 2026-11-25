@@ -23,11 +23,8 @@ use crc_fast::{CrcAlgorithm, Digest};
 use crate::fs::LogFile;
 use crate::record::{FIELDS_LEN, Fields, Kind, decode_fields};
 
-pub(crate) const HINT_FILE_NAME: &str = "tally.hint";
-pub(crate) const COMPACT_HINT_FILE_NAME: &str = "tally.hint.compact";
-
 const MAGIC: &[u8; 4] = b"TLYH";
-const VERSION: u8 = 2;
+const VERSION: u8 = 3;
 const PREFIX_LEN: u64 = 5;
 const TRAILER_LEN: u64 = 24;
 const FLUSH_AT: usize = 1 << 20;
@@ -61,17 +58,17 @@ impl From<io::Error> for Invalid {
 }
 
 /// Writes a hint file, one entry per record, in log order.
-pub(crate) struct Writer<'a, F: LogFile> {
-    file: &'a F,
+pub(crate) struct Writer<F: LogFile> {
+    file: F,
     buffer: Vec<u8>,
     written: u64,
     checksum: Digest,
     count: u64,
 }
 
-impl<'a, F: LogFile> Writer<'a, F> {
+impl<F: LogFile> Writer<F> {
     /// A hint in the empty `file`.
-    pub(crate) fn new(file: &'a F) -> Writer<'a, F> {
+    pub(crate) fn new(file: F) -> Writer<F> {
         let mut buffer = Vec::with_capacity(FLUSH_AT);
         buffer.extend_from_slice(MAGIC);
         buffer.push(VERSION);
@@ -86,7 +83,7 @@ impl<'a, F: LogFile> Writer<'a, F> {
 
     /// More entries for the hint in `file` that `tail` came from. Cuts off
     /// its trailer first, so it is invalid until `finish`.
-    pub(crate) fn extend(file: &'a F, tail: Tail) -> io::Result<Writer<'a, F>> {
+    pub(crate) fn extend(file: F, tail: Tail) -> io::Result<Writer<F>> {
         file.set_len(tail.entries_end)?;
         Ok(Writer {
             file,
@@ -112,14 +109,16 @@ impl<'a, F: LogFile> Writer<'a, F> {
         Ok(())
     }
 
-    /// Writes the trailer for the first `log_len` bytes of a segment.
-    pub(crate) fn finish(mut self, log_len: u64) -> io::Result<()> {
+    /// Writes the trailer for the first `log_len` bytes of a segment, and
+    /// returns the file.
+    pub(crate) fn finish(mut self, log_len: u64) -> io::Result<F> {
         self.buffer.extend_from_slice(&self.count.to_le_bytes());
         self.buffer.extend_from_slice(&log_len.to_le_bytes());
         self.checksum.update(&self.buffer);
         let checksum = self.checksum.finalize();
         self.buffer.extend_from_slice(&checksum.to_le_bytes());
-        self.file.write_all_at(&self.buffer, self.written)
+        self.file.write_all_at(&self.buffer, self.written)?;
+        Ok(self.file)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -288,7 +287,7 @@ mod tests {
     use super::*;
     use crate::fs::Fs;
     use crate::mem_fs::MemFs;
-    use crate::record::Format;
+    use crate::record::Place;
     use std::path::Path;
 
     fn set(key: &[u8], value_len: u32) -> (Fields, Vec<u8>) {
@@ -296,9 +295,13 @@ mod tests {
     }
 
     fn fields(kind: Kind, key: &[u8], value_len: u32) -> (Fields, Vec<u8>) {
+        placed(kind, Place::Top, key, value_len)
+    }
+
+    fn placed(kind: Kind, place: Place, key: &[u8], value_len: u32) -> (Fields, Vec<u8>) {
         let fields = Fields {
             kind,
-            format: Format::Crc64,
+            place,
             key_len: key.len() as u16,
             value_len,
         };
@@ -308,8 +311,7 @@ mod tests {
     fn write(entries: &[(Fields, Vec<u8>)], log_len: u64) -> Vec<u8> {
         let fs = MemFs::new();
         let path = Path::new("/hint");
-        let file = fs.open_or_create(path).unwrap();
-        let mut writer = Writer::new(&file);
+        let mut writer = Writer::new(fs.open_or_create(path).unwrap());
         for (fields, key) in entries {
             writer.push(*fields, key).unwrap();
         }
@@ -351,13 +353,13 @@ mod tests {
     #[test]
     fn the_bytes_of_a_two_entry_hint() {
         let bytes = write(&[set(b"a", 2), set(b"bc", 1)], 22 + 22);
-        let mut expected = b"TLYH\x02".to_vec();
-        expected.extend_from_slice(&[0x11, 1, 0, 2, 0, 0, 0, b'a']);
-        expected.extend_from_slice(&[0x11, 2, 0, 1, 0, 0, 0, b'b', b'c']);
+        let mut expected = b"TLYH\x03".to_vec();
+        expected.extend_from_slice(&[0x31, 1, 0, 2, 0, 0, 0, b'a']);
+        expected.extend_from_slice(&[0x31, 2, 0, 1, 0, 0, 0, b'b', b'c']);
         expected.extend_from_slice(&2u64.to_le_bytes());
         expected.extend_from_slice(&44u64.to_le_bytes());
         // CRC-64/NVME of the bytes above, computed in Python.
-        expected.extend_from_slice(&0x211b_e5c0_f2cf_45ab_u64.to_le_bytes());
+        expected.extend_from_slice(&0xc347098e2db51f9c_u64.to_le_bytes());
         assert_eq!(bytes, expected);
     }
 
@@ -368,41 +370,23 @@ mod tests {
     }
 
     #[test]
-    fn the_bytes_of_a_delete_and_a_batch() {
+    fn the_bytes_of_a_batch_of_a_delete_and_a_set() {
         let entries = [
             fields(Kind::Batch, b"", 8),
-            fields(Kind::Delete, b"a", 0),
-            set(b"b", 1),
+            placed(Kind::Delete, Place::Inner, b"a", 0),
+            placed(Kind::Set, Place::Inner, b"b", 1),
         ];
         let bytes = write(&entries, 27 + 20 + 21);
-        let mut expected = b"TLYH\x02".to_vec();
-        expected.extend_from_slice(&[0x13, 0, 0, 8, 0, 0, 0]);
-        expected.extend_from_slice(&[0x12, 1, 0, 0, 0, 0, 0, b'a']);
-        expected.extend_from_slice(&[0x11, 1, 0, 1, 0, 0, 0, b'b']);
+        let mut expected = b"TLYH\x03".to_vec();
+        expected.extend_from_slice(&[0x33, 0, 0, 8, 0, 0, 0]);
+        expected.extend_from_slice(&[0x72, 1, 0, 0, 0, 0, 0, b'a']);
+        expected.extend_from_slice(&[0x71, 1, 0, 1, 0, 0, 0, b'b']);
         expected.extend_from_slice(&1u64.to_le_bytes());
         expected.extend_from_slice(&68u64.to_le_bytes());
         // CRC-64/NVME of the bytes above, computed in Python.
-        expected.extend_from_slice(&0x6160_f248_4865_8a2d_u64.to_le_bytes());
+        expected.extend_from_slice(&0x17b5baa2420c2382_u64.to_le_bytes());
         assert_eq!(bytes, expected);
         assert_eq!(read(&bytes), Ok(at(&entries, &[0, 27, 47])));
-    }
-
-    #[test]
-    fn records_from_before_64_bit_checksums_have_15_byte_headers() {
-        let old = |kind, key: &[u8], value_len| {
-            let (mut fields, key) = fields(kind, key, value_len);
-            fields.format = Format::Crc32c;
-            (fields, key)
-        };
-        let entries = [
-            old(Kind::Set, b"a", 2),
-            old(Kind::Delete, b"a", 0),
-            set(b"b", 1),
-        ];
-        let bytes = write(&entries, 18 + 16 + 21);
-        assert_eq!(bytes[5], 0x01);
-        assert_eq!(bytes[13], 0x02);
-        assert_eq!(read(&bytes), Ok(at(&entries, &[0, 18, 34])));
     }
 
     #[test]
@@ -419,12 +403,11 @@ mod tests {
     fn an_extended_hint_is_the_hint_written_in_one_go() {
         let fs = MemFs::new();
         let path = Path::new("/hint");
-        let file = fs.open_or_create(path).unwrap();
-        let mut writer = Writer::new(&file);
+        let mut writer = Writer::new(fs.open_or_create(path).unwrap());
         writer.push(set(b"a", 2).0, b"a").unwrap();
-        writer.finish(22).unwrap();
+        let file = writer.finish(22).unwrap();
         let tail = read_entries(&file, trailer(&file).unwrap(), 1 << 20, |_| {}).unwrap();
-        let mut writer = Writer::extend(&file, tail).unwrap();
+        let mut writer = Writer::extend(file, tail).unwrap();
         let (fields, key) = fields(Kind::Delete, b"a", 0);
         writer.push(fields, &key).unwrap();
         writer.push(set(b"bc", 1).0, b"bc").unwrap();
@@ -439,30 +422,29 @@ mod tests {
     }
 
     #[test]
-    fn a_hint_from_before_64_bit_checksums_is_rejected() {
-        let mut bytes = b"TLYH\x01".to_vec();
-        bytes.extend_from_slice(&[1, 0, 2, 0, 0, 0, b'a']);
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&18u64.to_le_bytes());
-        bytes.extend_from_slice(&crc32c::crc32c(&bytes).to_le_bytes());
+    fn a_hint_from_another_version_is_rejected() {
+        let mut bytes = write(&[set(b"a", 2)], 22);
+        bytes[4] = 2;
+        reseal(&mut bytes);
         assert_eq!(read(&bytes), Err(Invalid("not a tally hint file")));
     }
 
     #[test]
     fn an_entry_that_breaks_a_record_rule_is_rejected() {
-        // Zero and unknown types, a Set without a value, a Delete with one,
-        // a Batch with a key, an empty key, a key over the limit.
-        let bad: [&[u8]; 7] = [
+        // Zero, unknown and older types, a Delete with a value, a Batch with
+        // a key, a batch inside a batch, an empty key, a key over the limit.
+        let bad: [&[u8]; 8] = [
             &[0x00, 1, 0, 2, 0, 0, 0, b'a'],
-            &[0x19, 1, 0, 2, 0, 0, 0, b'a'],
-            &[0x11, 1, 0, 0, 0, 0, 0, b'a'],
-            &[0x12, 1, 0, 2, 0, 0, 0, b'a'],
-            &[0x13, 1, 0, 8, 0, 0, 0, b'a'],
-            &[0x11, 0, 0, 2, 0, 0, 0],
-            &[0x11, 0x01, 0x04, 2, 0, 0, 0],
+            &[0x39, 1, 0, 2, 0, 0, 0, b'a'],
+            &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
+            &[0x32, 1, 0, 2, 0, 0, 0, b'a'],
+            &[0x33, 1, 0, 8, 0, 0, 0, b'a'],
+            &[0x73, 0, 0, 8, 0, 0, 0],
+            &[0x31, 0, 0, 2, 0, 0, 0],
+            &[0x31, 0x01, 0x04, 2, 0, 0, 0],
         ];
         for entry in bad {
-            let mut bytes = b"TLYH\x02".to_vec();
+            let mut bytes = b"TLYH\x03".to_vec();
             bytes.extend_from_slice(entry);
             bytes.extend_from_slice(&[0; 24]);
             reseal(&mut bytes);

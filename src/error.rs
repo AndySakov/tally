@@ -22,7 +22,6 @@ pub enum CorruptionReason {
     PayloadChecksum,
     ZeroType,
     EmptyKey,
-    SetWithoutValue,
     DeleteWithValue,
     KeyMismatch,
     NotASet,
@@ -38,6 +37,9 @@ pub enum CorruptionReason {
     CutShort,
     /// A segment starts before the one before it ends.
     SegmentsOverlap,
+    /// A segment file's header has the wrong checksum or names another
+    /// base. Reported at the segment's base.
+    SegmentHeader,
 }
 
 impl Display for CorruptionReason {
@@ -47,7 +49,6 @@ impl Display for CorruptionReason {
             CorruptionReason::PayloadChecksum => write!(f, "payload checksum mismatch"),
             CorruptionReason::ZeroType => write!(f, "record type is zero"),
             CorruptionReason::EmptyKey => write!(f, "key length is zero"),
-            CorruptionReason::SetWithoutValue => write!(f, "set record has an empty value"),
             CorruptionReason::DeleteWithValue => write!(f, "delete record has a value"),
             CorruptionReason::KeyMismatch => write!(f, "stored key does not match index"),
             CorruptionReason::NotASet => write!(f, "indexed record is not a set"),
@@ -55,6 +56,7 @@ impl Display for CorruptionReason {
             CorruptionReason::BadBatch => write!(f, "malformed batch"),
             CorruptionReason::CutShort => write!(f, "segment ends partway through a record"),
             CorruptionReason::SegmentsOverlap => write!(f, "segment starts inside the one before"),
+            CorruptionReason::SegmentHeader => write!(f, "segment file header is damaged"),
         }
     }
 }
@@ -62,6 +64,9 @@ impl Display for CorruptionReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedReason {
     UnknownType(u8),
+    /// A segment file this version can't read, or a `tally.log`: written
+    /// by another version of tally, or not tally's.
+    OtherFormat,
     OverLimit {
         field: Field,
         len: usize,
@@ -73,6 +78,12 @@ impl Display for UnsupportedReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UnsupportedReason::UnknownType(byte) => write!(f, "unknown record type {:#04x}", byte),
+            UnsupportedReason::OtherFormat => {
+                write!(
+                    f,
+                    "not in this version's format (written by another version of tally?)"
+                )
+            }
             UnsupportedReason::OverLimit { field, len, max } => {
                 write!(
                     f,
@@ -87,7 +98,7 @@ impl Display for UnsupportedReason {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    Empty(Field),
+    EmptyKey,
     TooLarge {
         field: Field,
         len: usize,
@@ -118,7 +129,7 @@ pub enum Error {
 impl Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Empty(field) => write!(f, "{} must not be empty", field),
+            Error::EmptyKey => write!(f, "key must not be empty"),
             Error::TooLarge { field, len, max } => {
                 write!(f, "{} is {} bytes, over the {}-byte limit", field, len, max)
             }
@@ -194,14 +205,7 @@ mod tests {
 
     #[test]
     fn empty_message() {
-        assert_eq!(
-            Error::Empty(Field::Key).to_string(),
-            "key must not be empty"
-        );
-        assert_eq!(
-            Error::Empty(Field::Value).to_string(),
-            "value must not be empty"
-        );
+        assert_eq!(Error::EmptyKey.to_string(), "key must not be empty");
     }
 
     #[test]
@@ -235,10 +239,6 @@ mod tests {
             (
                 CorruptionReason::EmptyKey,
                 "corrupt record at offset 4096: key length is zero",
-            ),
-            (
-                CorruptionReason::SetWithoutValue,
-                "corrupt record at offset 4096: set record has an empty value",
             ),
             (
                 CorruptionReason::DeleteWithValue,
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn non_io_errors_have_no_source() {
-        assert!(Error::Empty(Field::Key).source().is_none());
+        assert!(Error::EmptyKey.source().is_none());
         assert!(
             Error::Corruption {
                 offset: 0,

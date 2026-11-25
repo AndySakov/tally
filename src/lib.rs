@@ -32,9 +32,9 @@ pub mod fuzz {
 
     pub use crate::mem_fs::MemFs;
     pub use crate::record::{
-        Format, HEADER_LEN, Record, SHORTEST_HEADER_LEN, decode_header, decode_payload, encode,
-        encode_as,
+        HEADER_LEN, Place, Record, decode_header, decode_payload, encode, seal,
     };
+    pub use crate::segment::segment_file;
     use crate::{Error, Options, Store};
 
     /// A store on the in-memory disk, which has no syscalls to wait on.

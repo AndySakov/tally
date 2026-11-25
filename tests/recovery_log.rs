@@ -25,8 +25,16 @@ impl Log for Capture {
 
 static LOGGER: Capture = Capture(Mutex::new(Vec::new()));
 
+fn append(dir: &std::path::Path, bytes: &[u8]) {
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(dir.join("tally.00000000000000000000.log"))
+        .unwrap();
+    std::io::Write::write_all(&mut log, bytes).unwrap();
+}
+
 #[test]
-fn open_warns_with_the_offset_and_bytes_dropped() {
+fn open_warns_with_the_offset_and_where_the_bytes_went() {
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(LevelFilter::Trace);
 
@@ -40,21 +48,30 @@ fn open_warns_with_the_offset_and_bytes_dropped() {
         )
         .unwrap();
     drop(store);
-    let mut log = std::fs::OpenOptions::new()
-        .append(true)
-        .open(dir.join("tally.00000000000000000000.log"))
-        .unwrap();
-    std::io::Write::write_all(&mut log, &[0u8; 14]).unwrap();
-    drop(log);
 
+    append(dir, &[0u8; 14]);
+    Store::open(dir).unwrap();
+    append(dir, &[0xab; 3]);
     Store::open(dir).unwrap();
     Store::open(dir).unwrap();
 
+    // ce01bddc32C of the three bytes, computed in Python.
+    let side = dir.join("tally.log.torn-22-ce01bddc");
     assert_eq!(
         *LOGGER.0.lock().unwrap(),
-        [(
-            Level::Warn,
-            "truncated a torn tail at offset 22: dropped 14 bytes".to_string()
-        )]
+        [
+            (
+                Level::Warn,
+                "truncated a torn tail at offset 22: dropped 14 zero bytes".to_string()
+            ),
+            (
+                Level::Warn,
+                format!(
+                    "truncated a torn tail at offset 22: moved 3 bytes to {}",
+                    side.display()
+                )
+            ),
+        ]
     );
+    assert_eq!(std::fs::read(side).unwrap(), [0xab; 3]);
 }

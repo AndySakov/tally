@@ -11,8 +11,8 @@ use std::path::Path;
 
 use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
-use crate::record::{Record, encode};
-use crate::segment::{hint_name, log_name};
+use crate::record::{Place, Record, encode};
+use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
 use crate::store::{LOG_FILE_NAME, Write};
 use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
 
@@ -279,31 +279,27 @@ fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
     println!("power cut: {checked} disks checked");
 }
 
-/// SET_A_HI, a Delete of "a" with its key corrupted, then a Set of "b".
+/// The records of the first segment: a Set of "a", a Delete of "a" with
+/// its key corrupted at 22, then a Set of "b".
 fn log_with_a_corrupt_middle() -> Vec<u8> {
-    let mut bytes = Vec::new();
-    encode(
-        &Record::Set {
+    let records = [
+        Record::Set {
             key: Key::try_from(&b"a"[..]).unwrap(),
             value: Value::try_from(&b"hi"[..]).unwrap(),
         },
-        &mut bytes,
-    );
-    let corrupt_at = bytes.len();
-    encode(
-        &Record::Delete {
+        Record::Delete {
             key: Key::try_from(&b"a"[..]).unwrap(),
         },
-        &mut bytes,
-    );
-    bytes[corrupt_at + 19] ^= 0x01;
-    encode(
-        &Record::Set {
+        Record::Set {
             key: Key::try_from(&b"b"[..]).unwrap(),
             value: Value::try_from(&b"2"[..]).unwrap(),
         },
-        &mut bytes,
-    );
+    ];
+    let mut bytes = Vec::new();
+    for record in &records {
+        encode(record, Place::Top, bytes.len() as u64, &mut bytes);
+    }
+    bytes[22 + 19] ^= 0x01;
     bytes
 }
 
@@ -312,8 +308,10 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
     let dir = Path::new(DIR);
     let log_path = dir.join(log_name(0));
     let side_path = dir.join(format!("{LOG_FILE_NAME}.corrupt-22"));
-    let original = log_with_a_corrupt_middle();
-    let (kept, moved) = original.split_at(22);
+    let records = log_with_a_corrupt_middle();
+    let original = segment_file(0, &records);
+    let kept = &segment_file(0, &records[..22])[..];
+    let moved = &records[22..];
 
     let fs = MemFs::new();
     fs.put(&log_path, &original);
@@ -381,16 +379,18 @@ fn what_open_reads_survives_a_power_cut() {
         .unwrap();
     drop(store);
 
+    let log = fs.open_existing(&dir.join(log_name(0))).unwrap();
+    let end = log.size().unwrap();
     let mut unsynced = Vec::new();
     encode(
         &Record::Set {
             key: key(2),
             value: Value::try_from(&b"unsynced"[..]).unwrap(),
         },
+        Place::Top,
+        end - FILE_HEADER_LEN,
         &mut unsynced,
     );
-    let log = fs.open_existing(&dir.join(log_name(0))).unwrap();
-    let end = log.size().unwrap();
     log.write_all_at(&unsynced, end).unwrap();
     drop(log);
 
@@ -416,30 +416,39 @@ fn what_open_reads_survives_a_power_cut() {
 #[test]
 fn a_removed_hint_stays_removed_after_a_power_cut() {
     let dir = Path::new(DIR);
+    let rolls_at_40 = Options {
+        auto_compact: None,
+        segment_bytes: 40,
+    };
     let fs = MemFs::new();
-    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, rolls_at_40).unwrap();
     store
         .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
         .unwrap();
     store
         .set(key(2), Value::try_from(&b"2"[..]).unwrap())
         .unwrap();
-    store.compact().unwrap();
+    store
+        .set(key(9), Value::try_from(&b"9"[..]).unwrap())
+        .unwrap();
     drop(store);
-    let compacted = 23 + 22;
-    let hint = fs.read(&dir.join(hint_name(compacted))).unwrap();
-    let log = fs.read(&dir.join(log_name(compacted))).unwrap();
-    assert_eq!(log.len(), 23 + 22);
+    drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());
+    let hint = fs.read(&dir.join(hint_name(0))).unwrap();
+    let log = fs.read(&dir.join(log_name(0))).unwrap();
+    assert_eq!(log.len() as u64, FILE_HEADER_LEN + 23 + 22);
 
     let fs = MemFs::new();
-    fs.put(&dir.join(log_name(0)), &log[..23]);
+    fs.put(
+        &dir.join(log_name(0)),
+        &log[..FILE_HEADER_LEN as usize + 23],
+    );
     fs.put(&dir.join(hint_name(0)), &hint);
     let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(3), Value::try_from(&b"3"[..]).unwrap())
         .unwrap();
     drop(store);
-    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), 23 + 22);
+    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), log.len());
 
     let disk = fs.disk();
     for cut in disk.cuts() {
@@ -450,64 +459,4 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
             "{cut:?}"
         );
     }
-}
-
-/// Turning a log from before segments, with its hint, into the first
-/// segment renames both and rewrites `tally.log`. A power cut at any point
-/// of it must leave a store that opens with every key, and never one an
-/// earlier tally would open as empty.
-#[test]
-fn a_power_cut_while_moving_to_segments_loses_nothing() {
-    let dir = Path::new(DIR);
-    let fs = MemFs::new();
-    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
-    store
-        .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
-        .unwrap();
-    store
-        .set(key(2), Value::try_from(&b"2"[..]).unwrap())
-        .unwrap();
-    store.compact().unwrap();
-    drop(store);
-    let log = fs.read(&dir.join(log_name(45))).unwrap();
-    let hint = fs.read(&dir.join(hint_name(45))).unwrap();
-    let legacy = || {
-        let fs = MemFs::new();
-        fs.put(&dir.join(LOG_FILE_NAME), &log);
-        fs.put(&dir.join(crate::hint::HINT_FILE_NAME), &hint);
-        fs
-    };
-    let expected = State::from([(1, b"hi".to_vec()), (2, b"2".to_vec())]);
-
-    let fs = legacy();
-    drop(Store::open_in(fs.clone(), dir, Options::default()).unwrap());
-    let steps = fs.steps();
-    let mut checked = 0;
-    for step in 1..=steps {
-        let fs = legacy();
-        fs.cut_before(step);
-        drop(Store::open_in(fs.clone(), dir, Options::default()).unwrap());
-        let snapshot = fs.snapshot().unwrap();
-        for cut in snapshot.cuts() {
-            let context = format!("cut before step {step} {cut:?}");
-            let after = MemFs::after(&snapshot, cut);
-            let legacy_log = after.read(&dir.join(LOG_FILE_NAME));
-            assert!(
-                legacy_log.as_deref() == Some(&log[..])
-                    || legacy_log.as_deref() == Some(&crate::store::marker()[..])
-                        && after.read(&dir.join(log_name(0))).as_deref() == Some(&log[..]),
-                "{context}: an earlier version would not find the records, or would not be refused"
-            );
-            let store = Store::open_in(after.clone(), dir, Options::default()).unwrap();
-            assert_eq!(read_state(&store), expected, "{context}");
-            drop(store);
-            assert_eq!(
-                after.read(&dir.join(LOG_FILE_NAME)).as_deref(),
-                Some(&crate::store::marker()[..]),
-                "{context}"
-            );
-            checked += 1;
-        }
-    }
-    println!("moving to segments: {checked} disks checked");
 }

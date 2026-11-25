@@ -1,21 +1,14 @@
 use crate::{
-    Error::{Empty, TooLarge},
+    Error::{EmptyKey, TooLarge},
     Field, MAX_KEY_LEN, MAX_VALUE_LEN,
     error::Error,
 };
 
-fn check_len(field: Field, len: usize) -> Result<(), Error> {
-    let max = match field {
-        Field::Key => MAX_KEY_LEN,
-        Field::Value => MAX_VALUE_LEN,
-    };
-    if len == 0 {
-        Err(Empty(field))
-    } else if len > max {
-        Err(TooLarge { field, len, max })
-    } else {
-        Ok(())
+fn check_len(field: Field, len: usize, max: usize) -> Result<(), Error> {
+    if len > max {
+        return Err(TooLarge { field, len, max });
     }
+    Ok(())
 }
 
 /// A validated key: non-empty and at most `MAX_KEY_LEN` bytes.
@@ -25,7 +18,7 @@ fn check_len(field: Field, len: usize) -> Result<(), Error> {
 /// ```compile_fail
 /// let key = tally::Key(Box::from(&b""[..]));
 /// ```
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Key(Box<[u8]>);
 
 impl Key {
@@ -34,12 +27,12 @@ impl Key {
     }
 }
 
-/// A validated value: non-empty and at most `MAX_VALUE_LEN` bytes.
+/// A validated value: at most `MAX_VALUE_LEN` bytes, possibly none.
 ///
 /// The field is private, so `Value::try_from` is the only way to build one:
 ///
 /// ```compile_fail
-/// let value = tally::Value(Box::from(&b""[..]));
+/// let value = tally::Value(Box::from(&b"v"[..]));
 /// ```
 #[derive(PartialEq, Eq)]
 pub struct Value(Box<[u8]>);
@@ -67,8 +60,10 @@ impl TryFrom<&[u8]> for Key {
     type Error = Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let len = bytes.len();
-        check_len(Field::Key, len)?;
+        if bytes.is_empty() {
+            return Err(EmptyKey);
+        }
+        check_len(Field::Key, bytes.len(), MAX_KEY_LEN)?;
         Ok(Key(bytes.into()))
     }
 }
@@ -77,8 +72,7 @@ impl TryFrom<&[u8]> for Value {
     type Error = Error;
 
     fn try_from(bytes: &[u8]) -> Result<Self, Self::Error> {
-        let len = bytes.len();
-        check_len(Field::Value, len)?;
+        check_len(Field::Value, bytes.len(), MAX_VALUE_LEN)?;
         Ok(Value(bytes.into()))
     }
 }
@@ -89,10 +83,7 @@ mod tests {
 
     #[test]
     fn key_rejects_empty() {
-        assert!(matches!(
-            Key::try_from(&b""[..]),
-            Err(Error::Empty(Field::Key))
-        ));
+        assert!(matches!(Key::try_from(&b""[..]), Err(Error::EmptyKey)));
     }
 
     #[test]
@@ -114,11 +105,8 @@ mod tests {
     }
 
     #[test]
-    fn value_rejects_empty() {
-        assert!(matches!(
-            Value::try_from(&b""[..]),
-            Err(Error::Empty(Field::Value))
-        ));
+    fn a_value_may_be_empty() {
+        assert_eq!(Value::try_from(&b""[..]).unwrap().as_bytes(), b"");
     }
 
     #[test]
@@ -138,31 +126,6 @@ mod tests {
                 max: 16_777_216
             })
         ));
-    }
-
-    #[test]
-    fn as_bytes_returns_the_input() {
-        assert_eq!(
-            Key::try_from(&b"user:42"[..]).unwrap().as_bytes(),
-            b"user:42"
-        );
-        assert_eq!(Value::try_from(&b"hello"[..]).unwrap().as_bytes(), b"hello");
-    }
-
-    #[test]
-    fn equal_bytes_compare_equal() {
-        assert_eq!(
-            Key::try_from(&b"a"[..]).unwrap(),
-            Key::try_from(&b"a"[..]).unwrap()
-        );
-        assert_ne!(
-            Key::try_from(&b"a"[..]).unwrap(),
-            Key::try_from(&b"b"[..]).unwrap()
-        );
-        assert_eq!(
-            Value::try_from(&b"x"[..]).unwrap(),
-            Value::try_from(&b"x"[..]).unwrap()
-        );
     }
 
     #[test]

@@ -5,19 +5,19 @@ A single-node, crash-safe, log-structured key-value store. Version 1 is an embed
 ## Scope (v1)
 
 - API: `open(dir)`, `open_with(dir, options)`, `set(key, value)`, `get(key) -> Option<value>`, `delete(key)`, `write(batch)`, `compact()`, `verify()`.
-- `open` takes a directory. It holds the log's segments (`tally.<base>.log`), a hint for each segment a compaction wrote or `open` read in full (`tally.<base>.hint`), `tally.lock`, and `tally.log`, which holds only a marker that keeps earlier versions out (see Segments).
+- `open` takes a directory. It holds the log's segments (`tally.<base>.log`), a hint for each segment a compaction wrote or `open` read in full (`tally.<base>.hint`), `tally.lock`, and any side files that recovery saved bytes to (see Recovery).
 - `delete` of a missing key is a no-op: no record is written and it returns `Ok`.
-- Keys and values are non-empty byte strings.
+- Keys are non-empty byte strings. Values may be empty.
 - One process, many threads. A `Store` is `Send` and `Sync`, and every method takes `&self`: threads share one through an `Arc`. Reads run alongside writes and compaction; writes from several threads share fsyncs (see Group commit). `open` takes an exclusive lock (`flock`) on `tally.lock`, a separate file because compaction removes segments and a lock on one of them would not outlive it. A second `open` fails with `Locked` until the first `Store` is dropped or its process exits.
 
 ## On-disk format
 
-The log is a sequence of append-only segment files (see Segments). Every record is a 19-byte header followed by the payload.
+The log is a sequence of append-only segment files (see Segments). Each starts with a 17-byte file header, then records. Every record is a 19-byte header followed by the payload.
 
 | Offset         | Size        | Field              | Notes                            |
 | -------------- | ----------- | ------------------ | -------------------------------- |
-| 0              | 4           | `header_checksum`  | CRC32C of bytes 4..19            |
-| 4              | 1           | `type`             | `0x11` Set, `0x12` Delete, `0x13` Batch |
+| 0              | 4           | `header_checksum`  | CRC32C of the record's log offset (u64), then bytes 4..19 |
+| 4              | 1           | `type`             | `0x31` Set, `0x32` Delete, `0x33` Batch; `0x40` added inside a batch |
 | 5              | 2           | `key_len`          | u16                              |
 | 7              | 4           | `value_len`        | u32                              |
 | 11             | 8           | `payload_checksum` | CRC-64/NVME of key + value       |
@@ -27,19 +27,25 @@ The log is a sequence of append-only segment files (see Segments). Every record 
 - All integers are little-endian.
 - The header checksum is CRC32C (Castagnoli), the payload checksum CRC-64/NVME (the NVMe and S3 CRC-64). The variants are part of the format.
 - `header_checksum` covers `payload_checksum`, so the payload checksum is itself protected.
+- `header_checksum` also covers where the record is, so a valid record anywhere else fails it: stale blocks a file system hands back after a crash (ext4 with `data=writeback`), a record copied from elsewhere in the log or from another store. CRC32C tells any two offsets that differ by one apart, whatever the carry. It costs nothing measurable: `open` of 100k records took 15.3 ms against 16.0 ms without it.
 - The payload checksum is 64 bits because it is what stands between bit rot and a wrong value. A corrupted payload passes CRC32C 1 time in 2³², and passes CRC-64 1 time in 2⁶⁴; CRC-64 also catches every error confined to 64 bits, against 32. The header stays at CRC32C: a damaged header that passes it gives wrong lengths, and the payload checksum over the wrong bytes then fails, so the damage is still reported, not returned. With `crc-fast`, CRC-64 is faster than CRC32C from about 100 bytes (15 against 20 ns at 117, 34 against 77 ns at 1 KiB on an M1 Pro).
-
-### Old records
-
-Records written before 64-bit checksums have a 15-byte header: the same fields with a 4-byte CRC32C `payload_checksum` at 11, and types `1`, `2` and `3`. The high nibble of `type` names the format (`0` old, `1` new) and the low nibble the kind, so a reader takes the header's length from byte 4 before checking anything: it reads 15 bytes, then 4 more if the type names the new format. A damaged type byte gives the wrong length, and the header checksum then fails. Type `0` is invalid in either format.
-
-- Old records are read and checked as before, wherever they are. Every write is in the new format, so a segment can hold both.
-- Compaction rewrites each old record it copies in the new format, checking its CRC32C on the way, so a store moves to 64-bit checksums as it compacts. A record already in the new format is copied byte for byte: rewriting every record took 100k live records' compaction from 44.1 to 47.5 ms.
-- Each index entry records its record's format, in what was padding, so `get` reads it in one read either way and dead bytes are counted exactly.
-- A version from before 64-bit checksums fails on a new record with `Unsupported` (unknown type `0x11`) instead of misreading it, and `repair` refuses it the same way. Like the move to segments, the change is one way once a new record is written.
 - The header has its own checksum so lengths can be trusted before they are used. A single record checksum cannot tell a torn tail from a mid-file record with a corrupted length, and treating the second as the first would silently drop acknowledged records.
-- Type `0` is invalid so a zero-filled region can never parse as a record.
-- A Batch record has no key and an 8-byte "value", `body_len` (u64): the byte length of the Set and Delete records that follow it and belong to the batch. Those records are ordinary records with their own checksums, so `get` reads one the same way whether or not it was written in a batch. A version without Batch fails on one with `Unsupported` (unknown type 3) instead of misreading it.
+- Type `0` is invalid so a zero-filled region can never parse as a record. The high nibble, `3`, is this version of the format; types from earlier versions are unknown.
+- An append of one record is that record. An append of more is one Batch record around them: a Batch record has no key and an 8-byte "value", `body_len` (u64), the byte length of the records that follow it and belong to it. Each of those has `0x40` in its type, so a record inside a batch is never taken for one written on its own (see Recovery). They are ordinary records otherwise, with their own checksums, so `get` reads one the same way whether or not it was written in a batch.
+
+### Segment file header
+
+| Offset | Size | Field      | Notes                     |
+| ------ | ---- | ---------- | ------------------------- |
+| 0      | 4    | magic      | `TLYS`                    |
+| 4      | 1    | version    | `3`                       |
+| 5      | 8    | base       | u64, the segment's base   |
+| 13     | 4    | checksum   | CRC32C of bytes 0..13     |
+
+- The header sits outside the log's offsets: `Segment` adds its length when it translates a log offset to one in the file, so the index, errors and records see only records.
+- A file whose magic or version is not this one is refused with `Unsupported` (`OtherFormat`) instead of being read as damaged records, and so is a directory holding `tally.log`, the one-file log of the first versions. There is no upgrade in place: stores from before version 3 must be read by the version that wrote them.
+- A header whose checksum fails or whose base is not the one in the file's name is `SegmentHeader` corruption at the base: a copied or renamed segment would otherwise put its records at the wrong offsets.
+- A segment's header is written and fsynced before its name is made durable and before any record goes in. A newest segment no longer than a header that is not the header (cut short, zeros, or stale blocks a crash exposed) holds no record, so `open` writes the header again, unless it names another version. In an older segment that is `CutShort` corruption. `repair` does not fix a damaged header in a sealed segment; it reports the error.
 
 ### Record validity
 
@@ -47,9 +53,8 @@ A record whose header checksum passes is still invalid if any of these hold:
 
 - `type == 0`
 - `key_len == 0`, for Set and Delete
-- Set with `value_len == 0`
 - Delete with `value_len != 0`
-- Batch with `key_len != 0` or `value_len != 8` (`BadBatch`)
+- Batch with `key_len != 0` or `value_len != 8`, or inside a batch (`BadBatch`)
 
 ## Limits
 
@@ -60,7 +65,7 @@ Policy constants in code, not part of the format. The format allows keys up to 6
 | Key   | 1 KiB  | Every key lives in the in-memory index                     |
 | Value | 16 MiB | Caps the allocation of a single `get` and of startup reads |
 
-Keys and values are newtypes (`Key`, `Value`) built with `TryFrom<&[u8]>`. Construction fails on empty input or input over the limit, so `set` cannot receive invalid input.
+Keys and values are newtypes (`Key`, `Value`) built with `TryFrom<&[u8]>`. Construction fails on an empty key or input over the limit, so `set` cannot receive invalid input.
 
 ## Durability contract
 
@@ -70,8 +75,8 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 
 ### Write path
 
-1. Build the full record in memory: payload, then `payload_checksum`, then the prefix, then `header_checksum`.
-2. Append it with a single write to the end of the file, together with the other writes in its group.
+1. Build the group's records in memory, inside one Batch record if there are more than one: for each, the payload, then `payload_checksum`, then the prefix, then `header_checksum` over its offset and the prefix.
+2. Append them with a single write to the end of the file.
 3. `fsync` the file.
 4. Update the index.
 5. Return `Ok`.
@@ -81,7 +86,7 @@ v1 has one sync policy: `fsync` on every write. A batched policy (`Interval`) is
 A write's cost is its fsync, about 5 ms here, so writes from several threads share one. A write joins a queue. If no group is being written, its thread becomes the leader: it takes the oldest queued writes, up to 1,024 writes or 4 MiB, encodes them in order into one buffer, appends it with one write, fsyncs, updates the index, and hands each waiting thread its result. If its own write was not among them, it leads again. Writes that arrive meanwhile queue for the next leader. A group's results go out before any automatic compaction it makes due, which the leader then runs: the writes that made it due return at once, and the next group waits for it. There is no dedicated thread, and a write alone is written at once.
 
 - The leader decides what each write does in queue order, with the group's earlier writes in view, as `write` does within a batch: a delete of a key an earlier write in the group set is written, and a delete of a key that is not live by then writes nothing.
-- Each write in a group lands whole, a Set or Delete record, or a Batch record with its body. A power cut mid-group can keep any number of the group's writes from the first, all unacknowledged, and recovery truncates the torn rest as any torn tail. The power-cut simulation checks every such prefix.
+- A group is one append, one record or one Batch record, so a power cut keeps all of it or none, and recovery treats a group cut short as any torn tail.
 - A failure fails every write in the group with the same error: none of them reached the index.
 - The index is updated only after the fsync, and a segment's length grows before the entries that point past its old end, so a read never sees a write that is not durable.
 - **The leader waits for its group to fill.** Threads that write again as soon as a write returns wake within microseconds of each other, but the first one back would lead alone and spend a whole fsync on one write, so groups would alternate between 1 and the rest. If the last group had more than one write, a new leader waits until the queue holds as many as that group did, or until 10% of the last fsync's measured time has passed, whichever comes first. A new write wakes it. After a group of one it doesn't wait, so a writer alone never does, and on a disk with fast fsyncs the wait is as short. When fewer threads are writing, one leader waits out the 10% and the next expects the smaller group. `set` of 1 KiB from 1, 4, 16 and 64 threads: 192, 439, 1,490 and 5,540 writes/s without the wait; 194, 778, 2,736 and 9,739 with it (`cargo bench -- "concurrent set"`). Waiting 25% or 50% gained nothing more. With threads that pause a random 0 to 10 ms between writes, as server traffic would, writes already pile up during each fsync, and the wait changed neither throughput nor latency beyond run-to-run noise (16 threads: about 1,000 writes/s, p50 7.8 to 8.0 ms, both ways).
@@ -108,68 +113,54 @@ If the append fails partway (disk full, I/O error), the leader truncates the fil
 
 `Batch` collects sets and deletes in order; `write(batch)` makes all of them durable with one append and one fsync, and recovery applies all of them or none (see Recovery). It is how a single thread gets group commit (see Group commit for several): the cost of a write is its fsync, so sharing one fsync across a batch divides it. 1 KiB values on an M1 Pro: 212 writes/s one at a time, 2,019/s in batches of 10, 18,663/s in batches of 100, and 100,810/s in batches of 1,000.
 
-- Operations apply in order, so a delete sees the batch's own earlier sets. A delete of a key that isn't live at that point writes nothing, as `delete` does, and a batch that writes nothing writes no Batch record either.
-- The 23-byte Batch record counts as dead bytes from the start. Compaction copies the live Set records out of batches like any others; the compacted log has no batches.
+- Operations apply in order, so a delete sees the batch's own earlier sets. A delete of a key that isn't live at that point writes nothing, as `delete` does. A batch that writes nothing writes nothing, and one that writes one record writes it on its own.
+- The 27-byte Batch record counts as dead bytes from the start. Compaction copies the live Set records out of batches like any others; the compacted log has no batches.
 - The whole batch is encoded in memory before the write, so its size is bounded by memory, not by the format (`body_len` is a u64).
 
 ## Segments
 
-The log is split into segment files, each named for the log offset of its first byte: `tally.<base, 20 digits>.log`, so sorting the names sorts the log. Offsets everywhere (the index, errors, `Repaired`, side-file names) are offsets into the whole log; `Segment` (`src/segment.rs`) implements `LogFile` by subtracting its base, so the scan, `get` and `verify` read a segment with the same code that read the one file. The index entry stays 16 bytes. The log's offsets only grow: compaction appends copies at the end and deletes the old segments, so the log has holes where they were.
+The log is split into segment files, each named for the log offset of its first record: `tally.<base, 20 digits>.log`, so sorting the names sorts the log. Offsets everywhere (the index, errors, `Repaired`, side-file names) are offsets into the whole log; `Segment` (`src/segment.rs`) implements `LogFile` by subtracting its base and adding its file header's length, so the scan, `get` and `verify` read every segment with the same code. The index entry stays 16 bytes. The log's offsets only grow: compaction appends copies at the end and deletes the old segments, so the log has holes where they were.
 
-- Writes go to the last segment. Before a write, if that segment holds at least `Options::segment_bytes` (default 256 MiB), a new one is created at the end of the log and the directory fsynced, so its name is durable before any acknowledged write lands in it. A write is one append, so a batch never spans two segments; a segment can exceed `segment_bytes` by one group of writes (see Group commit), and a compaction's output by any amount.
+- Writes go to the last segment. Before a write, if that segment holds at least `Options::segment_bytes` (default 256 MiB), a new one is created at the end of the log, its header fsynced, then the directory, so its name is durable before any acknowledged write lands in it. A write is one append, so a batch never spans two segments; a segment can exceed `segment_bytes` by one group of writes (see Group commit), and a compaction's output by any amount.
 - Only the newest segment can have a torn tail: every other was complete and fsynced before the next was written. In any other segment, a tail `open` would truncate is `CutShort` corruption instead, for `repair`.
 - Segments must not overlap: a segment that starts before the previous one ends fails `open` with `SegmentsOverlap`. Nothing tally does can produce one; it means files were copied in from elsewhere.
 - Every segment stays open for the life of the `Store`, one file descriptor each. At 256 MiB that is 4 per GiB of log: the default soft limit of 256 per process on macOS is reached around 60 GiB, and Linux's 1,024 around 250 GiB. Past that, `open` or the write that starts a segment fails with the OS's "too many open files"; raise `ulimit -n` or `segment_bytes`. A cache of open files would lift the limit but give every read path a handle to open and evict behind `&self`; RocksDB's default (`max_open_files = -1`) makes the same trade of keeping everything open.
-
-### From one file to segments
-
-A directory from before segments has `tally.log` (and maybe `tally.hint`) and no segment files. `open` (and `repair`):
-
-1. Hard-links `tally.log` as the segment at 0, renames `tally.hint` to its hint, and removes any `tally.log.compact` and `tally.hint.compact` a crashed compaction left.
-2. Writes the marker to `tally.log.marker` and fsyncs it, then the directory.
-3. Renames `tally.log.marker` over `tally.log`, and fsyncs the directory.
-
-Offsets do not change, since the segment at 0 holds exactly the old file. The marker is one record header of type 255 with valid checksums. Every earlier version reads `tally.log` from offset 0, so it fails with `Unsupported` (unknown type 255) instead of finding no records and starting an empty store over the real data; its `repair` refuses unsupported records too.
-
-At every step, then, `tally.log` holds either all the old records or the whole marker, so a power cut never leaves an earlier version a `tally.log` that is missing, torn or zeroed, any of which it would open as an empty store. The directory fsync in step 2 keeps the rename from landing without the link, which would leave the records with no name. The power-cut test checks this at every cut of the move.
-
-- A `tally.log` that holds records while the segment at 0 is the same file (by device and inode) is a move stopped after step 1, and `open` finishes it.
-- A `tally.log` shorter than any record (16 bytes) that is not the marker is replaced with it: it holds no records.
-- A `tally.log` holding records while any other segment exists fails `open`: an earlier version wrote records the segments know nothing about, and they cannot be put in order.
-- On a file system without hard links, step 1 renames `tally.log` instead, and a power cut before step 3 lands can leave no `tally.log` for an earlier version to refuse.
-
-The move is one way.
 
 ## Recovery (startup)
 
 `open` reads every segment in log order into one index. For each: if its hint is usable (see Hint file), the records it describes are applied to the index in order and `pos` starts where the hint ends; otherwise `pos` starts at the segment's base. `len` is the segment's end. Loop:
 
 1. `pos == len`: clean end, stop.
-2. Fewer than 15 bytes remain, or fewer than the header length byte 4 names (15 or 19): torn header. Truncate at `pos`.
-3. Read the header. If `header_checksum` fails: if every byte from `pos` to EOF is zero, truncate at `pos`; otherwise fail with corruption.
-4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version). Validity violations: fail with corruption.
-5. Fewer than `header_len + key_len + value_len` bytes remain: torn payload. Truncate at `pos`.
-6. Read the payload. If `payload_checksum` fails: if every byte from `pos + header_len` to EOF is zero (the header landed but the payload did not), truncate at `pos`; otherwise fail with corruption.
-7. Set inserts `key -> Entry { offset: pos, value_len, format }`. Delete removes the key. A Batch is handled as described below.
-8. `pos += header_len + key_len + value_len`. Repeat.
+2. Fewer than 19 bytes remain, or fewer than the record's length: cut short.
+3. Read the header. If `header_checksum` fails: damaged.
+4. Header is trusted. Unknown type, or lengths over the limits: fail with an unsupported-record error (likely written by a newer version), never truncated. A record inside a batch, or a validity violation: damaged.
+5. Read the payload. If `payload_checksum` fails: damaged.
+6. Set inserts `key -> Entry { offset: pos, value_len, key_len }`. Delete removes the key. A Batch is handled as described below.
+7. `pos += 19 + key_len + value_len`. Repeat.
 
 A Batch record at `pos` is followed by `body_len` bytes of records, and the batch is all or nothing:
 
-- If fewer than `body_len` bytes follow, the batch is a torn tail: truncate at `pos`.
-- Otherwise read its records with the same rules. Their operations are held back until the whole body has been read and checked. A torn or zero-filled record inside it is a torn tail from `pos`.
-- A Batch inside the body, or a record that runs past the body's end, is corruption (`BadBatch`) at `pos`.
-- Any other error inside the body is reported at `pos`, not at the record, so `repair` moves the whole batch to the side file and never leaves part of one in the log.
-- Once the body checks out, apply its operations in order and continue at `pos + 23 + body_len`.
+- If fewer than `body_len` bytes follow, the batch was cut short.
+- Otherwise read its records with the same rules. Their operations are held back until the whole body has been read and checked.
+- A record without `0x40`, a Batch inside the body, or a record that runs past the body's end is `BadBatch` at `pos`.
+- Any other error inside the body is reported at `pos`, with its own reason, not at the record, so the torn-tail rule and `repair` treat the whole batch as one and never leave part of one in the log.
+- Once the body checks out, apply its operations in order and continue at `pos + 27 + body_len`.
 
-A truncation is only allowed in the newest segment; in any other it is `CutShort` corruption at `pos` (see Segments). After the loop, if a truncation happened: truncate the segment to `pos`, `fsync`, and log a warning (`log` crate) with the offset and number of bytes dropped: `truncated a torn tail at offset 18: dropped 14 bytes`. The caller sees it only if it installs a logger. This must complete before the first new write. Otherwise the next append lands after the torn bytes, and the following startup sees mid-file corruption.
+**Torn tails.** A record cut short or damaged at `pos` in the newest segment is a torn tail if no record written on its own starts anywhere after `pos`: no header whose checksum passes at its offset and whose type lacks `0x40`, whatever its type and lengths, so a record from a newer version is never cut. Each append is one record, so everything from `pos` on is then the bytes of the last append, which a crash may have landed in any order: cut short, zeros where blocks never landed, later blocks without earlier ones. The search tries every offset after `pos` and stops at the first header that checks, so it costs a CRC per byte of the tail and only runs on damage. If a header does check, the damage is in the middle of the log: `open` fails with corruption at `pos` and leaves the log alone for `repair`. In any other segment, every damage is corruption: each was complete and fsynced before the next began.
 
-Recovery is idempotent: a crash during recovery followed by a rerun yields the same result.
+The rule before version 3 called damage torn only when every byte after it was zero, so a write whose end landed before its start failed `open` as corruption. The flag on records inside a batch is what keeps a torn batch's own records from looking like a later append.
 
-A scan of 16 MiB or more (from `pos` to the segment's end) runs on several threads. This thread reads and checks the records as above, and hands the operations to an applier thread 65,536 at a time, then reads on while that window is applied. The applier (`Index::apply_in_order`) hashes the window's keys on up to 8 threads, then has each thread apply, in log order, the operations for the shards it owns. Every operation on a key falls in that key's shard, so they still apply in the order they were written. Segments written by appends have no hint, so in steady state most of a log is scanned: at 10M keys after 20M random overwrites (2.6 GB in 10 segments, 7 with hints), `open` takes 1.8 s against 3.8 s on one thread. What remains is mostly this thread's reading: a `pread` per MiB, the checksums, and an allocation per key.
+A torn tail is never dropped silently. Unless every byte of it is zero, `open` writes it to `tally.log.torn-<pos>-<CRC32C of the bytes, 8 hex digits>`, fsyncs it, then the directory; then it truncates the segment to `pos`, fsyncs it, and logs a warning (`log` crate): `truncated a torn tail at offset 22: moved 3 bytes to <path>`, or `dropped 14 zero bytes`. The caller sees it only if it installs a logger. The truncate must complete before the first new write. Otherwise the next append lands after the torn bytes, and the following startup sees mid-file corruption. Bit rot in the last record looks the same as a torn write and is handled the same way: its bytes are saved, and the side file holds the record whole.
+
+A value whose bytes form a valid header for its own offset, which takes a CRC32C chosen on purpose, inside a torn append would make the tail look like mid-log damage: `open` then fails and `repair` moves the bytes aside. It never makes damage look torn.
+
+Recovery is idempotent: a crash during recovery followed by a rerun yields the same result. A rerun saves the same bytes to the same side file.
+
+A scan of 16 MiB or more (from `pos` to the segment's end) runs on several threads. This thread reads and checks the records as above, and hands the operations to an applier thread 65,536 at a time, then reads on while that window is applied. The applier (`Index::apply_in_order`) hashes the window's keys on up to 8 threads, then has each thread apply, in log order, the operations for the shards it owns. Every operation on a key falls in that key's shard, so they still apply in the order they were written. The window read before damage is applied too, since the damage may be a torn tail. Segments written by appends have no hint, so in steady state most of a log is scanned: at 10M keys after 20M random overwrites (2.6 GB in 10 segments, 7 with hints), `open` takes 1.8 s against 3.8 s on one thread. What remains is mostly this thread's reading: a `pread` per MiB, the checksums, and an allocation per key.
 
 ### Repair
 
-`open` never discards data outside the cases above. `Store::repair(dir) -> Result<Option<Repaired>, Error>` handles the rest:
+`open` never discards data, and saves what it cuts. `Store::repair(dir) -> Result<Option<Repaired>, Error>` handles the rest:
 
 1. Take the same exclusive lock as `open`. While a `Store` is open, repair fails with `Locked`.
 2. Scan every segment in order, reading every record (hints are not used). If `open` would succeed, return `None` and change nothing: a torn tail of the newest segment is left for `open` to truncate.
@@ -187,15 +178,15 @@ Possible later improvement: when the record after the bad one parses cleanly, dr
 
 Compaction cleans segments: it copies their live records to the end of the log and deletes them. `compact()` cleans every segment; automatic compaction cleans only the deadest (see When it runs). To clean a set of segments:
 
-1. If the last segment holds anything, start a new one (as for a write), so the copies go to a segment of their own, which then takes new writes.
+1. The copies go to a new segment at the end of the log, which then takes new writes. It is written as `tally.<base>.compact`, with its file header, so no segment holds copies until all of them are durable.
 2. Read each chosen segment in one buffered pass, checking every record's checksums, and copy the bytes of each Set record the index still points at. Each copied record's old offset is kept, 8 bytes per live key, and its key and value length go to the new segment's hint. The index is not touched yet: reads go on from the old segments. A corrupt record, live or dead, stops compaction with its offset. One sequential pass beats two positioned reads per live record even counting the dead bytes it reads past: 30 ms against 183 ms for 100k live records.
 3. Note each Delete record that must be kept: its key is not live, and a segment older than its own is not being cleaned, so that segment may hold a Set the Delete hides. When every older segment is being cleaned, the Delete is dropped.
-4. `fsync` the new segment, then write the hint's trailer and `fsync` the hint. The trailer waits for the segment's fsync because nothing orders writes to two files: a complete hint could otherwise reach the disk ahead of the copies it lists, and `open` would trust it over the intact originals. The directory is not fsynced here: the new segment's name is durable from step 1 (or from the write or `open` that made it), and the hint's name only saves `open` a full read of the segment, so it waits for the first directory fsync of step 6.
+4. `fsync` the copy, rename it to `tally.<base>.log` (over the last segment, if that is empty and so has the same base), and `fsync` the directory. Then write the hint's trailer and `fsync` the hint. The trailer waits for the copy's fsync because nothing orders writes to two files: a complete hint could otherwise reach the disk ahead of the copies it lists, and `open` would trust it over the intact originals.
 5. Point the index at the copies, reading their keys back from the hint just fsynced, so no key is held in memory. Each entry moves only if it still points at the old offset, checked and changed under its shard's lock, so a write that landed since is never undone; a copy left behind counts as dead. A read that took the old entry and then finds its segment gone looks the key up again (see Reads).
 6. Append the kept Delete records, one write and one fsync.
 7. Remove the cleaned segments and their hints, oldest first, with a directory fsync after each.
 
-Until step 7 the cleaned segments are untouched, so a failure or crash leaves the store as it was, with extra copies that are newer than the records they copy and say the same. After a failure in steps 2 to 4 the new segment is truncated to empty and fsynced, and its hint removed with a directory fsync, since a stale hint for a segment that later grows past it would look valid; the index never pointed at it. A failed fsync of the new segment is undone the same way and poisons the store (see Failed fsync), as does a failure to undo. The undo removes the hint first, and empties the segment whether or not that worked: a hint must never vouch for copies that may not be on disk, since `open` would trust it over the intact originals. If rereading the hint fails partway through step 5, the entries already moved point at durable copies and the rest at the old segments, so compaction returns the error and keeps both, and the dead bytes are counted again from the index.
+Until step 7 the cleaned segments are untouched, so a failure or crash leaves the store as it was, with extra copies that are newer than the records they copy and say the same. A failure before the rename removes the copy and its hint; the log never saw them, so even a failed fsync of the copy leaves the store writable. `open` removes any `.compact` file a crash left, and any hint without its segment. A failed directory fsync after the rename poisons the store (see Failed fsync). If writing or rereading the hint fails in steps 4 or 5, the hint is removed, the entries already moved point at durable copies and the rest at the old segments, so compaction returns the error and keeps both, and the dead bytes are counted again from the index.
 
 Writes wait while a compaction runs; reads do not.
 
@@ -203,7 +194,7 @@ The order in step 7 is what keeps deleted keys deleted. Say segment A holds `a=1
 
 The live records of the cleaned segments all land in one new segment, which can exceed `segment_bytes`: `compact()` on a 1.3 GB log writes one 1.3 GB segment.
 
-What cleaning only some segments buys is shorter pauses. Loading 10M keys of 100 bytes in batches and then overwriting 20M random keys in batches of 10,000, with the default 256 MiB segments and automatic compaction: before segments, two compactions each rewrote the whole log and stalled one batch for 8.05 and 9.01 s; with segments the slowest batch took 0.88 s, as each compaction copied a few segments. The batch p99 stayed at 17.5 ms, the 20M overwrites took 32.2 s against 43.2 s, the directory peaked at 2,672 MB against 2,815 MB, and memory at 923 MB against 890 MB. `compact()` itself costs a little more for the extra directory fsyncs: 34.6 ms against 30.9 ms at 10k live records, 42.0 against 40.1 ms at 100k. `open` of an empty store went from 75 to 120 µs (median of 5,000): 21 µs to list the directory and 14 µs to open `tally.log` and read the marker. The marker must be read, not only its size checked: a full-length marker that landed as zeros is not one.
+What cleaning only some segments buys is shorter pauses. Loading 10M keys of 100 bytes in batches and then overwriting 20M random keys in batches of 10,000, with the default 256 MiB segments and automatic compaction: before segments, two compactions each rewrote the whole log and stalled one batch for 8.05 and 9.01 s; with segments the slowest batch took 0.88 s, as each compaction copied a few segments. The batch p99 stayed at 17.5 ms, the 20M overwrites took 32.2 s against 43.2 s, the directory peaked at 2,672 MB against 2,815 MB, and memory at 923 MB against 890 MB. `compact()` itself costs a little more for the extra directory fsyncs: 34.6 ms against 30.9 ms at 10k live records, 42.0 against 40.1 ms at 100k. `open` of an empty store went from 75 to 120 µs (median of 5,000), 21 µs of it to list the directory.
 
 ### Hint file
 
@@ -214,8 +205,8 @@ magic "TLYH" | version u8 | entries | count u64 | log_len u64 | crc64 u64
 entry: type u8 | key_len u16 | value_len u32 | key
 ```
 
-- Version 2. An entry is its record's header without the two checksums (bytes 4 to 11), then the key: Set, Delete and Batch records each have one, in either record format, and an entry must pass the same type, length and validity rules as a header. `type` gives the header's length. A Batch entry has no key; the records of its body follow it as their own entries. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
-- A version 1 hint, from before 64-bit checksums, is rejected like any other bad hint: removed, and its segment read in full. That costs one slow `open` after the upgrade and loses nothing; the next compaction writes version 2.
+- Version 3. An entry is its record's header without the two checksums (bytes 4 to 11), then the key: Set, Delete and Batch records each have one, and an entry must pass the same type, length and validity rules as a header. A Batch entry has no key; the records of its body follow it as their own entries, with `0x40` in their types. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
+- A hint of another version is rejected like any other bad hint: removed, and its segment read in full.
 
 - Offsets are not stored. A hint has an entry for every record from the segment's start, end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after a compaction, and the Delete records its step 5 appended) are scanned.
 - `count` is the number of Set entries, at most the keys the hint adds. `open` reads every trailer first, with one positioned read each, and sizes the index for the largest count, never more than the log could hold (its length over 17, the shortest record), since the count is unchecked until every entry is read. Not the sum: a key overwritten in every segment would be counted once per segment. On the store below that sum was about 20M for 10M live keys, and sizing for it took the peak from 854 MB to 1.14 GB; past the largest hint, the map grows a shard at a time.
@@ -229,7 +220,7 @@ On `open`, a hint is used only if its magic, version and checksum hold, every en
 
 The cost is that `open` no longer checks the checksums of records the hint covers, which, with the hints `open` writes, is every sealed segment after its first `open`. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan, and `verify` checks every record on demand. This is the Bitcask trade.
 
-At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB. The hint was 22 bytes per key here (220 MB); version 2's type byte makes it 23. With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
+At 10M live records of 100 bytes, `open` from the hint took 1.54 to 1.61 s and peaked at 718 MB, against 2.11 s and 1.23 GB for a full scan (before the index stopped storing keys; see Index). With the 128-bit index it took 1.79 to 1.88 s at 557 MB, and reading on 8 threads took that to 0.61 to 0.67 s at 586 MB. The hint was 22 bytes per key here (220 MB); the type byte makes it 23. With 100 values of 16 MiB, `open` went from 1.18 s to 38 ms.
 
 ### Hints written by open
 
@@ -262,14 +253,14 @@ An automatic compaction never turns a successful write or `open` into an error: 
 
 `Store<F: Fs = OsFs>` reaches the disk only through two traits in `tally::fs`, so the power-cut tests can swap in an in-memory disk:
 
-- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `hard_link`, `same_file`, `sync_dir`, `list`, with `type File: LogFile`.
+- `Fs`: `create_dir`, `open_or_create`, `open_existing`, `rename`, `remove`, `sync_dir`, `list`, with `type File: LogFile`.
 - `LogFile`: `size`, `read_exact_at`, `reader_at(offset) -> impl Read`, `write_all_at`, `set_len`, `sync`, and `try_lock`. Writes go only at the current end: the real file is in append mode, where Linux ignores the offset, and the fake asserts it.
 
 Both traits are sealed: public because `Store`'s type parameter is, but implementable only inside tally. `Store::open` and `Store::repair` are defined on `Store<OsFs>` (a default type parameter is not used for inference, so a generic `open` would need annotations); the generic versions are crate-private. The traits return errors; poisoning on a failed fsync is `Store`'s.
 
 ## Index
 
-`src/index.rs`: `HashMap<u128, Entry>` where `Entry { offset: u64, value_len: u32, key_len: u16, format: Format }` (16 bytes, `key_len` and the record's format filling what was padding). Keys are not stored: each is replaced by its 128-bit SipHash-1-3 under a key drawn at random for every `open`, from std's `RandomState`, which is seeded from the OS. The map hashes that `u128` by taking its low 64 bits.
+`src/index.rs`: `HashMap<u128, Entry>` where `Entry { offset: u64, value_len: u32, key_len: u16 }` (16 bytes, `key_len` filling what was padding). Keys are not stored: each is replaced by its 128-bit SipHash-1-3 under a key drawn at random for every `open`, from std's `RandomState`, which is seeded from the OS. The map hashes that `u128` by taking its low 64 bits.
 
 - No allocation per key, and 32 bytes per slot whatever the key's length. At 10M keys of 16 bytes, building the index alone went from 78 to 58 ns per key and from 681 to 528 MB, and `open` from the hint from 718 to 557 MB at peak. The saving grows with key length.
 - The keyed hash also restores HashDoS resistance, which foldhash (the hasher before) did not claim: without the key, no one can choose keys that land in the same slot. That was a prerequisite for keys arriving over the network.
@@ -291,7 +282,7 @@ Both traits are sealed: public because `Store`'s type parameter is, but implemen
 `get` always verifies:
 
 1. Look up the key. Missing: return `None` with no I/O.
-2. Read the record at `offset` in one positioned read of `header_len + key_len + value_len` bytes, all from the index entry (`header_len` from its format). If the header there gives other lengths, or the read runs past the end, read it again the old way (header, then the payload length the header gives), so errors report what is actually on disk. One read instead of two took a 1 KiB hit from 1.30 µs to 0.82 µs.
+2. Read the record at `offset` in one positioned read of `19 + key_len + value_len` bytes, all from the index entry. If the header there gives other lengths, or the read runs past the end, read it again the old way (header, then the payload length the header gives), so errors report what is actually on disk. One read instead of two took a 1 KiB hit from 1.30 µs to 0.82 µs.
 3. Verify both checksums and that the stored key equals the requested key.
 4. Return the value. Any failure returns a corruption error, never `None`.
 
@@ -311,8 +302,8 @@ One error enum, marked `#[non_exhaustive]` so variants can be added without brea
 | ------------- | -------------------------------------------------- | ----------------------------------------- |
 | I/O           | disk full, permission denied                       | environment problem; may retry or give up |
 | Corruption    | bad checksum, invalid record, cut-short or overlapping segment, with the log offset | run `repair`  |
-| Unsupported   | unknown record type, lengths over current limits   | upgrade tally                             |
-| Invalid input | empty key or value, over the limit                 | fix the input                             |
+| Unsupported   | unknown record type, lengths over current limits, a store of another version | use the version that wrote it |
+| Invalid input | empty key, over the limit                          | fix the input                             |
 | Locked        | store already open in another `Store` or process   | close the other one, or wait              |
 
 | Poisoned      | an earlier fsync, directory fsync or truncate failed | reopen the store                       |
@@ -322,20 +313,20 @@ Bugs (broken internal invariants) panic. Errors are for failures that can happen
 ## Testing
 
 - **Kill test** (`tests/kill.rs`): the test binary runs itself as a child that applies a seeded sequence of set, delete, reopen, compact and batch, with automatic compaction at 50% dead and no size floor and 16 KiB segments, printing an ack after each `Ok`. Every other run, the child runs four such sequences on four threads sharing one store, each on keys of its own, with compactions in place of reopens, so writes land in groups and compactions run between them; each sequence's acks are checked on their own. The parent `kill -9`s it after a random delay, three times on the same directory without opening it in between, so kills also land in the next child's `open` and recovery. Then the parent opens the store and checks that `open` succeeds, that the state is that of every acknowledged operation with each round's in-flight operation applied or not, and that a write after recovery survives a reopen. `TALLY_KILL_RUNS` (default 20) and `TALLY_KILL_SEED`; CI runs 1,000 on Linux. This cannot detect a missing `fsync`, because the OS page cache survives process death.
-- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions, batches, and a group of sets, deletes and a batch written as one, as writes from several threads are (a cut may keep any prefix of its writes) and runs with automatic compaction at 50% dead, no size floor and 64-byte segments, so most writes start a segment and most compactions clean some segments and keep others; the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn or as zeros, one file landing all its changes while the others land none or their next write as zeros (nothing orders writes across files), and any of the changes to directory entries since the directory's last sync: each create, remove or rename lands whole or not at all, in any combination that keeps the changes to each name in order, and everything under a lost directory is lost. A directory sync makes the directory's entries exactly what they are now. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file), cut the move from one file to segments at every step, and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests, with one exception, from the hint file. The hint's own fsync: a torn hint fails its checksum and `open` reads the whole log, so correctness never rests on it, and it is kept so that no 32-bit checksum ever has to vouch for one. A single directory fsync after all the removals, instead of one after each, is caught (a deleted key comes back), as is removing the cleaned segments newest first. Letting unsynced directory changes land in any combination, not only all or none at the next directory sync, also found two states that a crash on a real disk can leave and that had to be handled: a `tally.log` whose name landed with its marker still zeros, which `open` refused as records written by an earlier version, and a side file whose name landed with its bytes still zeros, which `repair` refused to overwrite.
-- **A full disk, and failed fsyncs and truncates:** the in-memory disk can be given a free-space limit (`MemFs::limit_free_space`). A write that doesn't fit lands what fits and fails with `StorageFull`, as a full disk does, and truncating frees what it cut. The tests of hints that `open` couldn't finish use it, as do the tests that a failed write is truncated away and leaves the store writable. `MemFs::fail_truncates` and `fail_dir_syncs` make every truncate or directory sync fail. `fail_syncs` makes every file sync fail as Linux does: what it would have made durable never reaches the disk, even after a later sync, while reads still see it. Tests check that a failed fsync in a write or a compaction, a failed directory fsync when starting a segment, and a failed truncate after a failed write poison the store, that reads go on, and that after a reopen and a power cut a failed write is gone and later ones are kept.
+- **Power-cut simulation** (`src/power_cut.rs`, on the in-memory disk in `src/mem_fs.rs`): runs a workload and cuts the power before every step it takes, a step being any write, truncate, file sync, directory create, rename or directory sync. The workload includes explicit compactions, batches, and a group of sets, deletes and a batch written as one, as writes from several threads are (a cut may keep any prefix of its writes) and runs with automatic compaction at 50% dead, no size floor and 64-byte segments, so most writes start a segment and most compactions clean some segments and keep others; the power is also cut after its last step. For each cut it tries every way the disk could be left: any prefix of the unsynced changes landing, the next write landing torn, as zeros, or with its second half and not its first, one file landing all its changes while the others land none or their next write as zeros (nothing orders writes across files), and any of the changes to directory entries since the directory's last sync: each create, remove or rename lands whole or not at all, in any combination that keeps the changes to each name in order, and everything under a lost directory is lost. A directory sync makes the directory's entries exactly what they are now. After each, `open` must succeed with every acknowledged write, and recovery is itself cut at every step and checked the same way. Separate tests cut `repair` at every step (no byte is ever missing from both the log and the side file) and check that what `open` served from a dead process's unsynced write survives a cut. Deleting any one fsync or directory sync from `open`, `append`, `repair` or `compact` fails these tests, with one exception, from the hint file. The hint's own fsync: a torn hint fails its checksum and `open` reads the whole log, so correctness never rests on it, and it is kept so that no 32-bit checksum ever has to vouch for one. A single directory fsync after all the removals, instead of one after each, is caught (a deleted key comes back), as is removing the cleaned segments newest first. Letting unsynced directory changes land in any combination, not only all or none at the next directory sync, also found a state that a crash on a real disk can leave and that had to be handled: a side file whose name landed with its bytes still zeros, which `repair` refused to overwrite. The main test checks 584,293 disk states.
+- **A full disk, and failed fsyncs and truncates:** the in-memory disk can be given a free-space limit (`MemFs::limit_free_space`). A write that doesn't fit lands what fits and fails with `StorageFull`, as a full disk does, and truncating frees what it cut. The tests of hints that `open` couldn't finish use it, as do the tests that a failed write is truncated away and leaves the store writable. `MemFs::fail_truncates` and `fail_dir_syncs` make every truncate or directory sync fail. `fail_syncs` makes every file sync fail as Linux does: what it would have made durable never reaches the disk, even after a later sync, while reads still see it. Tests check that a failed fsync in a write, a failed directory fsync when starting a segment, and a failed truncate after a failed write poison the store, that a failed fsync of a compaction's copy leaves it writable, that reads go on, and that after a reopen and a power cut a failed write is gone and later ones are kept.
 - **Threads:** a test holds the writer lock while 8 threads queue a `set` each, then checks the 8 share 2 fsyncs; another checks a group's writes apply in order with one. Readers check every value while 4 threads write and 20 compactions run, which fails if a compaction publishes the copies' length after pointing the index at them. A test drives the read that finds its segment removed, deterministically. Three check the leader's wait: none after a group of one, a wait that ends when the queue refills (three threads, one fsync), and one that ends at 10% of the last fsync. Others check that a thread panicking under the writer lock poisons the store, that a failed compaction leaves no hint behind, and that a group that writes nothing does not compact.
-- **Corruption tests:** truncated tails, zero-filled tails, flipped bits in the header, payload, and lengths, mid-file corruption.
+- **Corruption tests:** truncated tails, zero-filled tails, a record whose end landed without its start, flipped bits in the header, payload, and lengths, a valid record at another offset, mid-file corruption, damaged and torn segment headers, and directories of other versions.
 - **Model test** (`tests/model.rs`): random sequences of set, get, delete, batch and reopen against a `HashMap`, with 100-byte segments, checking every read after every step. Half the cases run with automatic compaction at 50% dead and no floor, so it cleans some segments and keeps others, and check the log is at least as long as the live records; the rest check the log is exactly as long as the writes. Real fsyncs, so the default case count is small; `PROPTEST_CASES=2000 cargo test --test model` for a long run. A second test runs 4 threads on one store, each with keys and a `HashMap` of its own, doing sets, gets, deletes, batches and compactions; each checks its own reads, then all are checked after a reopen, with `verify`.
 - **Codec properties** (`record.rs`): round trip, any one-byte change is rejected by the checksum covering it, `decode_header` accepts exactly the valid headers, and a valid header with a matching payload always decodes.
-- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records and batches, then damaged), `ops` (the model test, coverage-guided, on the in-memory disk, where it runs about 4 times faster than on files; the input chooses whether automatic compaction runs), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
+- **Fuzzing** (`fuzz/`, nightly and `cargo-fuzz`): `cargo +nightly fuzz run <target>` with targets `decode` (arbitrary bytes, optionally with checksums fixed up so the fuzzer gets past them), `open` (logs built from arbitrary records and batches, then truncated, given a changed byte, or zeroed over any range, with the torn-tail rule as the oracle), `ops` (the model test, coverage-guided, on the in-memory disk, where it runs about 4 times faster than on files; the input chooses whether automatic compaction runs), and `hint` (a compacted store with more writes after it and a hint changed, truncated or replaced with arbitrary bytes: `open` must still read back every key). Fuzz builds skip fsync: durability cannot be observed there and fsync would cut throughput a hundredfold.
 - **Benchmarks** (`cargo bench`): `write` with batches of 10, 100 and 1,000; `concurrent set` from 1, 4, 16 and 64 threads; `set` next to a bare append + `sync_all` baseline and with overwrites of 1,000 keys under the default automatic compaction (which fails if the log outgrows twice its live size, so compaction must have run), `get` hit in the active and in a sealed segment, and miss, `open` on an empty log and at 10k and 100k records, and `compact` at 10k and 100k live records. The empty-log `open` fsyncs files with nothing dirty, so it shows the fixed cost of `open`, not the cost of a real fsync; `set` shows that.
 
 ### Done criteria
 
 - 1,000 random-kill runs lose zero acknowledged writes.
 - Power-cut simulation loses zero acknowledged writes.
-- A torn or zero-filled tail is truncated on open. Mid-file corruption fails `open` and `repair` recovers it.
+- A torn tail is saved and truncated on open. Mid-file corruption fails `open` and `repair` recovers it.
 - A benchmark reports writes per second.
 
 ## Dependencies

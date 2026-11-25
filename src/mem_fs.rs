@@ -89,6 +89,9 @@ pub(crate) enum Torn {
     Nothing,
     Bytes(usize),
     Zeros(usize),
+    /// The write's bytes from this many on, with zeros before them: a later
+    /// block of it landed and an earlier one didn't.
+    Holes(usize),
 }
 
 impl Disk {
@@ -162,15 +165,19 @@ impl Disk {
                     _ => None,
                 });
             if let Some(len) = next_write {
-                for n in [1, len / 2, len.saturating_sub(1)] {
-                    if n > 0 && n < len {
-                        cuts.push(Cut {
-                            keep,
-                            torn: Torn::Bytes(n),
-                            entries: 0,
-                            whole: None,
-                        });
-                    }
+                let half = len / 2;
+                let tears = [1, half, len.saturating_sub(1)]
+                    .into_iter()
+                    .filter(|&n| n > 0 && n < len)
+                    .map(Torn::Bytes)
+                    .chain((half > 0).then_some(Torn::Holes(half)));
+                for torn in tears {
+                    cuts.push(Cut {
+                        keep,
+                        torn,
+                        entries: 0,
+                        whole: None,
+                    });
                 }
                 cuts.push(Cut {
                     keep,
@@ -219,6 +226,10 @@ impl Disk {
                         Torn::Nothing => None,
                         Torn::Bytes(n) => Some(bytes[..n.min(bytes.len())].to_vec()),
                         Torn::Zeros(n) => Some(vec![0; n.min(bytes.len())]),
+                        Torn::Holes(n) => {
+                            let n = n.min(bytes.len());
+                            Some([&vec![0; n][..], &bytes[n..]].concat())
+                        }
                     };
                     if let Some(bytes) = landed {
                         apply(
@@ -501,27 +512,6 @@ impl Fs for MemFs {
         Ok(())
     }
 
-    fn hard_link(&self, from: &Path, to: &Path) -> io::Result<()> {
-        self.step();
-        let mut state = self.0.borrow_mut();
-        let disk = &mut state.disk;
-        assert_eq!(from.parent(), to.parent(), "links stay in one directory");
-        if disk.files.contains_key(to) {
-            return Err(ErrorKind::AlreadyExists.into());
-        }
-        let ino = *disk.files.get(from).ok_or(ErrorKind::NotFound)?;
-        disk.files.insert(to.to_path_buf(), ino);
-        disk.entry_changes
-            .push(EntryChange(vec![(to.to_path_buf(), Some(ino))]));
-        Ok(())
-    }
-
-    fn same_file(&self, a: &Path, b: &Path) -> io::Result<bool> {
-        let state = self.0.borrow();
-        let ino = |path| state.disk.files.get(path).ok_or(ErrorKind::NotFound);
-        Ok(ino(a)? == ino(b)?)
-    }
-
     fn list(&self, path: &Path) -> io::Result<Vec<String>> {
         let state = self.0.borrow();
         state.disk.has_dir(path)?;
@@ -773,6 +763,34 @@ mod tests {
                 (b"12".to_vec(), b"\0".to_vec()),
                 (b"".to_vec(), b"3".to_vec()),
                 (b"\0".to_vec(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_torn_write_can_land_its_end_without_its_start() {
+        let fs = MemFs::new();
+        let a = fs.open_or_create(Path::new("/a")).unwrap();
+        fs.sync_dir(Path::new("/")).unwrap();
+        a.write_all_at(b"1234", 0).unwrap();
+        let disk = fs.disk();
+        let mut landed: Vec<Vec<u8>> = disk
+            .cuts()
+            .into_iter()
+            .map(|cut| MemFs::after(&disk, cut).read(Path::new("/a")).unwrap())
+            .collect();
+        landed.sort();
+        landed.dedup();
+        assert_eq!(
+            landed,
+            [
+                b"".to_vec(),
+                b"\0\0\0\0".to_vec(),
+                b"\0\0\x334".to_vec(),
+                b"1".to_vec(),
+                b"12".to_vec(),
+                b"123".to_vec(),
+                b"1234".to_vec(),
             ]
         );
     }
