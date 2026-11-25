@@ -36,33 +36,42 @@ fn value(len: usize) -> Value {
     Value::try_from(&vec![0x5a; len][..]).unwrap()
 }
 
-/// Encodes one Set record. A second, independent implementation of the
-/// format, so large fixtures can be written without one fsync per record.
+/// Encodes one Set record at the end of `out`, whose first byte is at log
+/// offset 0. A second, independent implementation of the format, so large
+/// fixtures can be written without one fsync per record.
 fn encode_set(out: &mut Vec<u8>, key: &[u8], value: &[u8]) {
+    let offset = out.len() as u64;
     let mut header = [0u8; 19];
-    header[4] = 0x11;
+    header[4] = 0x31;
     header[5..7].copy_from_slice(&(key.len() as u16).to_le_bytes());
     header[7..11].copy_from_slice(&(value.len() as u32).to_le_bytes());
     let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc64Nvme);
     digest.update(key);
     digest.update(value);
     header[11..19].copy_from_slice(&digest.finalize().to_le_bytes());
-    let header_checksum = crc32c::crc32c(&header[4..]);
+    let header_checksum =
+        crc32c::crc32c_append(crc32c::crc32c(&offset.to_le_bytes()), &header[4..]);
     header[..4].copy_from_slice(&header_checksum.to_le_bytes());
     out.extend_from_slice(&header);
     out.extend_from_slice(key);
     out.extend_from_slice(value);
 }
 
-/// Writes `n` distinct Set records to `dir/tally.log`, then checks that a
-/// store opened on it agrees, so a broken fixture fails loudly.
+/// Writes `n` distinct Set records to the first segment in `dir`, then
+/// checks that a store opened on it agrees, so a broken fixture fails
+/// loudly.
 fn write_fixture(dir: &Path, n: u64, value_len: usize) {
     let value_bytes = vec![0x5a; value_len];
     let mut out = Vec::new();
     for i in 0..n {
         encode_set(&mut out, key_bytes(i).as_bytes(), &value_bytes);
     }
-    fs::write(dir.join("tally.log"), out).unwrap();
+    // Magic, version 3, base 0, and the CRC32C of those 13 bytes.
+    let mut file = b"TLYS\x03".to_vec();
+    file.extend_from_slice(&0u64.to_le_bytes());
+    file.extend_from_slice(&crc32c::crc32c(&file).to_le_bytes());
+    file.extend_from_slice(&out);
+    fs::write(dir.join("tally.00000000000000000000.log"), file).unwrap();
     let store = Store::open(dir).unwrap();
     assert_eq!(store.get(&key(n - 1)).unwrap(), Some(value(value_len)));
 }

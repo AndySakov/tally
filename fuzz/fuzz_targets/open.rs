@@ -1,27 +1,27 @@
 //! Builds a log from arbitrary records and batches, optionally damages it,
-//! and opens it. A batch is one unit: applied whole or not at all, and any
-//! error inside it is reported at its start.
+//! and opens it. A unit is a record on its own or a batch: applied whole or
+//! not at all, and any error inside it is reported at its start.
 //!
-//! - Undamaged: `open` succeeds and every key reads back the value the
-//!   records describe.
-//! - Truncated anywhere, or zero bytes appended: `open` succeeds with the
-//!   state of the complete records and truncates the log after the last one.
-//! - One byte changed: the record holding it fails its header checksum (if
-//!   the byte is in its first 19 bytes) or its payload checksum. CRC32C
-//!   catches any change confined to 32 bits, and CRC-64 any confined to 64.
-//!   A changed type byte that names the old format makes the header read
-//!   15 bytes long, and its checksum still fails. If every byte that checksum
-//!   covers, through to the end of the log, is zero, the record is a torn
-//!   tail and is truncated; otherwise `open` fails with corruption at the
-//!   start of the record and leaves the log alone.
+//! - Undamaged, or zeros appended: `open` succeeds and every key reads back
+//!   the value the records describe.
+//! - Truncated anywhere: `open` succeeds with the state of the complete
+//!   units, truncates the log after the last one, and saves the bytes it
+//!   cut, unless they are all zeros.
+//! - Bytes changed or zeroed: the first unit they changed is damaged. If a
+//!   later unit's header is intact, `open` fails with corruption at the
+//!   damaged unit and leaves the log alone: its header checksum if the
+//!   first changed record changed in its first 19 bytes, else its payload
+//!   checksum. Otherwise the damage is a torn tail, which `open` truncates
+//!   and saves like a cut one.
 
 #![no_main]
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use tally::fuzz::{HEADER_LEN, Record, encode};
+use tally::fuzz::{HEADER_LEN, Place, Record, encode, segment_file};
 use tally::{CorruptionReason, Error, Key, Store, Value};
 
 #[derive(Arbitrary, Debug)]
@@ -35,6 +35,34 @@ enum Op {
 enum Inner {
     Set { key: u8, value: Vec<u8> },
     Delete { key: u8 },
+}
+
+#[derive(Arbitrary, Debug)]
+enum Damage {
+    None,
+    Truncate { at: u32 },
+    ChangeByte { at: u32, mask: u8 },
+    Zero { at: u32, len: u16 },
+    ZeroTail { len: u8 },
+}
+
+#[derive(Arbitrary, Debug)]
+struct Input {
+    ops: Vec<Op>,
+    damage: Damage,
+}
+
+type State = HashMap<u8, Vec<u8>>;
+
+/// The records of one unit, as (start, end), in log order.
+struct Unit {
+    start: usize,
+    end: usize,
+    records: Vec<(usize, usize)>,
+}
+
+fn key(k: u8) -> Key {
+    Key::try_from(&[k][..]).unwrap()
 }
 
 /// The record for one set or delete, applied to `state`. `None` for a set
@@ -56,28 +84,14 @@ fn record(op: Inner, state: &mut State) -> Option<Record> {
     }
 }
 
-#[derive(Arbitrary, Debug)]
-enum Damage {
-    None,
-    Truncate { at: u32 },
-    ChangeByte { at: u32, mask: u8 },
-    ZeroTail { len: u8 },
-}
-
-#[derive(Arbitrary, Debug)]
-struct Input {
-    ops: Vec<Op>,
-    damage: Damage,
-}
-
-type State = HashMap<u8, Vec<u8>>;
-
-fn key(k: u8) -> Key {
-    Key::try_from(&[k][..]).unwrap()
+fn push(record: &Record, place: Place, log: &mut Vec<u8>) -> (usize, usize) {
+    let start = log.len();
+    encode(record, place, start as u64, log);
+    (start, log.len())
 }
 
 enum Expect {
-    /// `open` succeeds with this state and leaves the log `len` bytes long.
+    /// `open` succeeds with this state and cuts the log at `len`.
     Opens { state: State, len: usize },
     Corrupt {
         offset: u64,
@@ -87,104 +101,80 @@ enum Expect {
 
 fuzz_target!(|input: Input| {
     let mut log = Vec::new();
-    // `boundaries[i]` is the log length after `i` units (a record or a whole
-    // batch); `states[i]` is the key-value state after them. `starts` holds
-    // each record's start and the start of the unit it belongs to.
-    let mut boundaries = vec![0];
+    let mut units: Vec<Unit> = Vec::new();
+    // `states[i]` is the state after the first `i` units.
     let mut states = vec![State::new()];
-    let mut starts: Vec<(usize, usize)> = Vec::new();
     let mut state = State::new();
 
     for op in input.ops {
-        let unit = log.len();
-        match op {
+        let start = log.len();
+        let records = match op {
             Op::Set { key, value } => {
                 let Some(record) = record(Inner::Set { key, value }, &mut state) else {
                     continue;
                 };
-                starts.push((unit, unit));
-                encode(&record, &mut log);
+                vec![push(&record, Place::Top, &mut log)]
             }
             Op::Delete { key } => {
                 let record = record(Inner::Delete { key }, &mut state).unwrap();
-                starts.push((unit, unit));
-                encode(&record, &mut log);
+                vec![push(&record, Place::Top, &mut log)]
             }
             Op::Batch(inner) => {
-                let mut body = Vec::new();
-                let mut inner_starts = Vec::new();
+                let frame = push(&Record::Batch { body_len: 0 }, Place::Top, &mut log);
+                let mut records = vec![frame];
                 for op in inner {
                     if let Some(record) = record(op, &mut state) {
-                        inner_starts.push(body.len());
-                        encode(&record, &mut body);
+                        records.push(push(&record, Place::Inner, &mut log));
                     }
                 }
-                starts.push((unit, unit));
-                encode(
-                    &Record::Batch {
-                        body_len: body.len() as u64,
-                    },
-                    &mut log,
-                );
-                let body_start = log.len();
-                starts.extend(inner_starts.into_iter().map(|s| (body_start + s, unit)));
-                log.extend_from_slice(&body);
+                let body_len = (log.len() - frame.1) as u64;
+                let mut sealed = Vec::new();
+                encode(&Record::Batch { body_len }, Place::Top, start as u64, &mut sealed);
+                log[start..frame.1].copy_from_slice(&sealed);
+                records
             }
-        }
-        boundaries.push(log.len());
+        };
+        units.push(Unit {
+            start,
+            end: log.len(),
+            records,
+        });
         states.push(state.clone());
     }
 
+    let original = log.clone();
+    let opens_at = |units_kept: usize, states: &mut Vec<State>| Expect::Opens {
+        state: states.swap_remove(units_kept),
+        len: units_kept.checked_sub(1).map_or(0, |i| units[i].end),
+    };
     let expect = match input.damage {
-        Damage::None => Expect::Opens {
-            state,
-            len: log.len(),
-        },
-        Damage::Truncate { at } => {
-            let len = at as usize % (log.len() + 1);
-            log.truncate(len);
-            let i = boundaries.iter().rposition(|&b| b <= len).unwrap();
-            Expect::Opens {
-                state: states.swap_remove(i),
-                len: boundaries[i],
-            }
-        }
-        Damage::ChangeByte { at, mask } => {
-            if log.is_empty() || mask == 0 {
-                return;
-            }
-            let i = at as usize % log.len();
-            log[i] ^= mask;
-            let &(start, unit) = starts.iter().rfind(|&&(s, _)| s <= i).unwrap();
-            let r = boundaries.iter().position(|&b| b == unit).unwrap();
-            let (covered_from, reason) = if i - start < HEADER_LEN {
-                (start, CorruptionReason::HeaderChecksum)
-            } else {
-                (start + HEADER_LEN, CorruptionReason::PayloadChecksum)
-            };
-            if log[covered_from..].iter().all(|&b| b == 0) {
-                Expect::Opens {
-                    state: states.swap_remove(r),
-                    len: unit,
-                }
-            } else {
-                Expect::Corrupt {
-                    offset: unit as u64,
-                    reason,
-                }
-            }
-        }
+        Damage::None => opens_at(units.len(), &mut states),
         Damage::ZeroTail { len } => {
-            let end = log.len();
-            log.resize(end + len as usize, 0);
-            Expect::Opens { state, len: end }
+            log.resize(log.len() + len as usize, 0);
+            opens_at(units.len(), &mut states)
+        }
+        Damage::Truncate { at } => {
+            log.truncate(at as usize % (log.len() + 1));
+            let kept = units.iter().take_while(|u| u.end <= log.len()).count();
+            opens_at(kept, &mut states)
+        }
+        Damage::ChangeByte { .. } | Damage::Zero { .. } if log.is_empty() => return,
+        Damage::ChangeByte { at, mask } => {
+            log[at as usize % original.len()] ^= mask;
+            damaged(&units, &original, &log, &mut states)
+        }
+        Damage::Zero { at, len } => {
+            let at = at as usize % original.len();
+            let end = (at + len as usize).min(original.len());
+            log[at..end].fill(0);
+            damaged(&units, &original, &log, &mut states)
         }
     };
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("tally.log"), &log).unwrap();
-    // `open` makes a log from before segments the segment at 0.
     let path = dir.path().join("tally.00000000000000000000.log");
+    let file = segment_file(0, &log);
+    std::fs::write(&path, &file).unwrap();
     let opened = Store::open(dir.path());
 
     match expect {
@@ -197,11 +187,18 @@ fuzz_target!(|input: Input| {
                     state.get(&k).map(Vec::as_slice)
                 );
             }
-            let on_disk = std::fs::metadata(&path).unwrap().len();
             assert_eq!(
-                on_disk, len as u64,
-                "open must truncate after the last record"
+                std::fs::read(&path).unwrap(),
+                segment_file(0, &log[..len]),
+                "open must truncate after the last unit"
             );
+            let cut = &log[len..];
+            let saved = torn_file(dir.path(), len);
+            if cut.iter().all(|&b| b == 0) {
+                assert_eq!(saved, None, "zeros are not saved");
+            } else {
+                assert_eq!(saved.as_deref(), Some(cut), "the cut bytes are saved");
+            }
         }
         Expect::Corrupt { offset, reason } => {
             match opened {
@@ -216,9 +213,50 @@ fuzz_target!(|input: Input| {
             }
             assert_eq!(
                 std::fs::read(&path).unwrap(),
-                log,
+                file,
                 "a failed open must not touch the log"
             );
         }
     }
 });
+
+/// What `open` must do with `log`, which is `original` with some bytes
+/// changed.
+fn damaged(units: &[Unit], original: &[u8], log: &[u8], states: &mut Vec<State>) -> Expect {
+    let changed = |(start, end): (usize, usize)| original[start..end] != log[start..end];
+    let Some(u) = units.iter().position(|u| changed((u.start, u.end))) else {
+        return Expect::Opens {
+            state: states.pop().unwrap(),
+            len: log.len(),
+        };
+    };
+    let header_intact = |u: &Unit| !changed((u.start, u.start + HEADER_LEN));
+    if !units[u + 1..].iter().any(header_intact) {
+        return Expect::Opens {
+            state: states.swap_remove(u),
+            len: units[u].start,
+        };
+    }
+    let &(start, _) = units[u].records.iter().find(|&&r| changed(r)).unwrap();
+    let reason = if changed((start, start + HEADER_LEN)) {
+        CorruptionReason::HeaderChecksum
+    } else {
+        CorruptionReason::PayloadChecksum
+    };
+    Expect::Corrupt {
+        offset: units[u].start as u64,
+        reason,
+    }
+}
+
+/// The bytes `open` saved from a torn tail at `offset`, if it saved any.
+fn torn_file(dir: &Path, offset: usize) -> Option<Vec<u8>> {
+    let prefix = format!("tally.log.torn-{offset}-");
+    let mut found = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.starts_with(&prefix));
+    let name = found.next()?;
+    assert_eq!(found.next(), None, "one side file per torn tail");
+    Some(std::fs::read(dir.join(name)).unwrap())
+}

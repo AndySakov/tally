@@ -56,13 +56,14 @@ fn key(k: u8) -> Key {
     Key::try_from(&key_bytes(k)[..]).unwrap()
 }
 
-/// Bytes across the log's segment files, `tally.<20 digits>.log`.
+/// Bytes of records across the log's segment files, `tally.<20
+/// digits>.log`, each after a 17-byte file header.
 fn log_len(fs: &MemFs, dir: &Path) -> u64 {
     fs.list(dir)
         .unwrap()
         .into_iter()
         .filter(|name| name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log"))
-        .map(|name| fs.read(&dir.join(name)).unwrap().len() as u64)
+        .map(|name| fs.read(&dir.join(name)).unwrap().len() as u64 - 17)
         .sum()
 }
 
@@ -107,6 +108,7 @@ fuzz_target!(|input: (bool, Vec<Op>)| {
             Op::Batch(ops) => {
                 let mut batch = Batch::new();
                 let mut written = 0u64;
+                let mut records = 0;
                 for (k, v) in ops {
                     let k = k % KEY_SPACE;
                     match v {
@@ -116,19 +118,23 @@ fuzz_target!(|input: (bool, Vec<Op>)| {
                             };
                             batch.set(key(k), value);
                             written += (HEADER_LEN + key_bytes(k).len() + v.len()) as u64;
+                            records += 1;
                             model.insert(k, v);
                         }
                         None => {
                             batch.delete(key(k));
                             if model.remove(&k).is_some() {
                                 written += (HEADER_LEN + key_bytes(k).len()) as u64;
+                                records += 1;
                             }
                         }
                     }
                 }
                 store.write(batch).unwrap();
-                if written > 0 {
-                    expected_len += (HEADER_LEN + 8) as u64 + written;
+                // More than one record goes inside a Batch record.
+                expected_len += written;
+                if records > 1 {
+                    expected_len += (HEADER_LEN + 8) as u64;
                 }
             }
             Op::Compact => {

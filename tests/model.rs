@@ -160,7 +160,8 @@ fn key(k: u8) -> Key {
     Key::try_from(&key_bytes(k)[..]).unwrap()
 }
 
-/// Bytes across the log's segment files, `tally.<20 digits>.log`.
+/// Bytes of records across the log's segment files, `tally.<20
+/// digits>.log`, each after a 17-byte file header.
 fn log_len(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
         .unwrap()
@@ -170,7 +171,7 @@ fn log_len(dir: &Path) -> u64 {
             let name = name.to_string_lossy();
             name.len() == 30 && name.starts_with("tally.") && name.ends_with(".log")
         })
-        .map(|e| e.metadata().unwrap().len())
+        .map(|e| e.metadata().unwrap().len() - 17)
         .sum()
 }
 
@@ -218,24 +219,29 @@ proptest! {
                 Op::Batch(ops) => {
                     let mut batch = Batch::new();
                     let mut written = 0u64;
+                    let mut records = 0;
                     for (k, v) in ops {
                         match v {
                             Some(v) => {
                                 batch.set(key(k), Value::try_from(&v[..]).unwrap());
                                 written += HEADER_LEN + key_bytes(k).len() as u64 + v.len() as u64;
+                                records += 1;
                                 model.insert(k, v);
                             }
                             None => {
                                 batch.delete(key(k));
                                 if model.remove(&k).is_some() {
                                     written += HEADER_LEN + key_bytes(k).len() as u64;
+                                    records += 1;
                                 }
                             }
                         }
                     }
                     store.write(batch).unwrap();
-                    if written > 0 {
-                        expected_len += HEADER_LEN + 8 + written;
+                    // More than one record goes inside a Batch record.
+                    expected_len += written;
+                    if records > 1 {
+                        expected_len += HEADER_LEN + 8;
                     }
                 }
             }

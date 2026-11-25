@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs::TryLockError;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::num::NonZero;
@@ -9,36 +9,22 @@ use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use crate::fs::{Fs, LogFile, OsFs};
-use crate::hint::{self, COMPACT_HINT_FILE_NAME, HINT_FILE_NAME};
+use crate::hint;
 use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
-    Fields, Format, HEADER_LEN, Header, IndexOp, Kind, Record, SHORTEST_HEADER_LEN, decode_header,
-    decode_index_op, decode_payload, encode, encode_set,
+    BATCH_PAYLOAD_LEN, Fields, HEADER_LEN, Header, IndexOp, Kind, Place, Record, decode_header,
+    decode_index_op, decode_payload, encode, move_header, record_len, starts_a_record,
 };
-use crate::segment::{Segment, hint_name, log_name, parse_hint_name, parse_log_name};
-use crate::{Batch, CorruptionReason, DecodeError, Error, Key, Value};
+use crate::segment::{
+    FILE_HEADER_LEN, FileHeader, Segment, check_file_header, compact_name, create, hint_name,
+    log_name, parse_compact_name, parse_hint_name, parse_log_name, start_file,
+};
+use crate::{Batch, CorruptionReason, Error, Key, UnsupportedReason, Value};
 
-/// The log before it was split into segments, and now the marker that
-/// keeps earlier versions of tally out (DESIGN.md, Segments).
+/// The one-file log of tally before segments, which this version refuses.
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
-/// Where an earlier version's compaction wrote the new log.
-const COMPACT_FILE_NAME: &str = "tally.log.compact";
-/// Where the marker is written before it is renamed over `tally.log`.
-const MARKER_FILE_NAME: &str = "tally.log.marker";
-
-/// What `tally.log` holds once the log is in segments: a record header of
-/// type 255 with valid checksums, which every earlier version reads as an
-/// unsupported record at offset 0 instead of starting an empty log.
-pub(crate) fn marker() -> [u8; SHORTEST_HEADER_LEN] {
-    let mut bytes = [0u8; SHORTEST_HEADER_LEN];
-    bytes[4] = 0xff;
-    bytes[11..15].copy_from_slice(&crc32c::crc32c(&[]).to_le_bytes());
-    let checksum = crc32c::crc32c(&bytes[4..]);
-    bytes[..4].copy_from_slice(&checksum.to_le_bytes());
-    bytes
-}
 
 /// What `Store::repair` moved out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,13 +108,16 @@ pub(crate) enum Write {
 }
 
 impl Write {
-    /// About how many bytes it writes, to cap a group.
-    fn size(&self) -> usize {
-        let records = match self {
+    fn records(&self) -> &[Record] {
+        match self {
             Write::One(record) => std::slice::from_ref(record),
             Write::Batch(records) => records,
-        };
-        records
+        }
+    }
+
+    /// About how many bytes it writes, to cap a group.
+    fn size(&self) -> usize {
+        self.records()
             .iter()
             .map(|record| match record {
                 Record::Set { key, value } => key.as_bytes().len() + value.as_bytes().len(),
@@ -171,19 +160,19 @@ impl Store {
     /// segment, from its hint and the records written after it if a
     /// compaction left a usable one, otherwise by reading every record. A
     /// hint that can't be used is logged as a warning and removed
-    /// (DESIGN.md, Hint file). A log from before segments, a lone
-    /// `tally.log`, becomes the first segment (DESIGN.md, Segments).
-    /// Takes an exclusive lock on `tally.lock`: a second `open` of the same
-    /// directory fails with `Locked` until this `Store` is dropped.
+    /// (DESIGN.md, Hint file). A directory written by another version of
+    /// tally fails with `Unsupported`. Takes an exclusive lock on
+    /// `tally.lock`: a second `open` of the same directory fails with
+    /// `Locked` until this `Store` is dropped.
     ///
     /// Creating any file requires an fsync of its parent directory (see
     /// DESIGN.md, New files).
     ///
-    /// A torn or zero-filled tail of the newest segment is truncated,
-    /// fsynced and logged as a warning before `open` returns. Any other bad
-    /// record `open` reads fails it with its offset; `repair` handles those
-    /// (DESIGN.md, Recovery). Records a hint covers aren't read, so damage
-    /// to them shows up in `get` instead.
+    /// A torn tail of the newest segment is saved to a side file unless it
+    /// is all zeros, then truncated, fsynced and logged as a warning before
+    /// `open` returns. Any other bad record `open` reads fails it with its
+    /// offset; `repair` handles those (DESIGN.md, Recovery). Records a hint
+    /// covers aren't read, so damage to them shows up in `get` instead.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store, Error> {
         Self::open_with(dir, Options::default())
     }
@@ -232,8 +221,7 @@ impl<F: Fs> Store<F> {
         lock(&lock_file)?;
         let mut segments = open_segments(&fs, dir)?;
         if segments.is_empty() {
-            let file = fs.open_or_create(&dir.join(log_name(0)))?;
-            segments.push(Segment::new(0, file, 0));
+            segments.push(create(&fs, &dir.join(log_name(0)), 0)?);
         }
         segments.last().expect("one was just made").file.sync()?;
         fs.sync_dir(dir)?;
@@ -272,17 +260,15 @@ impl<F: Fs> Store<F> {
         let mut index = Index::new();
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
+            let newest = i + 1 == segments.len();
             match scan(
                 segment,
                 &mut index,
                 segment.base,
                 segment.end(),
+                newest,
                 &mut |_, _| {},
             ) {
-                Ok(end) if end < segment.end() && i + 1 < segments.len() => {
-                    bad = Some((segment, end));
-                    break;
-                }
                 Ok(_) => {}
                 Err(Error::Corruption { offset, .. }) => {
                     bad = Some((segment, offset));
@@ -383,14 +369,13 @@ impl<F: Fs> Store<F> {
     /// overwritten values and Delete records stop taking space.
     ///
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, fsyncs both, points the index at the
-    /// copies, then removes the old segments oldest first, fsyncing the
-    /// directory after each. Until then the old segments are untouched, so
-    /// any failure while copying returns the error and leaves the store as
-    /// it was. Reads each segment in one pass and checks every record it
-    /// reads, so a corrupt record stops compaction with its offset rather
-    /// than being copied. Reads go on while it runs; writes wait for it. A
-    /// failed fsync of the log or the directory poisons the store.
+    /// into a new segment with a hint, points the index at the copies, then
+    /// removes the old segments oldest first, fsyncing the directory after
+    /// each. Until then the old segments are untouched, so any failure while
+    /// copying returns the error and leaves the store as it was. Checks
+    /// every record it reads, so a corrupt record stops compaction with its
+    /// offset rather than being copied. Reads go on while it runs; writes
+    /// wait for it. A failed directory fsync poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         let writing = self.writer();
         self.writable()?;
@@ -404,64 +389,74 @@ impl<F: Fs> Store<F> {
     }
 
     /// Copies the live records of the segments based at `chosen` (in log
-    /// order) to a fresh segment, then removes them. A Delete record is
-    /// copied too while an older segment that is kept might hold a Set it
-    /// hides.
+    /// order) to a new segment at the end of the log, then removes them. A
+    /// Delete record is copied too while an older segment that is kept
+    /// might hold a Set it hides.
     fn clean(&self, writing: &Writing, chosen: &[u64]) -> Result<(), Error> {
         if chosen.is_empty() {
             return Ok(());
         }
-        if self.active().len() > 0 {
-            self.roll(writing)?;
-        }
         let segments = self.segments();
-        let (inputs, output) = segments.split_at(segments.len() - 1);
-        let output = &output[0];
+        let base = segments.last().expect("there is always a segment").end();
         let oldest_kept = segments
             .iter()
             .filter(|s| !chosen.contains(&s.base))
             .map(|s| s.base)
             .min()
-            .expect("the new segment is kept");
-        let hint_path = self.dir.join(hint_name(output.base));
+            .unwrap_or(base);
+        let copy_path = self.dir.join(compact_name(base));
+        let hint_path = self.dir.join(hint_name(base));
         let mut moved = Vec::with_capacity(self.index.len());
-        let mut carry = Vec::new();
-        // The hint gets its trailer only once the copies are durable:
-        // nothing orders writes to two files, so a valid hint could
-        // otherwise reach the disk ahead of the copies it vouches for.
-        let copied = self
-            .fs
-            .open_or_create(&hint_path)
-            .map_err(Error::from)
-            .and_then(|hint_file| {
-                let (hint, written) = self.copy_live(
-                    inputs,
-                    output,
-                    &hint_file,
-                    chosen,
-                    oldest_kept,
-                    &mut moved,
-                    &mut carry,
-                )?;
-                if let Err(err) = output.file.sync() {
-                    return Err(self.poison(err));
-                }
-                hint.finish(written)?;
-                hint_file.sync()?;
-                Ok((hint_file, written))
-            });
-        let (hint_file, written) = match copied {
+        let mut carry = BTreeSet::new();
+        let copied = self.copy_live(
+            &segments,
+            &copy_path,
+            &hint_path,
+            chosen,
+            oldest_kept,
+            &mut moved,
+            &mut carry,
+        );
+        let (output, hint, written) = match copied {
             Ok(copied) => copied,
             Err(err) => {
-                self.undo_copy(output, &hint_path);
+                let _ = remove_if_present(&self.fs, &copy_path);
+                let _ = remove_if_present(&self.fs, &hint_path);
                 return Err(err);
             }
         };
+        // The copy is complete and durable before it takes a segment's name,
+        // so the newest segment never holds more than one append that a
+        // crash could tear.
+        if let Err(err) = self.fs.rename(&copy_path, &self.dir.join(log_name(base))) {
+            let _ = remove_if_present(&self.fs, &copy_path);
+            let _ = remove_if_present(&self.fs, &hint_path);
+            return Err(err.into());
+        }
+        if let Err(err) = self.fs.sync_dir(&self.dir) {
+            return Err(self.poison(err));
+        }
         output.set_len_written(written);
-        if let Err(err) = self.repoint(output, &hint_file, &moved) {
+        let output = Arc::new(output);
+        let mut next = segments.to_vec();
+        if next.last().is_some_and(|s| s.base == base) {
+            next.pop();
+        }
+        next.push(Arc::clone(&output));
+        self.replace_segments(writing, next);
+        // Written only now: nothing orders writes to two files, and a hint
+        // must never reach the disk before the copies it lists.
+        let repointed = hint
+            .finish(written)
+            .and_then(|file| file.sync().map(|()| file))
+            .map_err(Error::from)
+            .and_then(|file| self.repoint(&output, &file, &moved));
+        if let Err(err) = repointed {
+            let _ = remove_if_present(&self.fs, &hint_path);
             self.count_dead(writing);
             return Err(err);
         }
+        let segments = self.segments();
         let mut left_behind = 0usize;
         self.index.for_each(|entry| {
             if chosen.contains(&segments[segment_of(&segments, entry.offset)].base) {
@@ -469,24 +464,23 @@ impl<F: Fs> Store<F> {
             }
         });
         assert_eq!(left_behind, 0, "every live key in them is copied");
-        for segment in inputs {
+        for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
             }
         }
         if !carry.is_empty() {
-            let mut buffer = Vec::new();
-            for key in &carry {
-                encode(
-                    &Record::Delete {
-                        key: Key::try_from(&key[..]).expect("read from a record"),
-                    },
-                    &mut buffer,
-                );
-            }
-            let at = self.append_bytes(writing, &buffer)?;
-            let segments = self.segments();
-            segments[segment_of(&segments, at)].add_dead(buffer.len() as u64);
+            let dead = carry
+                .iter()
+                .map(|key| record_len(entry_key_len(key), 0))
+                .sum();
+            let deletes: Vec<Record> = carry
+                .into_iter()
+                .map(|key| Record::Delete { key })
+                .collect();
+            let deletes: Vec<&Record> = deletes.iter().collect();
+            self.append_records(writing, &deletes)?;
+            self.active().add_dead(dead);
         }
         for &base in chosen {
             remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
@@ -505,53 +499,36 @@ impl<F: Fs> Store<F> {
         Ok(())
     }
 
-    /// Throws away a compaction's copy: removes its hint, then empties
-    /// `output`, each whether or not the other worked. Poisons the store if
-    /// either fails, since the next write would land after the copy's
-    /// bytes. The hint goes first: it must never vouch for bytes that may
-    /// not be on disk.
-    fn undo_copy(&self, output: &Segment<F::File>, hint_path: &Path) {
-        let hint_gone = remove_if_present(&self.fs, hint_path).and_then(|removed| {
-            if removed {
-                self.fs.sync_dir(&self.dir)?;
-            }
-            Ok(())
-        });
-        let emptied = output.file.set_len(0).and_then(|()| output.file.sync());
-        if let Err(err) = hint_gone.and(emptied) {
-            self.poison(err);
-        }
-    }
-
-    /// Writes each live record of the `chosen` segments among `inputs` to
-    /// the empty segment `output`, and its key and lengths to `hint_file`,
-    /// pushing its old offset to `moved`, in the same order. Pushes to
-    /// `carry` the key of each Delete record that must outlive its segment:
-    /// its key isn't live, and a segment older than it is kept. Returns the
-    /// hint, still without its trailer, and the bytes written; fsyncs
-    /// neither file. One buffered pass per segment:
+    /// Writes each live record of the `chosen` segments to a new segment at
+    /// `copy_path`, based where the log ends, and its key and lengths to a
+    /// hint at `hint_path`, pushing its old offset to `moved`, in the same
+    /// order. Adds to `carry` the key of each Delete record that must
+    /// outlive its segment: its key isn't live, and a segment older than it
+    /// is kept. Fsyncs the copy, not the hint, which is returned without its
+    /// trailer, along with the bytes copied. One buffered pass per segment:
     /// reading the dead records in between costs less than a positioned
     /// read per live one.
-    #[allow(clippy::too_many_arguments)]
-    fn copy_live<'h>(
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn copy_live(
         &self,
-        inputs: &[Arc<Segment<F::File>>],
-        output: &Segment<F::File>,
-        hint_file: &'h F::File,
+        segments: &[Arc<Segment<F::File>>],
+        copy_path: &Path,
+        hint_path: &Path,
         chosen: &[u64],
         oldest_kept: u64,
         moved: &mut Vec<u64>,
-        carry: &mut Vec<Vec<u8>>,
-    ) -> Result<(hint::Writer<'h, F::File>, u64), Error> {
+        carry: &mut BTreeSet<Key>,
+    ) -> Result<(Segment<F::File>, hint::Writer<F::File>, u64), Error> {
+        let base = segments.last().expect("there is always a segment").end();
+        let output = create(&self.fs, copy_path, base)?;
+        let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
         let mut hint = hint::Writer::new(hint_file);
-        let mut carried = HashSet::new();
         let mut header_buf = [0u8; HEADER_LEN];
         let mut payload_buf = Vec::new();
         let mut buffer = Vec::new();
         let mut written = 0u64;
-        let mut expected = 0usize;
-        for input in inputs.iter().filter(|s| chosen.contains(&s.base)) {
+        for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
             let mut reader = BufReader::with_capacity(
                 hint::buffer_for(input.len(), COMPACT_BUFFER),
                 input.reader_at(input.base),
@@ -559,13 +536,14 @@ impl<F: Fs> Store<F> {
             let mut offset = input.base;
             let end = input.end();
             while offset < end {
-                let header_bytes = read_header(&mut reader, &mut header_buf, end - offset)?.ok_or(
-                    Error::Corruption {
+                if end - offset < HEADER_LEN as u64 {
+                    return Err(Error::Corruption {
                         offset,
                         reason: CorruptionReason::CutShort,
-                    },
-                )?;
-                let header = decode_header(header_bytes).map_err(|err| err.at(offset))?;
+                    });
+                }
+                read_header(&mut reader, &mut header_buf)?;
+                let header = decode_header(&header_buf, offset).map_err(|err| err.at(offset))?;
                 payload_buf.resize(header.payload_len(), 0);
                 reader.read_exact(&mut payload_buf)?;
                 let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
@@ -578,45 +556,34 @@ impl<F: Fs> Store<F> {
                         {
                             moved.push(offset);
                             let fields = Fields {
-                                format: Format::Crc64,
+                                place: Place::Top,
                                 ..header.fields()
                             };
                             hint.push(fields, key.as_bytes())?;
-                            match header.format() {
-                                Format::Crc64 => {
-                                    buffer.extend_from_slice(header_bytes);
-                                    buffer.extend_from_slice(&payload_buf);
-                                }
-                                Format::Crc32c => {
-                                    let (key, value) = payload_buf.split_at(key.as_bytes().len());
-                                    encode_set(key, value, &mut buffer);
-                                }
-                            }
+                            move_header(&mut header_buf, base + written + buffer.len() as u64);
+                            buffer.extend_from_slice(&header_buf);
+                            buffer.extend_from_slice(&payload_buf);
                             if buffer.len() >= COMPACT_BUFFER {
-                                output.file.write_all_at(&buffer, written)?;
+                                output.write_all_at(&buffer, base + written)?;
                                 written += buffer.len() as u64;
                                 buffer.clear();
                             }
                         }
                     }
                     IndexOp::Delete { key } => {
-                        if oldest_kept < input.base
-                            && !self.index.contains(key.as_bytes())
-                            && carried.insert(key.as_bytes().to_vec())
-                        {
-                            carry.push(key.as_bytes().to_vec());
+                        if oldest_kept < input.base && !self.index.contains(key.as_bytes()) {
+                            carry.insert(key);
                         }
                     }
                     IndexOp::Batch { .. } => {}
                 }
                 offset += header.record_len();
             }
-            expected += 1;
         }
-        assert_eq!(expected, chosen.len(), "every chosen segment is read");
-        output.file.write_all_at(&buffer, written)?;
+        output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
-        Ok((hint, written))
+        output.file.sync()?;
+        Ok((output, hint, written))
     }
 
     /// Points each key `copy_live` copied at its copy in `output`, as the
@@ -642,7 +609,6 @@ impl<F: Fs> Store<F> {
                     offset: output.base + offset,
                     value_len: fields.value_len,
                     key_len: fields.key_len,
-                    format: fields.format,
                 };
                 if !self.index.replace(key, from, entry) {
                     output.add_dead(entry.record_len());
@@ -685,34 +651,55 @@ impl<F: Fs> Store<F> {
     /// name durable before anything is written to it.
     fn roll(&self, writing: &Writing) -> Result<(), Error> {
         let segments = self.segments();
-        let active = segments.last().expect("there is always a segment");
-        let base = active.end();
-        let file = self.fs.open_or_create(&self.dir.join(log_name(base)))?;
+        let base = segments.last().expect("there is always a segment").end();
+        let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
         if let Err(err) = self.fs.sync_dir(&self.dir) {
             // A retry would fsync a new descriptor, which Linux need not
             // tell about this failure.
             return Err(self.poison(err));
         }
         let mut next = segments.to_vec();
-        next.push(Arc::new(Segment::new(base, file, 0)));
+        next.push(Arc::new(segment));
         self.replace_segments(writing, next);
         Ok(())
     }
 
-    /// Writes `buffer` at the end of the log in one write and fsyncs it,
-    /// first starting a new segment if the active one is full, so a write
-    /// never spans two segments. Returns where it landed. A failed write or
+    /// Appends Set and Delete `records` in one write and fsyncs it, and
+    /// returns where each landed. One record is written on its own, and
+    /// more inside a Batch record, so a crash keeps all of them or none;
+    /// the Batch header counts as dead. Starts a new segment first if the
+    /// active one is full, so an append never spans two. A failed write or
     /// fsync is truncated away and the truncation fsynced. A failed fsync
     /// poisons the store, and so does a failed truncation.
-    fn append_bytes(&self, writing: &Writing, buffer: &[u8]) -> Result<u64, Error> {
+    fn append_records(&self, writing: &Writing, records: &[&Record]) -> Result<Vec<u64>, Error> {
         let full = self.active().len();
         if full > 0 && full >= self.segment_bytes {
             self.roll(writing)?;
         }
         let active = self.active();
-        let offset = active.end();
-        if let Err(err) = active.write_all_at(buffer, offset) {
-            if let Err(truncate) = active.set_len(offset).and_then(|()| active.sync()) {
+        let start = active.end();
+        let framed = records.len() > 1;
+        let frame_len = if framed {
+            record_len(0, BATCH_PAYLOAD_LEN)
+        } else {
+            0
+        };
+        let place = if framed { Place::Inner } else { Place::Top };
+        let mut buffer = vec![0u8; frame_len as usize];
+        let mut offsets = Vec::with_capacity(records.len());
+        for record in records {
+            let offset = start + buffer.len() as u64;
+            offsets.push(offset);
+            encode(record, place, offset, &mut buffer);
+        }
+        if framed {
+            let mut frame = Vec::with_capacity(frame_len as usize);
+            let body_len = buffer.len() as u64 - frame_len;
+            encode(&Record::Batch { body_len }, Place::Top, start, &mut frame);
+            buffer[..frame.len()].copy_from_slice(&frame);
+        }
+        if let Err(err) = active.write_all_at(&buffer, start) {
+            if let Err(truncate) = active.set_len(start).and_then(|()| active.sync()) {
                 self.poison(truncate);
             }
             return Err(err.into());
@@ -722,7 +709,7 @@ impl<F: Fs> Store<F> {
             // Linux can mark the pages clean while reads still see them, so
             // a reopen would take the group as written and a later fsync
             // would not write it, leaving a hole before later writes.
-            let _ = active.set_len(offset).and_then(|()| active.sync());
+            let _ = active.set_len(start).and_then(|()| active.sync());
             return Err(self.poison(err));
         }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -730,7 +717,8 @@ impl<F: Fs> Store<F> {
         #[cfg(test)]
         self.commits.fetch_add(1, Ordering::Relaxed);
         active.set_len_written(active.len() + buffer.len() as u64);
-        Ok(offset)
+        active.add_dead(frame_len);
+        Ok(offsets)
     }
 
     /// Appends a Set record, fsyncs, then points the index at it. Then
@@ -863,60 +851,23 @@ impl<F: Fs> Store<F> {
             return (each(err, writes.len()), false);
         }
         let mut live = HashMap::new();
-        let mut buffer = Vec::new();
-        let mut ops: Vec<(u64, &Record)> = Vec::new();
-        let mut batch_headers = 0u64;
-        for write in writes {
-            match write {
-                Write::One(op) => {
-                    if takes_effect(&self.index, op, &mut live) {
-                        ops.push((buffer.len() as u64, op));
-                        encode(op, &mut buffer);
-                    }
-                }
-                Write::Batch(batch) => {
-                    let mut body = Vec::new();
-                    let mut in_body = Vec::with_capacity(batch.len());
-                    for op in batch {
-                        if takes_effect(&self.index, op, &mut live) {
-                            in_body.push((body.len() as u64, op));
-                            encode(op, &mut body);
-                        }
-                    }
-                    if in_body.is_empty() {
-                        continue;
-                    }
-                    let start = buffer.len() as u64;
-                    encode(
-                        &Record::Batch {
-                            body_len: body.len() as u64,
-                        },
-                        &mut buffer,
-                    );
-                    let header_len = buffer.len() as u64 - start;
-                    batch_headers += header_len;
-                    ops.extend(
-                        in_body
-                            .into_iter()
-                            .map(|(at, op)| (start + header_len + at, op)),
-                    );
-                    buffer.extend_from_slice(&body);
-                }
-            }
+        let records: Vec<&Record> = writes
+            .iter()
+            .flat_map(Write::records)
+            .filter(|op| takes_effect(&self.index, op, &mut live))
+            .collect();
+        if records.is_empty() {
+            return (writes.iter().map(|_| Ok(())).collect(), false);
         }
-        let wrote = !ops.is_empty();
-        if wrote {
-            let start = match self.append_bytes(writing, &buffer) {
-                Ok(start) => start,
-                Err(err) => return (each(err, writes.len()), false),
-            };
-            let segments = self.segments();
-            segments[segment_of(&segments, start)].add_dead(batch_headers);
-            for (at, op) in ops {
-                self.indexed(&segments, op, start + at);
-            }
+        let offsets = match self.append_records(writing, &records) {
+            Ok(offsets) => offsets,
+            Err(err) => return (each(err, writes.len()), false),
+        };
+        let segments = self.segments();
+        for (record, offset) in records.into_iter().zip(offsets) {
+            self.indexed(&segments, record, offset);
         }
-        (writes.iter().map(|_| Ok(())).collect(), wrote)
+        (writes.iter().map(|_| Ok(())).collect(), true)
     }
 
     /// Updates the index and the dead bytes for a Set or Delete record now
@@ -933,7 +884,6 @@ impl<F: Fs> Store<F> {
                         value_len: u32::try_from(value.as_bytes().len())
                             .expect("Value guarantees len fits u32"),
                         key_len: entry_key_len(key),
-                        format: Format::Crc64,
                     },
                 );
                 if let Some(old) = old {
@@ -941,13 +891,12 @@ impl<F: Fs> Store<F> {
                 }
             }
             Record::Delete { key } => {
-                let key_len = key.as_bytes().len();
                 let old = self
                     .index
                     .remove(key.as_bytes())
                     .expect("deleted keys are live");
                 died(old.offset, old.record_len());
-                died(offset, (HEADER_LEN + key_len) as u64);
+                died(offset, record_len(entry_key_len(key), 0));
             }
             Record::Batch { .. } => unreachable!("not an index operation"),
         }
@@ -955,7 +904,7 @@ impl<F: Fs> Store<F> {
 
     /// Returns the value for `key`, or `None` if it isn't live.
     ///
-    /// Reads the record with two positioned reads (header, then payload) and
+    /// Reads the record in one positioned read and
     /// verifies both checksums and that the stored key equals `key`. Any failure is a
     /// corruption error at the record's offset, never `None`. Takes no lock
     /// while it reads, so it runs alongside writes and compaction.
@@ -1025,6 +974,7 @@ impl<F: Fs> Store<F> {
                 &mut scanned,
                 segment.base,
                 segment.end(),
+                false,
                 &mut |_, _| {},
             )?;
             if end != segment.end() {
@@ -1182,39 +1132,18 @@ fn starts_tail(
     }
 }
 
-/// The shortest record there can be: a Set of one-byte key and value in
-/// the old format.
-const SHORTEST_RECORD: u64 = SHORTEST_HEADER_LEN as u64 + 2;
+/// The shortest record there can be: a one-byte key and no value.
+const SHORTEST_RECORD: u64 = HEADER_LEN as u64 + 1;
 
-/// Reads a record's header into `buf` and returns its bytes: the shortest
-/// header, then the rest if its type byte names a longer one. `None` if
-/// that is more than the `remaining` bytes, which must be at least the
-/// shortest header.
-///
-/// Copies a header the buffer already holds instead: two short
-/// `read_exact`s took a scan of 100k records from 12.8 to 14.4 ms.
-fn read_header<'a, R: Read>(
-    reader: &mut BufReader<R>,
-    buf: &'a mut [u8; HEADER_LEN],
-    remaining: u64,
-) -> io::Result<Option<&'a [u8]>> {
-    let buffered = reader.buffer();
-    if buffered.len() >= HEADER_LEN {
-        let len = Format::of(buffered[4]).header_len();
-        if remaining < len as u64 {
-            return Ok(None);
-        }
-        buf[..len].copy_from_slice(&buffered[..len]);
-        reader.consume(len);
-        return Ok(Some(&buf[..len]));
+/// Reads a record's header into `buf`, copying it straight from the
+/// buffer when the buffer holds it whole.
+fn read_header<R: Read>(reader: &mut BufReader<R>, buf: &mut [u8; HEADER_LEN]) -> io::Result<()> {
+    if let Some(buffered) = reader.buffer().get(..HEADER_LEN) {
+        buf.copy_from_slice(buffered);
+        reader.consume(HEADER_LEN);
+        return Ok(());
     }
-    reader.read_exact(&mut buf[..SHORTEST_HEADER_LEN])?;
-    let len = Format::of(buf[4]).header_len();
-    if remaining < len as u64 {
-        return Ok(None);
-    }
-    reader.read_exact(&mut buf[SHORTEST_HEADER_LEN..len])?;
-    Ok(Some(&buf[..len]))
+    reader.read_exact(buf)
 }
 
 /// How much `compact` buffers before each write.
@@ -1252,35 +1181,27 @@ fn copy_to_end(mut reader: impl Read, file: &impl LogFile) -> io::Result<()> {
 fn load_indexed(file: &impl LogFile, entry: &Entry) -> Result<Record, Error> {
     let len = entry.record_len();
     let mut buf = vec![0u8; usize::try_from(len).expect("a record fits in memory")];
+    let reread = || load_record(file, entry.offset);
     match file.read_exact_at(&mut buf, entry.offset) {
         Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => {
-            return load_record(file, entry.offset).map(|(_, record)| record);
-        }
+        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return reread(),
         Err(err) => return Err(err.into()),
     }
-    if Format::of(buf[4]) != entry.format {
-        return load_record(file, entry.offset).map(|(_, record)| record);
-    }
-    let header_len = entry.format.header_len();
-    let header = decode_header(&buf[..header_len]).map_err(|err| err.at(entry.offset))?;
+    let header_bytes = buf[..HEADER_LEN].try_into().unwrap();
+    let header = decode_header(header_bytes, entry.offset).map_err(|err| err.at(entry.offset))?;
     if header.record_len() != len {
-        return load_record(file, entry.offset).map(|(_, record)| record);
+        return reread();
     }
-    decode_payload(header, &buf[header_len..]).map_err(|err| err.at(entry.offset))
+    decode_payload(header, &buf[HEADER_LEN..]).map_err(|err| err.at(entry.offset))
 }
 
-fn load_record(file: &impl LogFile, offset: u64) -> Result<(Header, Record), Error> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    let mut reader = BufReader::with_capacity(HEADER_LEN, file.reader_at(offset));
-    let header_bytes = read_header(&mut reader, &mut header_buf, u64::MAX)?
-        .expect("no limit on the bytes it may read");
-    let header = decode_header(header_bytes).map_err(|err| err.at(offset))?;
-    let mut payload_buf = vec![0u8; header.payload_len()];
-    let header_boundary = header_bytes.len() as u64 + offset;
-    file.read_exact_at(&mut payload_buf, header_boundary)?;
-    let record = decode_payload(header, &payload_buf).map_err(|err| err.at(offset))?;
-    Ok((header, record))
+fn load_record(file: &impl LogFile, offset: u64) -> Result<Record, Error> {
+    let mut header_bytes = [0u8; HEADER_LEN];
+    file.read_exact_at(&mut header_bytes, offset)?;
+    let header = decode_header(&header_bytes, offset).map_err(|err| err.at(offset))?;
+    let mut payload = vec![0u8; header.payload_len()];
+    file.read_exact_at(&mut payload, offset + HEADER_LEN as u64)?;
+    decode_payload(header, &payload).map_err(|err| err.at(offset))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1313,20 +1234,26 @@ fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
     chosen
 }
 
-/// Opens every segment in `dir`, in log order, after turning a log from
-/// before segments into the first one, putting the marker in `tally.log`,
-/// and removing hints whose segment is gone. Fails if two segments overlap.
+/// Opens every segment in `dir`, in log order, after removing hints whose
+/// segment is gone and copies a compaction left unfinished. Refuses a
+/// directory another version of tally wrote, and segments that overlap.
+/// A newest segment whose header a crash cut short is started again: no
+/// record was written to it before its header was fsynced.
 fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
-    let mut names = fs.list(dir)?;
-    let mut changed = migrate(fs, dir, &names)?;
-    if changed {
-        names = fs.list(dir)?;
+    let names = fs.list(dir)?;
+    if names.iter().any(|n| n == LOG_FILE_NAME) {
+        return Err(Error::Unsupported {
+            offset: 0,
+            reason: UnsupportedReason::OtherFormat,
+        });
     }
     let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
     bases.sort_unstable();
-    for base in names.iter().filter_map(|n| parse_hint_name(n)) {
-        if bases.binary_search(&base).is_err() {
-            fs.remove(&dir.join(hint_name(base)))?;
+    let mut changed = false;
+    for name in &names {
+        let orphan = parse_hint_name(name).is_some_and(|base| bases.binary_search(&base).is_err());
+        if orphan || parse_compact_name(name).is_some() {
+            fs.remove(&dir.join(name))?;
             changed = true;
         }
     }
@@ -1334,76 +1261,33 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
         fs.sync_dir(dir)?;
     }
     let mut segments: Vec<Segment<F::File>> = Vec::with_capacity(bases.len());
-    for base in bases {
+    for (i, &base) in bases.iter().enumerate() {
         let file = fs.open_existing(&dir.join(log_name(base)))?;
-        let len = file.size()?;
+        let corrupt = |reason| Error::Corruption {
+            offset: base,
+            reason,
+        };
+        match check_file_header(&file, base)? {
+            FileHeader::Valid => {}
+            FileHeader::Torn if i + 1 == bases.len() => start_file(&file, base)?,
+            FileHeader::Torn => return Err(corrupt(CorruptionReason::CutShort)),
+            FileHeader::Damaged => return Err(corrupt(CorruptionReason::SegmentHeader)),
+            FileHeader::Foreign => {
+                return Err(Error::Unsupported {
+                    offset: base,
+                    reason: UnsupportedReason::OtherFormat,
+                });
+            }
+        }
         if let Some(before) = segments.last()
             && before.end() > base
         {
-            return Err(Error::Corruption {
-                offset: base,
-                reason: CorruptionReason::SegmentsOverlap,
-            });
+            return Err(corrupt(CorruptionReason::SegmentsOverlap));
         }
+        let len = file.size()? - FILE_HEADER_LEN;
         segments.push(Segment::new(base, file, len));
     }
     Ok(segments)
-}
-
-/// Turns a `tally.log` from before segments into the segment at 0, with
-/// its hint, and leaves the marker in `tally.log`. Returns whether it
-/// changed anything the directory must make durable. `tally.log` holds the
-/// records or the whole marker at every step, so an earlier version never
-/// finds it missing or torn and starts an empty store. Fails if
-/// `tally.log` holds records while segments exist: an earlier version
-/// wrote them after the log was split, and they can't be put in order.
-fn migrate<F: Fs>(fs: &F, dir: &Path, names: &[String]) -> Result<bool, Error> {
-    let has = |name: &str| names.iter().any(|n| n == name);
-    let legacy = dir.join(LOG_FILE_NAME);
-    let first = dir.join(log_name(0));
-    if has(LOG_FILE_NAME) {
-        let file = fs.open_existing(&legacy)?;
-        let size = file.size()?;
-        if size <= SHORTEST_HEADER_LEN as u64 {
-            // Shorter than any record: the marker, or a write of it that a
-            // power cut tore or left as zeros.
-            let mut bytes = vec![0u8; size as usize];
-            file.read_exact_at(&mut bytes, 0)?;
-            if bytes[..] == marker()[..] {
-                return Ok(false);
-            }
-        } else if !names.iter().any(|n| parse_log_name(n).is_some()) {
-            // Without hard links, the rename leaves a window in which
-            // `tally.log` is missing.
-            if fs.hard_link(&legacy, &first).is_err() {
-                fs.rename(&legacy, &first)?;
-            }
-            if has(HINT_FILE_NAME) {
-                fs.rename(&dir.join(HINT_FILE_NAME), &dir.join(hint_name(0)))?;
-            }
-            remove_if_present(fs, &dir.join(COMPACT_FILE_NAME))?;
-            remove_if_present(fs, &dir.join(COMPACT_HINT_FILE_NAME))?;
-        } else if !(has(&log_name(0)) && fs.same_file(&legacy, &first)?) {
-            return Err(Error::Io(io::Error::other(
-                "tally.log holds records next to segment files: an earlier version of tally wrote them",
-            )));
-        }
-    }
-    replace_with_marker(fs, dir)?;
-    Ok(true)
-}
-
-/// Writes the marker to its own file, then renames it over `tally.log`
-/// once every name made so far is durable: a link from `tally.log` to the
-/// segment at 0 must not be lost while the marker takes its place.
-fn replace_with_marker<F: Fs>(fs: &F, dir: &Path) -> io::Result<()> {
-    let path = dir.join(MARKER_FILE_NAME);
-    let file = fs.open_or_create(&path)?;
-    file.set_len(0)?;
-    file.write_all_at(&marker(), 0)?;
-    file.sync()?;
-    fs.sync_dir(dir)?;
-    fs.rename(&path, &dir.join(LOG_FILE_NAME))
 }
 
 /// Builds the index from every segment in order: from its hint and the
@@ -1469,28 +1353,34 @@ fn try_load<F: Fs>(
         // A sealed segment never changes, so a hint for all of it stays
         // valid. Not fsynced: a hint that didn't land whole fails its
         // checksum, and the next open removes it and reads the segment.
-        let mut created = None;
         let mut writer = None;
         if i < newest && hinted < len {
-            let opened = match (&hint, tail) {
+            let opened = match (hint, tail) {
                 (Some(file), Some(tail)) => hint::Writer::extend(file, tail),
                 _ => fs
                     .open_or_create(&dir.join(hint_name(segment.base)))
-                    .map(|file| hint::Writer::new(created.insert(file))),
+                    .map(hint::Writer::new),
             };
             match opened {
                 Ok(opened) => writer = Some(opened),
                 Err(err) => hint_not_written(segment.base, &err),
             }
         }
-        let end = scan(&*segment, &mut index, hinted, len, &mut |fields, key| {
-            if let Some(hint) = &mut writer
-                && let Err(err) = hint.push(fields, key)
-            {
-                hint_not_written(segment.base, &err);
-                writer = None;
-            }
-        })?;
+        let end = scan(
+            &*segment,
+            &mut index,
+            hinted,
+            len,
+            i == newest,
+            &mut |fields, key| {
+                if let Some(hint) = &mut writer
+                    && let Err(err) = hint.push(fields, key)
+                {
+                    hint_not_written(segment.base, &err);
+                    writer = None;
+                }
+            },
+        )?;
         if let Some(hint) = writer.take()
             && end == len
             && let Err(err) = hint.finish(len - segment.base)
@@ -1498,19 +1388,21 @@ fn try_load<F: Fs>(
             hint_not_written(segment.base, &err);
         }
         if end < len {
-            if i < newest {
-                return Err(Error::Corruption {
-                    offset: end,
-                    reason: CorruptionReason::CutShort,
-                });
-            }
+            let saved = save_torn(fs, dir, &*segment, end, len)?;
             segment.set_len(end)?;
             segment.file.sync()?;
             segment.set_len_written(end - segment.base);
-            log::warn!(
-                "truncated a torn tail at offset {end}: dropped {} bytes",
-                len - end
-            );
+            match saved {
+                Some(path) => log::warn!(
+                    "truncated a torn tail at offset {end}: moved {} bytes to {}",
+                    len - end,
+                    path.display()
+                ),
+                None => log::warn!(
+                    "truncated a torn tail at offset {end}: dropped {} zero bytes",
+                    len - end
+                ),
+            }
         }
     }
     Ok(Ok(index))
@@ -1561,7 +1453,6 @@ fn read_hint<L: LogFile>(
                         offset: base + offset,
                         value_len: fields.value_len,
                         key_len: fields.key_len,
-                        format: fields.format,
                     }),
                 )),
                 Kind::Delete => Some((key, None)),
@@ -1580,20 +1471,22 @@ const PARALLEL_SCAN_FROM: u64 = 16 << 20;
 const SCAN_WINDOW: usize = 1 << 16;
 const SCAN_BUFFER: usize = 1 << 20;
 
-/// Applies the records from `start` to `len` to `index`. Returns where the
-/// valid records end: `len`, or the start of a torn or zero-filled tail. A
-/// batch is applied only once all of it has been read and checked; a torn
-/// one is a torn tail from its start, and an error inside one is reported
-/// at its start, so `repair` moves the whole batch. From
-/// `PARALLEL_SCAN_FROM` bytes, the index takes the records a window at a
-/// time on up to `MAX_THREADS` threads. Calls `record` with every record
-/// read, in log order, Batch records too, including any that a torn batch
-/// then leaves out.
+/// Applies the records from `start` to `len` to `index`, and returns where
+/// they end. In the newest segment, damage at an offset after which no
+/// record on its own starts is a torn tail: the bytes of an append a crash
+/// cut short, in any order. The scan returns where it starts. Any other
+/// damage is an error at its offset. A batch is applied only once all of
+/// it has been read and checked, and an error inside one is reported at
+/// its start, so `repair` moves the whole batch. From `PARALLEL_SCAN_FROM`
+/// bytes, the index takes the records a window at a time on up to
+/// `MAX_THREADS` threads. Calls `record` with every record read, in log
+/// order, Batch records too, including any in a torn tail.
 fn scan(
     file: &impl LogFile,
     index: &mut Index,
     start: u64,
     len: u64,
+    newest: bool,
     record: &mut impl FnMut(Fields, &[u8]),
 ) -> Result<u64, Error> {
     let threads = if len - start < PARALLEL_SCAN_FROM {
@@ -1603,7 +1496,75 @@ fn scan(
             .map_or(1, NonZero::get)
             .min(MAX_THREADS)
     };
-    scan_on(file, index, start, len, threads, record)
+    match scan_on(file, index, start, len, threads, record) {
+        Err(Error::Corruption { offset, .. })
+            if newest && !record_starts_after(file, offset, len)? =>
+        {
+            Ok(offset)
+        }
+        result => result.map(|()| len),
+    }
+}
+
+/// Whether a record on its own starts after `offset` and before `len`, by
+/// its header checksum alone: if one does, the damage at `offset` is in
+/// the middle of the log, not the end of it. A record this version can't
+/// read counts, so a newer version's records are never cut. Records inside
+/// a batch don't, so the bytes of a batch a crash tore never look like a
+/// later append.
+fn record_starts_after(file: &impl LogFile, offset: u64, len: u64) -> io::Result<bool> {
+    const CHUNK: u64 = 1 << 20;
+    let mut buf = Vec::new();
+    let mut start = offset + 1;
+    while len.saturating_sub(start) >= HEADER_LEN as u64 {
+        let n = (len - start).min(CHUNK + HEADER_LEN as u64 - 1) as usize;
+        buf.resize(n, 0);
+        file.read_exact_at(&mut buf, start)?;
+        for (i, window) in buf.windows(HEADER_LEN).enumerate() {
+            if starts_a_record(window.try_into().unwrap(), start + i as u64) {
+                return Ok(true);
+            }
+        }
+        start += (n - HEADER_LEN + 1) as u64;
+    }
+    Ok(false)
+}
+
+/// Saves `file`'s bytes from `offset` to `len` to a side file named for
+/// where they were and their CRC32C, fsynced with its name, unless every
+/// one is zero. A rerun after a crash rewrites the same file, and a later
+/// torn tail at the same offset gets its own.
+fn save_torn<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    file: &impl LogFile,
+    offset: u64,
+    len: u64,
+) -> Result<Option<PathBuf>, Error> {
+    let mut checksum = 0u32;
+    let mut zeros = true;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut reader = file.reader_at(offset).take(len - offset);
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err.into()),
+        };
+        zeros &= chunk[..n].iter().all(|&b| b == 0);
+        checksum = crc32c::crc32c_append(checksum, &chunk[..n]);
+    }
+    if zeros {
+        return Ok(None);
+    }
+    let path = dir.join(format!("{LOG_FILE_NAME}.torn-{offset}-{checksum:08x}"));
+    let side = fs.open_or_create(&path)?;
+    side.set_len(0)?;
+    copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
+    side.sync()?;
+    fs.sync_dir(dir)?;
+    Ok(Some(path))
 }
 
 /// On more than one thread, this one reads while another applies what it
@@ -1615,7 +1576,7 @@ fn scan_on(
     len: u64,
     threads: usize,
     record: &mut impl FnMut(Fields, &[u8]),
-) -> Result<u64, Error> {
+) -> Result<(), Error> {
     if threads == 1 {
         return scan_into(
             file,
@@ -1637,7 +1598,7 @@ fn scan_on(
             send.send(window)
                 .expect("the applier runs until the sender is dropped")
         };
-        let end = scan_into(
+        let scanned = scan_into(
             file,
             start,
             len,
@@ -1649,13 +1610,13 @@ fn scan_on(
             },
             record,
         );
-        if end.is_ok() {
-            sent(window);
-        }
+        // Sent even after an error: the records in it all come before the
+        // damage, which may be a torn tail.
+        sent(window);
         // The applier stops once the channel closes, and the scope waits
         // for it.
         drop(send);
-        end
+        scanned
     })
 }
 
@@ -1667,7 +1628,7 @@ fn scan_into(
     len: u64,
     sink: &mut impl FnMut(u64, IndexOp),
     record: &mut impl FnMut(Fields, &[u8]),
-) -> Result<u64, Error> {
+) -> Result<(), Error> {
     let mut reader = Reader {
         inner: BufReader::with_capacity(
             hint::buffer_for(len - start, SCAN_BUFFER),
@@ -1679,9 +1640,7 @@ fn scan_into(
     let mut batch = Vec::new();
     let mut offset = start;
     while offset < len {
-        let Next::Op(header, op) = reader.next(offset, len)? else {
-            return Ok(offset);
-        };
+        let (header, op) = reader.next(offset, len, Place::Top)?;
         record(header.fields(), key_of(&op));
         let record_len = header.record_len();
         let IndexOp::Batch { body_len } = op else {
@@ -1691,32 +1650,34 @@ fn scan_into(
         };
         let body_start = offset + record_len;
         if len - body_start < body_len {
-            return Ok(offset);
+            return Err(Error::Corruption {
+                offset,
+                reason: CorruptionReason::CutShort,
+            });
         }
         let body_end = body_start + body_len;
         let mut at = body_start;
         while at < body_end {
-            let next = reader.next(at, len).map_err(|err| err.moved_to(offset))?;
-            let Next::Op(header, op) = next else {
-                return Ok(offset);
-            };
+            let (header, op) = reader
+                .next(at, body_end, Place::Inner)
+                .map_err(|err| err.moved_to(offset))?;
             record(header.fields(), key_of(&op));
-            let len_here = header.record_len();
-            if matches!(op, IndexOp::Batch { .. }) || len_here > body_end - at {
-                return Err(Error::Corruption {
-                    offset,
-                    reason: CorruptionReason::BadBatch,
-                });
-            }
             batch.push((at, op));
-            at += len_here;
+            at += header.record_len();
         }
         for (at, op) in batch.drain(..) {
             sink(at, op);
         }
         offset = body_end;
     }
-    Ok(offset)
+    Ok(())
+}
+
+fn bad_batch_at(offset: u64) -> Error {
+    Error::Corruption {
+        offset,
+        reason: CorruptionReason::BadBatch,
+    }
 }
 
 /// Records a scan has read and not yet applied, with their keys' bytes end
@@ -1730,17 +1691,12 @@ struct Window {
 impl Window {
     fn push(&mut self, offset: u64, op: IndexOp) {
         let (key, entry) = match op {
-            IndexOp::Set {
-                key,
-                value_len,
-                format,
-            } => {
+            IndexOp::Set { key, value_len } => {
                 let key_len = entry_key_len(&key);
                 let entry = Entry {
                     offset,
                     value_len,
                     key_len,
-                    format,
                 };
                 (key, Some(entry))
             }
@@ -1768,11 +1724,7 @@ impl Window {
 
 fn apply(index: &mut Index, offset: u64, op: IndexOp) {
     match op {
-        IndexOp::Set {
-            key,
-            value_len,
-            format,
-        } => {
+        IndexOp::Set { key, value_len } => {
             let key_len = entry_key_len(&key);
             index.insert(
                 key.as_bytes(),
@@ -1780,7 +1732,6 @@ fn apply(index: &mut Index, offset: u64, op: IndexOp) {
                     offset,
                     value_len,
                     key_len,
-                    format,
                 },
             );
         }
@@ -1798,46 +1749,34 @@ struct Reader<R> {
     payload_buf: Vec<u8>,
 }
 
-enum Next {
-    /// A valid record.
-    Op(Header, IndexOp),
-    /// The log from here to `len` is a torn or zero-filled tail.
-    Torn,
-}
-
 impl<R: Read> Reader<R> {
-    /// Reads the record at `offset`, which must be where the reader is.
-    fn next(&mut self, offset: u64, len: u64) -> Result<Next, Error> {
-        if len - offset < SHORTEST_HEADER_LEN as u64 {
-            return Ok(Next::Torn);
+    /// Reads the record at `offset`, which must be where the reader is, and
+    /// checks it ends by `end` and sits in `place`. One that runs past the
+    /// end of its batch breaks the batch; one past the end of the file was
+    /// cut short.
+    fn next(&mut self, offset: u64, end: u64, place: Place) -> Result<(Header, IndexOp), Error> {
+        let cut_short = Error::Corruption {
+            offset,
+            reason: match place {
+                Place::Top => CorruptionReason::CutShort,
+                Place::Inner => CorruptionReason::BadBatch,
+            },
+        };
+        if end - offset < HEADER_LEN as u64 {
+            return Err(cut_short);
         }
-        let Some(header_bytes) = read_header(&mut self.inner, &mut self.header_buf, len - offset)?
-        else {
-            return Ok(Next::Torn);
-        };
-        let header = match decode_header(header_bytes) {
-            Ok(header) => header,
-            Err(DecodeError::Corrupt(CorruptionReason::HeaderChecksum))
-                if all_zero(header_bytes) && rest_is_zero(&mut self.inner)? =>
-            {
-                return Ok(Next::Torn);
-            }
-            Err(err) => return Err(err.at(offset)),
-        };
-        if len - offset < header.record_len() {
-            return Ok(Next::Torn);
+        read_header(&mut self.inner, &mut self.header_buf)?;
+        let header = decode_header(&self.header_buf, offset).map_err(|err| err.at(offset))?;
+        if header.fields().place != place {
+            return Err(bad_batch_at(offset));
+        }
+        if end - offset < header.record_len() {
+            return Err(cut_short);
         }
         self.payload_buf.resize(header.payload_len(), 0u8);
         self.inner.read_exact(&mut self.payload_buf)?;
-        match decode_index_op(header, &self.payload_buf) {
-            Ok(op) => Ok(Next::Op(header, op)),
-            Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum))
-                if all_zero(&self.payload_buf) && rest_is_zero(&mut self.inner)? =>
-            {
-                Ok(Next::Torn)
-            }
-            Err(err) => Err(err.at(offset)),
-        }
+        let op = decode_index_op(header, &self.payload_buf).map_err(|err| err.at(offset))?;
+        Ok((header, op))
     }
 }
 
@@ -1861,28 +1800,6 @@ fn remove_if_present(fs: &impl Fs, path: &Path) -> io::Result<bool> {
     }
 }
 
-fn all_zero(bytes: &[u8]) -> bool {
-    bytes.iter().all(|&b| b == 0)
-}
-
-/// Reads `reader` to the end in chunks and reports whether every byte was
-/// zero. A preallocated log can be gigabytes of zeros, so nothing is kept.
-fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
-    let mut chunk = [0u8; 8192];
-    loop {
-        match reader.read(&mut chunk) {
-            Ok(0) => return Ok(true),
-            Ok(n) if !all_zero(&chunk[..n]) => return Ok(false),
-            Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
-        }
-    }
-}
-
-/// Flushes `file` to disk. Panics on failure: after a failed fsync the
-/// kernel may have dropped the dirty pages, so retrying can report success
-/// for data that never reached disk (DESIGN.md, Failed fsync).
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -1891,8 +1808,9 @@ mod tests {
 
     use super::*;
     use crate::mem_fs::{Cut, MemFs, Torn};
-    use crate::record::tests::{DELETE_A, OLD_DELETE_A, OLD_SET_A_HI, SET_A_HI};
-    use crate::record::{Record, encode, encode_as};
+    use crate::record::tests::{DELETE_A, SET_A_HI};
+    use crate::record::{Record, encode, seal};
+    use crate::segment::segment_file;
     use crate::{CorruptionReason, Error, UnsupportedReason};
 
     fn key(bytes: &[u8]) -> Key {
@@ -1913,32 +1831,92 @@ mod tests {
         bases
     }
 
-    /// The newest segment, or before the first open, `tally.log`, which
-    /// `open` turns into the first segment.
+    /// The newest segment, or the first one before the first open.
     fn log_path(dir: &Path) -> PathBuf {
-        match segment_bases(dir).last() {
-            Some(&base) => dir.join(log_name(base)),
-            None => dir.join(LOG_FILE_NAME),
-        }
+        dir.join(log_name(segment_bases(dir).last().copied().unwrap_or(0)))
     }
 
-    /// Every segment's bytes, in log order.
+    /// The records of the segment at `base`, after checking its header.
+    fn segment_records(dir: &Path, base: u64) -> Vec<u8> {
+        let bytes = fs::read(dir.join(log_name(base))).unwrap();
+        let header = FILE_HEADER_LEN as usize;
+        assert_eq!(
+            bytes[..header],
+            segment_file(base, b"")[..],
+            "header of {base}"
+        );
+        bytes[header..].to_vec()
+    }
+
+    /// Every segment's records, in log order.
     fn log_bytes(dir: &Path) -> Vec<u8> {
-        let bases = segment_bases(dir);
-        if bases.is_empty() {
-            return fs::read(dir.join(LOG_FILE_NAME)).unwrap();
-        }
-        bases
+        segment_bases(dir)
             .into_iter()
-            .flat_map(|base| fs::read(dir.join(log_name(base))).unwrap())
+            .flat_map(|base| segment_records(dir, base))
             .collect()
     }
 
+    /// Writes a segment at `base` holding `records`.
+    fn write_segment(dir: &Path, base: u64, records: &[u8]) {
+        fs::write(dir.join(log_name(base)), segment_file(base, records)).unwrap();
+    }
+
     /// Overwrites bytes in the newest segment behind the store's back, at
-    /// an offset in its file.
+    /// an offset from its first record.
     fn write_log_at(dir: &Path, offset: u64, bytes: &[u8]) {
         let file = OpenOptions::new().write(true).open(log_path(dir)).unwrap();
-        file.write_all_at(bytes, offset).unwrap();
+        file.write_all_at(bytes, FILE_HEADER_LEN + offset).unwrap();
+    }
+
+    /// `records`, each on its own, the first at `start`.
+    fn encoded_at(start: u64, records: &[Record]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            encode(record, Place::Top, start + bytes.len() as u64, &mut bytes);
+        }
+        bytes
+    }
+
+    fn encoded(records: &[Record]) -> Vec<u8> {
+        encoded_at(0, records)
+    }
+
+    /// `records` inside one Batch record at `start`, as an append of more
+    /// than one writes them.
+    fn batched_at(start: u64, records: &[Record]) -> Vec<u8> {
+        let frame = record_len(0, BATCH_PAYLOAD_LEN);
+        let mut body = Vec::new();
+        for record in records {
+            let offset = start + frame + body.len() as u64;
+            encode(record, Place::Inner, offset, &mut body);
+        }
+        let mut bytes = encoded_at(
+            start,
+            &[Record::Batch {
+                body_len: body.len() as u64,
+            }],
+        );
+        bytes.extend(body);
+        bytes
+    }
+
+    /// A record encoded on its own, moved to `offset`.
+    fn moved(record: &[u8], offset: u64) -> Vec<u8> {
+        let mut bytes = record.to_vec();
+        seal(&mut bytes[..HEADER_LEN], offset);
+        bytes
+    }
+
+    /// Side files `open` saved torn tails to, with their bytes.
+    fn torn_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        file_names(dir)
+            .into_iter()
+            .filter(|name| name.starts_with("tally.log.torn-"))
+            .map(|name| {
+                let bytes = fs::read(dir.join(&name)).unwrap();
+                (name, bytes)
+            })
+            .collect()
     }
 
     // open
@@ -1973,7 +1951,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut bytes = [SET_A_HI.as_slice(), DELETE_A.as_slice()].concat();
         bytes[20] ^= 0x01; // first record's value: "hi" -> "ii"
-        fs::write(log_path(tmp.path()), bytes).unwrap();
+        write_segment(tmp.path(), 0, &bytes);
         assert!(matches!(
             Store::open(tmp.path()),
             Err(Error::Corruption {
@@ -1986,7 +1964,7 @@ mod tests {
     /// A store directory whose log holds exactly `bytes`.
     fn store_with_log(bytes: &[u8]) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(log_path(tmp.path()), bytes).unwrap();
+        write_segment(tmp.path(), 0, bytes);
         tmp
     }
 
@@ -2002,85 +1980,92 @@ mod tests {
         bytes
     }
 
-    // recovery: torn and zero-filled tails are truncated
+    // recovery: a torn tail is saved, unless it is zeros, and truncated
 
     #[test]
-    fn open_truncates_a_torn_header() {
-        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..14]));
-        let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
-    }
-
-    #[test]
-    fn open_truncates_a_header_torn_past_the_shortest_header() {
-        for cut in 15..19 {
+    fn open_moves_a_torn_record_to_a_side_file_and_truncates_it() {
+        for cut in 1..DELETE_A.len() {
             let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..cut]));
             let store = Store::open(tmp.path()).unwrap();
             assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
             assert_eq!(log_bytes(tmp.path()), SET_A_HI, "cut at {cut}");
+            let crc = crc32c::crc32c(&DELETE_A[..cut]);
+            assert_eq!(
+                torn_files(tmp.path()),
+                [(
+                    format!("tally.log.torn-22-{crc:08x}"),
+                    DELETE_A[..cut].to_vec()
+                )],
+                "cut at {cut}"
+            );
         }
     }
 
     #[test]
-    fn open_truncates_a_torn_payload() {
-        let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..19]));
+    fn a_record_whose_end_landed_without_its_start_is_a_torn_tail() {
+        let mut torn = DELETE_A.to_vec();
+        torn[..10].fill(0);
+        let tmp = store_with_log(&set_a_hi_then(&torn));
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(torn_files(tmp.path())[0].1, torn);
     }
 
     #[test]
-    fn a_log_written_before_64_bit_checksums_recovers_reads_and_compacts() {
-        let mut old = Vec::new();
-        encode_as(Format::Crc32c, &set_record(b"a", b"hi"), &mut old);
-        encode_as(Format::Crc32c, &set_record(b"z", b"9"), &mut old);
-        assert_eq!(old[..18], OLD_SET_A_HI);
-        let tmp = store_with_log(&[&old[..], &OLD_DELETE_A[..14]].concat());
-        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
-        assert_eq!(log_bytes(tmp.path()), old, "the torn tail is cut");
-        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-        store.set(key(b"b"), value(b"2")).unwrap();
+    fn a_record_this_version_cannot_read_after_damage_keeps_the_damage_from_being_torn() {
+        let mut unknown = encoded_at(42, &[set_record(b"b", b"2")]);
+        unknown[4] = 0x34;
+        seal(&mut unknown[..HEADER_LEN], 42);
+        let mut over_limit = encoded_at(42, &[set_record(b"b", b"2")]);
+        over_limit[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
+        seal(&mut over_limit[..HEADER_LEN], 42);
+        for later in [unknown, over_limit] {
+            let mut damaged = set_a_hi_then(&DELETE_A);
+            damaged[22 + 19] ^= 0x01;
+            damaged.extend(later);
+            assert_open_fails_untouched(&damaged, 22, CorruptionReason::PayloadChecksum);
+        }
+    }
+
+    #[test]
+    fn a_valid_record_at_another_offset_fails_its_header_checksum() {
+        let bytes = [&SET_A_HI[..], &SET_A_HI, &moved(&DELETE_A, 44)].concat();
+        assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
+    }
+
+    #[test]
+    fn an_empty_value_is_stored_and_read_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"a"), value(b"")).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"")));
         drop(store);
+        let store = Store::open(tmp.path()).unwrap();
+        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"")));
+        assert_eq!(log_bytes(tmp.path()).len(), 20);
+    }
 
-        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
-        let format = |store: &Store, k: &[u8]| store.index.get(k).unwrap().format;
-        assert_eq!(format(&store, b"a"), Format::Crc32c);
-        assert_eq!(format(&store, b"z"), Format::Crc32c);
-        assert_eq!(format(&store, b"b"), Format::Crc64);
-        assert_eq!(store.dead(), 0);
-        store.set(key(b"z"), value(b"0")).unwrap();
-        assert_eq!(store.dead(), 17, "the old Set of z");
-
-        store.compact().unwrap();
+    #[test]
+    fn the_side_file_of_a_torn_tail_is_named_for_its_offset_and_checksum() {
+        let tmp = store_with_log(&set_a_hi_then(&[0xab; 20]));
+        Store::open(tmp.path()).unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        // CRC32C of twenty 0xab bytes, computed in Python.
         assert_eq!(
-            log_bytes(tmp.path()),
-            encoded(&[
-                set_record(b"a", b"hi"),
-                set_record(b"b", b"2"),
-                set_record(b"z", b"0"),
-            ]),
-            "a is rewritten in the new format"
+            torn_files(tmp.path()),
+            [("tally.log.torn-22-2d3e2e45".to_string(), vec![0xab; 20])]
         );
-        assert_eq!(format(&store, b"a"), Format::Crc64);
-        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-        drop(store);
-
-        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
-        assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-        assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
-        assert_eq!(store.get(&key(b"z")).unwrap(), Some(value(b"0")));
-        store.verify().unwrap();
     }
 
     #[test]
-    fn damage_in_a_record_written_before_64_bit_checksums_is_still_caught() {
-        let mut bytes = [&OLD_SET_A_HI[..], &OLD_DELETE_A].concat();
-        bytes[16] ^= 0x01;
-        assert_open_fails_untouched(&bytes, 0, CorruptionReason::PayloadChecksum);
-        let mut bytes = [&OLD_SET_A_HI[..], &OLD_DELETE_A].concat();
-        bytes[18 + 7] ^= 0x01;
-        assert_open_fails_untouched(&bytes, 18, CorruptionReason::HeaderChecksum);
+    fn damage_to_the_last_record_is_a_torn_tail() {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes[22 + 19] ^= 0x01;
+        let tmp = store_with_log(&bytes);
+        Store::open(tmp.path()).unwrap();
+        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(torn_files(tmp.path())[0].1, &bytes[22..]);
     }
 
     #[test]
@@ -2104,6 +2089,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(log_bytes(tmp.path()), b"");
+        assert_eq!(torn_files(tmp.path()), [], "zeros are not saved");
     }
 
     #[test]
@@ -2134,7 +2120,8 @@ mod tests {
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
     }
 
-    // recovery: anything else fails open and leaves the log alone
+    // recovery: damage before a later record fails open and leaves the log
+    // alone
 
     fn assert_open_fails_untouched(bytes: &[u8], offset: u64, reason: CorruptionReason) {
         let tmp = store_with_log(bytes);
@@ -2148,7 +2135,7 @@ mod tests {
 
     #[test]
     fn open_fails_on_a_zero_filled_region_before_a_valid_record() {
-        let bytes = [SET_A_HI.as_slice(), &[0u8; 20], DELETE_A.as_slice()].concat();
+        let bytes = [SET_A_HI.as_slice(), &[0u8; 20], &moved(&DELETE_A, 42)].concat();
         assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
@@ -2157,38 +2144,36 @@ mod tests {
         let bytes = [
             SET_A_HI.as_slice(),
             &delete_a_with_a_zero_payload(),
-            DELETE_A.as_slice(),
+            &moved(&DELETE_A, 42),
         ]
         .concat();
         assert_open_fails_untouched(&bytes, 22, CorruptionReason::PayloadChecksum);
     }
 
-    #[test]
-    fn open_fails_on_a_garbage_tail_with_its_offset() {
-        assert_open_fails_untouched(
-            &set_a_hi_then(&[0xab; 20]),
-            22,
-            CorruptionReason::HeaderChecksum,
-        );
+    /// SET_A_HI, DELETE_A, then a Set of "b" at 42.
+    fn three_records() -> Vec<u8> {
+        let mut bytes = set_a_hi_then(&DELETE_A);
+        bytes.extend(encoded_at(42, &[set_record(b"b", b"2")]));
+        bytes
     }
 
     #[test]
     fn open_fails_on_a_corrupted_header_checksum_with_its_offset() {
-        let mut bytes = set_a_hi_then(&DELETE_A);
+        let mut bytes = three_records();
         bytes[22] ^= 0x01;
         assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_length_with_its_offset() {
-        let mut bytes = set_a_hi_then(&DELETE_A);
+        let mut bytes = three_records();
         bytes[22 + 7] ^= 0x01; // second record's value_len: 0 -> 1
         assert_open_fails_untouched(&bytes, 22, CorruptionReason::HeaderChecksum);
     }
 
     #[test]
     fn open_fails_on_a_corrupted_key_with_its_offset() {
-        let mut bytes = set_a_hi_then(&DELETE_A);
+        let mut bytes = three_records();
         bytes[22 + 19] ^= 0x01; // second record's key: "a" -> "`"
         assert_open_fails_untouched(&bytes, 22, CorruptionReason::PayloadChecksum);
     }
@@ -2197,7 +2182,7 @@ mod tests {
     fn open_fails_on_an_unsupported_tail_record_and_leaves_it() {
         let mut bytes = set_a_hi_then(&DELETE_A);
         bytes[22 + 4] = 0x19; // second record's type: unknown
-        fix_header_checksum(&mut bytes[22..22 + HEADER_LEN]);
+        seal(&mut bytes[22..22 + HEADER_LEN], 22);
         let tmp = store_with_log(&bytes);
         assert!(matches!(
             Store::open(tmp.path()),
@@ -2209,11 +2194,6 @@ mod tests {
         assert_eq!(log_bytes(tmp.path()), bytes);
     }
 
-    fn fix_header_checksum(header: &mut [u8]) {
-        let checksum = crc32c::crc32c(&header[4..]);
-        header[..4].copy_from_slice(&checksum.to_le_bytes());
-    }
-
     // repair
 
     fn side_file(dir: &Path, offset: u64) -> PathBuf {
@@ -2223,17 +2203,9 @@ mod tests {
     /// SET_A_HI, then a Delete of "a" with its key corrupted, then a Set of
     /// "b": the bad record at 22 hides the valid one after it.
     fn log_with_a_corrupt_middle() -> Vec<u8> {
-        let mut delete = DELETE_A.to_vec();
-        delete[HEADER_LEN] ^= 0x01;
-        let mut set_b = Vec::new();
-        encode(
-            &Record::Set {
-                key: key(b"b"),
-                value: value(b"2"),
-            },
-            &mut set_b,
-        );
-        [SET_A_HI.as_slice(), &delete, &set_b].concat()
+        let mut bytes = three_records();
+        bytes[22 + HEADER_LEN] ^= 0x01;
+        bytes
     }
 
     #[test]
@@ -2244,7 +2216,7 @@ mod tests {
         assert_eq!(log_bytes(tmp.path()), bytes);
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.00000000000000000000.log", "tally.lock", "tally.log"]
+            ["tally.00000000000000000000.log", "tally.lock"]
         );
     }
 
@@ -2339,7 +2311,7 @@ mod tests {
     fn repair_refuses_an_unsupported_record() {
         let mut bytes = set_a_hi_then(&DELETE_A);
         bytes[22 + 4] = 0x19;
-        fix_header_checksum(&mut bytes[22..22 + HEADER_LEN]);
+        seal(&mut bytes[22..22 + HEADER_LEN], 22);
         let tmp = store_with_log(&bytes);
         assert!(matches!(
             Store::repair(tmp.path()),
@@ -2512,15 +2484,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
-        let mut other = Vec::new();
-        encode(
-            &Record::Set {
-                key: key(b"b"),
-                value: value(b"hi"),
-            },
-            &mut other,
-        );
-        write_log_at(tmp.path(), 0, &other);
+        write_log_at(tmp.path(), 0, &encoded(&[set_record(b"b", b"hi")]));
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
@@ -2535,7 +2499,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
-        write_log_at(tmp.path(), 0, &DELETE_A);
+        write_log_at(tmp.path(), 0, &moved(&DELETE_A, 0));
         assert!(matches!(
             store.get(&key(b"a")),
             Err(Error::Corruption {
@@ -2552,14 +2516,6 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    fn encoded(records: &[Record]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for record in records {
-            encode(record, &mut bytes);
-        }
-        bytes
     }
 
     fn set_record(k: &[u8], v: &[u8]) -> Record {
@@ -2582,9 +2538,11 @@ mod tests {
 
         store.compact().unwrap();
 
-        let expected = encoded(&[set_record(b"c", b"3"), set_record(b"a", b"hi")]);
-        assert_eq!(expected[21..], SET_A_HI);
-        assert_eq!(log_bytes(tmp.path()), expected);
+        assert_eq!(segment_bases(tmp.path()), [105]);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(105, &[set_record(b"c", b"3"), set_record(b"a", b"hi")])
+        );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
         assert_eq!(store.get(&key(b"c")).unwrap(), Some(value(b"3")));
@@ -2606,10 +2564,17 @@ mod tests {
         store.delete(key(b"a")).unwrap();
         drop(store);
 
-        let mut expected = SET_A_HI.to_vec();
-        expected.extend(encoded(&[set_record(b"b", b"2")]));
-        expected.extend(DELETE_A);
-        assert_eq!(log_bytes(tmp.path()), expected);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(
+                45,
+                &[
+                    set_record(b"a", b"hi"),
+                    set_record(b"b", b"2"),
+                    delete_record(b"a"),
+                ]
+            )
+        );
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -2624,20 +2589,29 @@ mod tests {
         store.compact().unwrap();
         assert_eq!(log_bytes(tmp.path()), b"");
         store.set(key(b"a"), value(b"hi")).unwrap();
-        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(42, &[set_record(b"a", b"hi")])
+        );
     }
 
     #[test]
-    fn compact_twice_writes_the_same_log() {
+    fn compact_twice_copies_the_same_records_to_the_end() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
-        let once = log_bytes(tmp.path());
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(43, &[set_record(b"a", b"hi")])
+        );
         store.compact().unwrap();
-        assert_eq!(log_bytes(tmp.path()), once);
-        assert_eq!(once, SET_A_HI);
+        assert_eq!(segment_bases(tmp.path()), [65]);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(65, &[set_record(b"a", b"hi")])
+        );
     }
 
     #[test]
@@ -2652,10 +2626,8 @@ mod tests {
                 "tally.00000000000000000022.hint",
                 "tally.00000000000000000022.log",
                 "tally.lock",
-                "tally.log"
             ]
         );
-        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
     }
 
     #[test]
@@ -2767,7 +2739,7 @@ mod tests {
             .write(true)
             .open(log_path(tmp.path()))
             .unwrap()
-            .set_len(22)
+            .set_len(FILE_HEADER_LEN + 22)
             .unwrap();
         assert!(matches!(
             store.verify(),
@@ -2809,13 +2781,12 @@ mod tests {
             .unwrap();
         assert_eq!(segment_bases(tmp.path()), [0, 43]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(43))).unwrap(),
-            encoded(&[
-                set_record(b"c", b"3"),
-                Record::Batch { body_len: 41 },
-                set_record(b"d", b"4"),
-                delete_record(b"a"),
-            ]),
+            segment_records(tmp.path(), 43),
+            [
+                encoded_at(43, &[set_record(b"c", b"3")]),
+                batched_at(64, &[set_record(b"d", b"4"), delete_record(b"a")]),
+            ]
+            .concat(),
             "21 bytes is not full: the whole batch goes after c=3"
         );
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
@@ -2850,8 +2821,8 @@ mod tests {
         store.clean(&store.writer(), &[42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [0, 21, 62, 83]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(83))).unwrap(),
-            encoded(&[delete_record(b"a")])
+            segment_records(tmp.path(), 83),
+            encoded_at(83, &[delete_record(b"a")])
         );
         drop(store);
 
@@ -2868,8 +2839,8 @@ mod tests {
         store.clean(&store.writer(), &[0, 21, 42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [62, 83]);
         assert_eq!(
-            fs::read(tmp.path().join(log_name(83))).unwrap(),
-            encoded(&[set_record(b"b", b"2")]),
+            segment_records(tmp.path(), 83),
+            encoded_at(83, &[set_record(b"b", b"2")]),
             "only b=2 is copied; the Delete has nothing left to hide"
         );
         assert!(tmp.path().join(hint_name(83)).exists());
@@ -2944,7 +2915,7 @@ mod tests {
         // a live record, and a=1 at 0 is never read.
         store.delete(key(b"b")).unwrap();
         assert_eq!(segment_bases(tmp.path()), [0, 63, 83]);
-        assert_eq!(fs::read(tmp.path().join(log_name(83))).unwrap(), b"");
+        assert_eq!(segment_records(tmp.path(), 83), b"");
         assert_eq!(store.dead(), 20);
         drop(store);
         let store = Store::open_with(tmp.path(), options).unwrap();
@@ -2957,7 +2928,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         drop(one_record_per_segment(tmp.path()));
         let second = tmp.path().join(log_name(21));
-        fs::write(&second, &fs::read(&second).unwrap()[..10]).unwrap();
+        let cut = FILE_HEADER_LEN as usize + 10;
+        fs::write(&second, &fs::read(&second).unwrap()[..cut]).unwrap();
         assert!(matches!(
             Store::open_with(tmp.path(), segmented(1)),
             Err(Error::Corruption {
@@ -2978,11 +2950,7 @@ mod tests {
     fn segments_that_overlap_are_refused() {
         let tmp = tempfile::tempdir().unwrap();
         drop(one_record_per_segment(tmp.path()));
-        fs::write(
-            tmp.path().join(log_name(30)),
-            encoded(&[set_record(b"x", b"1")]),
-        )
-        .unwrap();
+        write_segment(tmp.path(), 30, &encoded_at(30, &[set_record(b"x", b"1")]));
         assert!(matches!(
             Store::open_with(tmp.path(), segmented(1)),
             Err(Error::Corruption {
@@ -3019,100 +2987,92 @@ mod tests {
         store.verify().unwrap();
     }
 
-    // migration from before segments
+    // other versions and segment headers
 
     #[test]
-    fn a_log_from_before_segments_becomes_the_first_segment_with_its_hint() {
+    fn a_directory_from_before_segments_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        fs::rename(
-            tmp.path().join(log_name(43)),
-            tmp.path().join(LOG_FILE_NAME),
-        )
-        .unwrap();
-        fs::rename(
-            tmp.path().join(hint_name(43)),
-            tmp.path().join(HINT_FILE_NAME),
-        )
-        .unwrap();
-        fs::write(tmp.path().join(COMPACT_FILE_NAME), b"left by a crash").unwrap();
-        write_log_at(tmp.path(), 20, b"X");
-
-        let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(
-            file_names(tmp.path()),
-            [
-                "tally.00000000000000000000.hint",
-                "tally.00000000000000000000.log",
-                "tally.lock",
-                "tally.log"
-            ]
-        );
-        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
-        assert!(
-            matches!(
-                store.get(&key(b"a")),
-                Err(Error::Corruption {
-                    offset: 0,
-                    reason: CorruptionReason::PayloadChecksum
-                })
-            ),
-            "read from the hint, not the log"
-        );
-        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        fs::write(tmp.path().join(LOG_FILE_NAME), SET_A_HI).unwrap();
+        assert!(matches!(
+            Store::open(tmp.path()),
+            Err(Error::Unsupported {
+                offset: 0,
+                reason: UnsupportedReason::OtherFormat
+            })
+        ));
+        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), SET_A_HI);
     }
 
     #[test]
-    fn a_move_to_segments_stopped_after_its_link_is_finished() {
+    fn a_segment_without_this_versions_header_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        compacted_a_and_b(tmp.path());
-        fs::rename(
-            tmp.path().join(log_name(43)),
-            tmp.path().join(LOG_FILE_NAME),
-        )
-        .unwrap();
-        fs::remove_file(tmp.path().join(hint_name(43))).unwrap();
-        fs::hard_link(tmp.path().join(LOG_FILE_NAME), tmp.path().join(log_name(0))).unwrap();
-
-        let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(
-            file_names(tmp.path()),
-            ["tally.00000000000000000000.log", "tally.lock", "tally.log"]
-        );
-        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
-        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        fs::write(tmp.path().join(log_name(0)), SET_A_HI).unwrap();
+        assert!(matches!(
+            Store::open(tmp.path()),
+            Err(Error::Unsupported {
+                offset: 0,
+                reason: UnsupportedReason::OtherFormat
+            })
+        ));
+        assert_eq!(fs::read(tmp.path().join(log_name(0))).unwrap(), SET_A_HI);
     }
 
     #[test]
-    fn the_marker_is_an_unsupported_record_to_any_earlier_tally() {
-        assert_eq!(
-            decode_header(&marker()),
-            Err(DecodeError::Unsupported(UnsupportedReason::UnknownType(
-                255
-            )))
-        );
+    fn a_damaged_segment_header_is_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut bytes = segment_file(0, &SET_A_HI);
+        bytes[14] ^= 0x01;
+        fs::write(tmp.path().join(log_name(0)), &bytes).unwrap();
+        assert!(matches!(
+            Store::open(tmp.path()),
+            Err(Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::SegmentHeader
+            })
+        ));
     }
 
     #[test]
-    fn a_torn_or_zeroed_marker_is_written_again() {
+    fn a_newest_segment_whose_header_a_crash_cut_short_is_started_again() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        for torn in [&marker()[..7], &[], &[0; SHORTEST_HEADER_LEN]] {
-            fs::write(tmp.path().join(LOG_FILE_NAME), torn).unwrap();
+        let header = segment_file(86, b"");
+        for torn in [&header[..9], &[], &[0; 17], &[0xab; 17]] {
+            fs::write(tmp.path().join(log_name(86)), torn).unwrap();
             let store = Store::open(tmp.path()).unwrap();
-            assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), marker());
+            assert_eq!(fs::read(tmp.path().join(log_name(86))).unwrap(), header);
             assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
         }
     }
 
     #[test]
-    fn records_in_tally_log_next_to_segments_are_refused() {
+    fn a_sealed_segment_whose_header_was_cut_short_is_corruption() {
         let tmp = tempfile::tempdir().unwrap();
-        compacted_a_and_b(tmp.path());
-        fs::write(tmp.path().join(LOG_FILE_NAME), SET_A_HI).unwrap();
-        assert!(matches!(Store::open(tmp.path()), Err(Error::Io(_))));
-        assert_eq!(fs::read(tmp.path().join(LOG_FILE_NAME)).unwrap(), SET_A_HI);
+        drop(one_record_per_segment(tmp.path()));
+        fs::write(tmp.path().join(log_name(21)), &segment_file(21, b"")[..9]).unwrap();
+        assert!(matches!(
+            Store::open_with(tmp.path(), segmented(1)),
+            Err(Error::Corruption {
+                offset: 21,
+                reason: CorruptionReason::CutShort
+            })
+        ));
+    }
+
+    #[test]
+    fn open_removes_a_copy_a_crashed_compaction_left() {
+        let tmp = tempfile::tempdir().unwrap();
+        let left = tmp.path().join(compact_name(0));
+        fs::write(&left, [0xAB; 100]).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        assert!(!left.exists());
+        store.set(key(b"a"), value(b"hi")).unwrap();
+        store.compact().unwrap();
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(22, &[set_record(b"a", b"hi")])
+        );
     }
 
     // batches
@@ -3147,13 +3107,15 @@ mod tests {
 
         assert_eq!(
             log_bytes(tmp.path()),
-            encoded(&[
-                Record::Batch { body_len: 84 },
-                set_record(b"a", b"1"),
-                set_record(b"b", b"2"),
-                set_record(b"a", b"hi"),
-                delete_record(b"b"),
-            ])
+            batched_at(
+                0,
+                &[
+                    set_record(b"a", b"1"),
+                    set_record(b"b", b"2"),
+                    set_record(b"a", b"hi"),
+                    delete_record(b"b"),
+                ]
+            )
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -3185,11 +3147,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
-            encoded(&[
-                Record::Batch { body_len: 41 },
-                set_record(b"a", b"1"),
-                delete_record(b"a"),
-            ])
+            batched_at(0, &[set_record(b"a", b"1"), delete_record(b"a")])
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
     }
@@ -3198,11 +3156,10 @@ mod tests {
     fn log_with_a_batch() -> (Vec<u8>, usize) {
         let before = encoded(&[set_record(b"b", b"2")]);
         let mut log = before.clone();
-        log.extend(encoded(&[
-            Record::Batch { body_len: 41 },
-            set_record(b"a", b"1"),
-            delete_record(b"b"),
-        ]));
+        log.extend(batched_at(
+            21,
+            &[set_record(b"a", b"1"), delete_record(b"b")],
+        ));
         (log, before.len())
     }
 
@@ -3211,7 +3168,7 @@ mod tests {
         let (log, before) = log_with_a_batch();
         for cut in before..log.len() {
             let tmp = tempfile::tempdir().unwrap();
-            fs::write(log_path(tmp.path()), &log[..cut]).unwrap();
+            write_segment(tmp.path(), 0, &log[..cut]);
             let store = Store::open(tmp.path()).unwrap();
             assert_eq!(store.get(&key(b"a")).unwrap(), None, "cut at {cut}");
             assert_eq!(
@@ -3222,7 +3179,7 @@ mod tests {
             assert_eq!(log_bytes(tmp.path()).len(), before, "cut at {cut}");
         }
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(log_path(tmp.path()), &log).unwrap();
+        write_segment(tmp.path(), 0, &log);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"1")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -3234,7 +3191,7 @@ mod tests {
         let len = log.len();
         log[len - 20..].fill(0);
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(log_path(tmp.path()), &log).unwrap();
+        write_segment(tmp.path(), 0, &log);
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -3245,8 +3202,9 @@ mod tests {
     fn corruption_inside_a_batch_is_reported_and_repaired_at_the_batch() {
         let (mut log, before) = log_with_a_batch();
         log[before + 27 + 20] ^= 0x01;
+        log.extend(encoded_at(89, &[set_record(b"c", b"3")]));
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(log_path(tmp.path()), &log).unwrap();
+        write_segment(tmp.path(), 0, &log);
         assert!(matches!(
             Store::open(tmp.path()),
             Err(Error::Corruption {
@@ -3256,23 +3214,29 @@ mod tests {
         ));
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!((repaired.offset, repaired.dropped), (21, 68));
+        assert_eq!((repaired.offset, repaired.dropped), (21, 68 + 21));
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
+        assert_eq!(store.get(&key(b"c")).unwrap(), None);
     }
 
     #[test]
     fn a_batch_inside_a_batch_or_a_record_past_its_end_is_corrupt() {
-        let nested = encoded(&[
-            Record::Batch { body_len: 48 },
-            Record::Batch { body_len: 21 },
-            set_record(b"a", b"1"),
-        ]);
-        let short = encoded(&[Record::Batch { body_len: 10 }, set_record(b"a", b"1")]);
-        for log in [nested, short] {
+        let mut nested = encoded(&[Record::Batch { body_len: 48 }]);
+        encode(
+            &Record::Batch { body_len: 21 },
+            Place::Inner,
+            27,
+            &mut nested,
+        );
+        encode(&set_record(b"a", b"1"), Place::Inner, 54, &mut nested);
+        let mut short = encoded(&[Record::Batch { body_len: 10 }]);
+        encode(&set_record(b"a", b"1"), Place::Inner, 27, &mut short);
+        for mut log in [nested, short] {
+            log.extend(encoded_at(log.len() as u64, &[set_record(b"b", b"2")]));
             let tmp = tempfile::tempdir().unwrap();
-            fs::write(log_path(tmp.path()), &log).unwrap();
+            write_segment(tmp.path(), 0, &log);
             assert!(matches!(
                 Store::open(tmp.path()),
                 Err(Error::Corruption {
@@ -3295,7 +3259,10 @@ mod tests {
             ]))
             .unwrap();
         store.compact().unwrap();
-        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(89, &[set_record(b"b", b"2")])
+        );
         assert_eq!(store.dead(), 0);
         drop(store);
         let store = Store::open(tmp.path()).unwrap();
@@ -3330,7 +3297,7 @@ mod tests {
             .write(true)
             .open(tmp.path().join(log_name(43)))
             .unwrap();
-        file.write_all_at(b"X", 20).unwrap();
+        file.write_all_at(b"X", FILE_HEADER_LEN + 20).unwrap();
         drop(file);
 
         let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
@@ -3416,37 +3383,26 @@ mod tests {
         let mut log = Vec::new();
         let mut set_at = 0;
         for i in 0..150_000u32 {
+            let at = log.len() as u64;
             if i == 140_001 {
-                set_at = log.len() as u64;
+                set_at = at;
             }
-            if i % 7 == 3 {
-                encode(&Record::Delete { key: k(i) }, &mut log);
+            let records = if i % 7 == 3 {
+                encoded_at(at, &[Record::Delete { key: k(i) }])
             } else if i % 1000 == 0 {
-                let mut body = Vec::new();
-                encode(
-                    &Record::Set {
-                        key: k(i),
-                        value: value(b"batched"),
-                    },
-                    &mut body,
-                );
-                encode(&Record::Delete { key: k(i + 1) }, &mut body);
-                encode(
-                    &Record::Batch {
-                        body_len: body.len() as u64,
-                    },
-                    &mut log,
-                );
-                log.extend_from_slice(&body);
+                let set = Record::Set {
+                    key: k(i),
+                    value: value(b"batched"),
+                };
+                batched_at(at, &[set, Record::Delete { key: k(i + 1) }])
             } else {
-                encode(
-                    &Record::Set {
-                        key: k(i),
-                        value: value(&i.to_le_bytes()),
-                    },
-                    &mut log,
-                );
-            }
+                let set = Record::Set {
+                    key: k(i),
+                    value: value(&i.to_le_bytes()),
+                };
+                encoded_at(at, &[set])
+            };
+            log.extend(records);
         }
         log.extend_from_slice(&SET_A_HI[..9]);
         (log, set_at)
@@ -3462,14 +3418,18 @@ mod tests {
 
         let mut one = Index::new();
         let mut many = Index::new();
-        assert_eq!(
-            scan_on(&file, &mut one, 0, len, 1, &mut |_, _| {}).unwrap(),
-            len - 9
-        );
-        assert_eq!(
-            scan_on(&file, &mut many, 0, len, 4, &mut |_, _| {}).unwrap(),
-            len - 9
-        );
+        for (index, threads) in [(&mut one, 1), (&mut many, 4)] {
+            assert!(
+                matches!(
+                    scan_on(&file, index, 0, len, threads, &mut |_, _| {}),
+                    Err(Error::Corruption {
+                        offset,
+                        reason: CorruptionReason::CutShort
+                    }) if offset == len - 9
+                ),
+                "{threads} threads"
+            );
+        }
         assert_eq!(many.len(), one.len());
         assert_eq!(many.len(), 34_285);
         for i in 0..40_000u32 {
@@ -3534,7 +3494,7 @@ mod tests {
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.00000000000000000043.log", "tally.lock", "tally.log"]
+            ["tally.00000000000000000043.log", "tally.lock"]
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -3545,12 +3505,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
         let log = log_bytes(tmp.path());
-        fs::write(log_path(tmp.path()), &log[..22]).unwrap();
+        write_segment(tmp.path(), 43, &log[..22]);
 
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(
             file_names(tmp.path()),
-            ["tally.00000000000000000043.log", "tally.lock", "tally.log"]
+            ["tally.00000000000000000043.log", "tally.lock"]
         );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -3560,10 +3520,13 @@ mod tests {
     fn repair_removes_the_hint_before_truncating() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
+        let store = Store::open(tmp.path()).unwrap();
+        store.set(key(b"d"), value(b"4")).unwrap();
+        drop(store);
         write_log_at(tmp.path(), 41, b"X");
 
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
-        assert_eq!(repaired.offset, 65);
+        assert_eq!((repaired.offset, repaired.dropped), (65, 21 + 21));
         assert!(!hint_path(tmp.path()).exists());
         let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -3584,7 +3547,10 @@ mod tests {
         drop(store);
 
         let store = Store::open(tmp.path()).unwrap();
-        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(106, &[set_record(b"b", b"2")])
+        );
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
         assert_eq!(store.dead(), 0);
@@ -3593,7 +3559,7 @@ mod tests {
     /// A hint's bytes, from its `entries`, Set count, log length and `crc`,
     /// computed in Python.
     fn hint_bytes(entries: &[&[u8]], count: u64, log_len: u64, crc: u64) -> Vec<u8> {
-        let mut bytes = b"TLYH\x02".to_vec();
+        let mut bytes = b"TLYH\x03".to_vec();
         for entry in entries {
             bytes.extend_from_slice(entry);
         }
@@ -3603,11 +3569,11 @@ mod tests {
         bytes
     }
 
-    /// Flips a byte of the segment at `base`, at `at` in its file.
+    /// Flips a byte of the segment at `base`, at `at` from its first record.
     fn damage(dir: &Path, base: u64, at: u64) {
         let path = dir.join(log_name(base));
         let mut bytes = fs::read(&path).unwrap();
-        bytes[at as usize] ^= 0x01;
+        bytes[(FILE_HEADER_LEN + at) as usize] ^= 0x01;
         fs::write(path, bytes).unwrap();
     }
 
@@ -3633,7 +3599,6 @@ mod tests {
                 "tally.00000000000000000069.log",
                 "tally.00000000000000000089.log",
                 "tally.lock",
-                "tally.log"
             ],
             "the active segment gets none"
         );
@@ -3641,22 +3606,22 @@ mod tests {
             fs::read(tmp.path().join(hint_name(0))).unwrap(),
             hint_bytes(
                 &[
-                    &[0x13, 0, 0, 8, 0, 0, 0],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'a'],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x33, 0, 0, 8, 0, 0, 0],
+                    &[0x71, 1, 0, 1, 0, 0, 0, b'a'],
+                    &[0x71, 1, 0, 1, 0, 0, 0, b'b'],
                 ],
                 2,
                 69,
-                0x908f_2205_8d4b_c596
+                0xe65a_6aef_8722_6c39
             )
         );
         assert_eq!(
             fs::read(tmp.path().join(hint_name(69))).unwrap(),
             hint_bytes(
-                &[&[0x12, 1, 0, 0, 0, 0, 0, b'a']],
+                &[&[0x32, 1, 0, 0, 0, 0, 0, b'a']],
                 0,
                 20,
-                0x11c1_da6b_3036_b216
+                0xc49e_1846_0308_4f35
             )
         );
 
@@ -3692,13 +3657,13 @@ mod tests {
             fs::read(tmp.path().join(hint_name(43))).unwrap(),
             hint_bytes(
                 &[
-                    &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'c'],
+                    &[0x31, 1, 0, 2, 0, 0, 0, b'a'],
+                    &[0x31, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x31, 1, 0, 1, 0, 0, 0, b'c'],
                 ],
                 3,
                 64,
-                0x4390_d75d_52fc_839d
+                0x92a6_b3e1_11e1_5f58
             )
         );
 
@@ -3760,32 +3725,6 @@ mod tests {
         assert_eq!(hints, segments - 1);
     }
 
-    #[test]
-    fn a_sealed_segment_from_before_64_bit_checksums_gets_a_hint_too() {
-        let mut old = Vec::new();
-        encode_as(Format::Crc32c, &set_record(b"a", b"hi"), &mut old);
-        let tmp = store_with_log(&old);
-        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        put(&store, b"b", b"2");
-        drop(store);
-
-        drop(Store::open_with(tmp.path(), segmented(1)).unwrap());
-        assert_eq!(
-            fs::read(tmp.path().join(hint_name(0))).unwrap(),
-            hint_bytes(
-                &[&[0x01, 1, 0, 2, 0, 0, 0, b'a']],
-                1,
-                18,
-                0x500e_34e4_b61c_0fa6
-            )
-        );
-        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        assert_eq!(store.index.get(b"a").unwrap().format, Format::Crc32c);
-        assert_eq!(read(&store, b"a").as_deref(), Some(&b"hi"[..]));
-        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
-        store.verify().unwrap();
-    }
-
     fn open_on(fs: &MemFs, options: Options) -> Store<MemFs> {
         Store::open_in(fs.clone(), Path::new("/db"), options).unwrap()
     }
@@ -3805,7 +3744,7 @@ mod tests {
 
         fs.limit_free_space(Some(10));
         let store = open_on(&fs, segmented(1));
-        assert_eq!(fs.read(&hint).unwrap(), b"TLYH\x02\x11\x01\x00\x01\x00");
+        assert_eq!(fs.read(&hint).unwrap(), b"TLYH\x03\x31\x01\x00\x01\x00");
         assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
         assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
         drop(store);
@@ -3815,10 +3754,10 @@ mod tests {
         assert_eq!(
             fs.read(&hint).unwrap(),
             hint_bytes(
-                &[&[0x11, 1, 0, 1, 0, 0, 0, b'a']],
+                &[&[0x31, 1, 0, 1, 0, 0, 0, b'a']],
                 1,
                 21,
-                0xeba4_83e6_d395_4202
+                0x3efb_41cb_e0ab_bf21
             )
         );
         assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
@@ -3846,7 +3785,7 @@ mod tests {
         let cut = fs.read(&hint).unwrap();
         assert_eq!(cut.len(), 5 + 16 + 24);
         assert_eq!(cut[..21], compacted[..21]);
-        assert_eq!(cut[21..29], [0x11, 1, 0, 1, 0, 0, 0, b'c']);
+        assert_eq!(cut[21..29], [0x31, 1, 0, 1, 0, 0, 0, b'c']);
         assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
         drop(store);
 
@@ -3856,13 +3795,13 @@ mod tests {
             fs.read(&hint).unwrap(),
             hint_bytes(
                 &[
-                    &[0x11, 1, 0, 2, 0, 0, 0, b'a'],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'b'],
-                    &[0x11, 1, 0, 1, 0, 0, 0, b'c'],
+                    &[0x31, 1, 0, 2, 0, 0, 0, b'a'],
+                    &[0x31, 1, 0, 1, 0, 0, 0, b'b'],
+                    &[0x31, 1, 0, 1, 0, 0, 0, b'c'],
                 ],
                 3,
                 64,
-                0x4390_d75d_52fc_839d
+                0x92a6_b3e1_11e1_5f58
             )
         );
         for (k, v) in [(b"a", &b"hi"[..]), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
@@ -3914,16 +3853,6 @@ mod tests {
         ));
         assert_eq!(log_bytes(tmp.path()), before);
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-    }
-
-    #[test]
-    fn compact_overwrites_a_compact_file_left_by_a_crash() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join(COMPACT_FILE_NAME), [0xAB; 100]).unwrap();
-        let store = Store::open(tmp.path()).unwrap();
-        store.set(key(b"a"), value(b"hi")).unwrap();
-        store.compact().unwrap();
-        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
     }
 
     #[test]
@@ -3984,7 +3913,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_that_fails_after_writing_copies_empties_the_new_segment() {
+    fn a_compaction_that_fails_after_writing_copies_leaves_no_trace() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
         let big = vec![b'v'; 700 << 10];
@@ -4001,15 +3930,13 @@ mod tests {
                 if offset == c
         ));
         let end = c + 21;
-        assert_eq!(segment_bases(tmp.path()), [0, end]);
-        assert_eq!(fs::read(tmp.path().join(log_name(end))).unwrap(), b"");
-        assert!(!tmp.path().join(hint_name(end)).exists());
+        assert_eq!(file_names(tmp.path()), [log_name(0).as_str(), "tally.lock"]);
         assert_eq!(read(&store, b"a"), Some(big.clone()));
         assert_eq!(read(&store, b"b"), Some(big));
         put(&store, b"d", b"4");
         assert_eq!(
-            fs::read(tmp.path().join(log_name(end))).unwrap(),
-            encoded(&[set_record(b"d", b"4")])
+            log_bytes(tmp.path())[end as usize..],
+            encoded_at(end, &[set_record(b"d", b"4")])
         );
         assert_eq!(store.index.get(b"d").unwrap().offset, end);
     }
@@ -4033,7 +3960,7 @@ mod tests {
         store.set(key(b"b"), value(b"4")).unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
-            encoded(&[set_record(b"a", b"3"), set_record(b"b", b"4")])
+            encoded_at(84, &[set_record(b"a", b"3"), set_record(b"b", b"4")])
         );
 
         store.set(key(b"a"), value(b"5")).unwrap();
@@ -4051,7 +3978,10 @@ mod tests {
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.delete(key(b"a")).unwrap();
-        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"b", b"2")]));
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(63, &[set_record(b"b", b"2")])
+        );
     }
 
     #[test]
@@ -4062,7 +3992,10 @@ mod tests {
         store.set(key(b"a"), value(b"2")).unwrap();
         assert_eq!(log_bytes(tmp.path()).len(), 42);
         store.set(key(b"a"), value(b"3")).unwrap();
-        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(63, &[set_record(b"a", b"3")])
+        );
     }
 
     #[test]
@@ -4098,7 +4031,10 @@ mod tests {
         drop(store);
 
         let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
-        assert_eq!(log_bytes(tmp.path()), SET_A_HI);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(44, &[set_record(b"a", b"hi")])
+        );
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
     }
 
@@ -4123,7 +4059,7 @@ mod tests {
         store.set(key(b"b"), value(b"4")).unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
-            encoded(&[set_record(b"a", b"3"), set_record(b"b", b"4")])
+            encoded_at(84, &[set_record(b"a", b"3"), set_record(b"b", b"4")])
         );
     }
 
@@ -4168,7 +4104,11 @@ mod tests {
             drop(writing);
         });
         assert_eq!(store.commits.load(Ordering::Relaxed), 2);
-        assert_eq!(log_bytes(tmp.path()).len(), 8 * 21);
+        assert_eq!(
+            log_bytes(tmp.path()).len(),
+            21 + 27 + 7 * 21,
+            "one alone, seven in a batch"
+        );
         for i in 0..8u8 {
             assert_eq!(read(&store, &[i]), Some(vec![i]));
         }
@@ -4192,13 +4132,18 @@ mod tests {
         assert_eq!(store.commits.load(Ordering::Relaxed), 2);
         assert_eq!(
             log_bytes(tmp.path()),
-            encoded(&[
-                set_record(b"b", b"0"),
-                set_record(b"a", b"1"),
-                delete_record(b"a"),
-                Record::Batch { body_len: 21 },
-                set_record(b"b", b"2"),
-            ])
+            [
+                encoded(&[set_record(b"b", b"0")]),
+                batched_at(
+                    21,
+                    &[
+                        set_record(b"a", b"1"),
+                        delete_record(b"a"),
+                        set_record(b"b", b"2"),
+                    ]
+                ),
+            ]
+            .concat()
         );
         assert_eq!(read(&store, b"a"), None);
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
@@ -4219,8 +4164,9 @@ mod tests {
         assert_eq!(messages, ["disk on fire"; 3]);
     }
 
+    /// The records of the first segment on `fs`.
     fn log_on(fs: &MemFs) -> Vec<u8> {
-        fs.read(&Path::new("/db").join(log_name(0))).unwrap()
+        fs.read(&Path::new("/db").join(log_name(0))).unwrap()[FILE_HEADER_LEN as usize..].to_vec()
     }
 
     #[test]
@@ -4342,7 +4288,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_fsync_during_compaction_poisons_the_store_and_keeps_the_old_segments() {
+    fn a_failed_fsync_of_a_compactions_copy_leaves_the_store_as_it_was() {
         let fs = MemFs::new();
         let store = open_on(&fs, segmented(1));
         store.set(key(b"a"), value(b"1")).unwrap();
@@ -4351,19 +4297,14 @@ mod tests {
         fs.fail_syncs(true);
         assert!(matches!(store.compact(), Err(Error::Io(_))));
         fs.fail_syncs(false);
-        assert!(matches!(
-            store.set(key(b"c"), value(b"4")),
-            Err(Error::Poisoned)
-        ));
+        let db = Path::new("/db");
+        assert_eq!(fs.read(&db.join(compact_name(63))), None);
+        assert_eq!(fs.read(&db.join(hint_name(63))), None);
         assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
         assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
+        store.set(key(b"c"), value(b"4")).unwrap();
         drop(store);
 
-        assert_eq!(
-            fs.read(&Path::new("/db").join(hint_name(63))),
-            None,
-            "no hint vouches for copies whose fsync failed"
-        );
         let store = open_on(&fs, segmented(1));
         assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
         assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
@@ -4390,7 +4331,6 @@ mod tests {
                 offset: 42,
                 value_len: 1,
                 key_len: 1,
-                format: Format::Crc64,
             }
         );
         assert_eq!(segment.base, 42);
@@ -4482,7 +4422,10 @@ mod tests {
             "half dead and not compacted"
         );
         store.commit(&[Write::One(set_record(b"a", b"3"))]);
-        assert_eq!(log_bytes(tmp.path()), encoded(&[set_record(b"a", b"3")]));
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded_at(63, &[set_record(b"a", b"3")])
+        );
     }
 
     /// A store whose next leader expects a group of `last_group` writes
