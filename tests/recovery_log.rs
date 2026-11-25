@@ -32,7 +32,7 @@ fn open_warns_with_the_offset_and_bytes_dropped() {
 
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
-    let mut store = Store::open(dir).unwrap();
+    let store = Store::open(dir).unwrap();
     store
         .set(
             Key::try_from(&b"a"[..]).unwrap(),

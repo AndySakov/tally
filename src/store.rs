@@ -1,9 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::TryLockError;
 use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, mpsc};
 use std::{mem, thread};
 
 use crate::fs::{Fs, LogFile, OsFs};
@@ -54,6 +55,11 @@ pub struct Repaired {
 /// An open store: the log's segments plus an in-memory index of every live
 /// key.
 ///
+/// Every method takes `&self`, and a `Store` on the real file system is
+/// `Send` and `Sync`: share one between threads with an `Arc`. Reads run in
+/// parallel with each other and with writes. Writes from several threads
+/// share fsyncs (DESIGN.md, Group commit).
+///
 /// `F` is the file system. It is always [`OsFs`] outside tally's own tests,
 /// which swap in an in-memory disk to simulate power cuts.
 pub struct Store<F: Fs = OsFs> {
@@ -62,12 +68,76 @@ pub struct Store<F: Fs = OsFs> {
     /// Holds the exclusive lock for as long as the store is open.
     _lock: F::File,
     /// In log order, none overlapping. Writes go to the last, which is
-    /// never empty of a file: there is always one to write to.
-    segments: Vec<Segment<F::File>>,
+    /// never empty of a file: there is always one to write to. Readers take
+    /// the list as it is; it is only replaced, by whoever holds `writing`.
+    segments: RwLock<Segments<F::File>>,
     segment_bytes: u64,
-    /// `None` once an automatic compaction has failed, until the next open.
     auto_compact: Option<AutoCompact>,
+    /// Set once an automatic compaction has failed, until the next open.
+    auto_failed: AtomicBool,
     index: Index,
+    /// Held by whoever appends to the log or changes its segments: the
+    /// leader of a group of writes, a compaction, or `verify`.
+    writing: Mutex<()>,
+    /// Writes waiting for a leader, and the results of those done.
+    queue: Mutex<Queue>,
+    /// Signalled when a group of writes is done.
+    committed: Condvar,
+    /// Set by a failed fsync, or a failed truncate after a failed write:
+    /// from then on writes fail with `Poisoned` (DESIGN.md, Failed fsync).
+    poisoned: AtomicBool,
+    /// Appends fsynced, for tests of group commit.
+    #[cfg(test)]
+    commits: std::sync::atomic::AtomicU64,
+}
+
+type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
+
+/// Evidence that the caller holds `Store::writing`.
+type Writing<'a> = MutexGuard<'a, ()>;
+
+/// A write a caller asked for: one record, or a batch.
+enum Write {
+    One(Record),
+    Batch(Vec<Record>),
+}
+
+impl Write {
+    /// About how many bytes it writes, to cap a group.
+    fn size(&self) -> usize {
+        let records = match self {
+            Write::One(record) => std::slice::from_ref(record),
+            Write::Batch(records) => records,
+        };
+        records
+            .iter()
+            .map(|record| match record {
+                Record::Set { key, value } => key.as_bytes().len() + value.as_bytes().len(),
+                Record::Delete { key } => key.as_bytes().len(),
+                Record::Batch { .. } => 0,
+            })
+            .sum()
+    }
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: VecDeque<(u64, Write)>,
+    next: u64,
+    done: HashMap<u64, Result<(), Error>>,
+    /// Whether a leader is writing a group now.
+    leading: bool,
+}
+
+/// A group takes waiting writes until it has this many, or this many bytes.
+const GROUP_MOST_WRITES: usize = 1024;
+const GROUP_MOST_BYTES: usize = 4 << 20;
+
+/// Locks `mutex` even if a thread panicked holding it. Every lock here
+/// guards state a panic can't leave half changed, or the poisoned flag
+/// covers it.
+fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Store {
@@ -138,33 +208,37 @@ impl<F: Fs> Store<F> {
         let mut segments = open_segments(&fs, dir)?;
         if segments.is_empty() {
             let file = fs.open_or_create(&dir.join(log_name(0)))?;
-            segments.push(Segment {
-                base: 0,
-                file,
-                len: 0,
-                dead: 0,
-                map: None,
-            });
+            segments.push(Segment::new(0, file, 0));
         }
-        sync(&segments.last().expect("one was just made").file);
+        segments.last().expect("one was just made").file.sync()?;
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let index = load(&fs, dir, &mut segments)?;
         let sealed = segments.len() - 1;
-        for segment in &mut segments[..sealed] {
+        for segment in &segments[..sealed] {
             segment.seal();
         }
-        let mut store = Store {
+        let store = Store {
             fs,
             dir: dir.to_path_buf(),
             _lock: lock_file,
-            segments,
+            segments: RwLock::new(Arc::new(segments.into_iter().map(Arc::new).collect())),
             segment_bytes: options.segment_bytes,
             auto_compact: options.auto_compact,
+            auto_failed: AtomicBool::new(false),
             index,
+            writing: Mutex::new(()),
+            queue: Mutex::default(),
+            committed: Condvar::new(),
+            poisoned: AtomicBool::new(false),
+            #[cfg(test)]
+            commits: std::sync::atomic::AtomicU64::new(0),
         };
-        store.count_dead();
-        store.compact_if_due();
+        {
+            let writing = hold(&store.writing);
+            store.count_dead(&writing);
+            store.compact_if_due(&writing);
+        }
         Ok(store)
     }
 
@@ -212,12 +286,12 @@ impl<F: Fs> Store<F> {
         };
         side.set_len(0)?;
         copy_to_end(segment.reader_at(offset).take(len - offset), &side)?;
-        sync(&side);
+        side.sync()?;
         remove_if_present(fs, &dir.join(hint_name(segment.base)))?;
         fs.sync_dir(dir)?;
 
         segment.set_len(offset)?;
-        sync(segment);
+        segment.sync()?;
         Ok(Some(Repaired {
             offset,
             dropped: len - offset,
@@ -225,103 +299,148 @@ impl<F: Fs> Store<F> {
         }))
     }
 
-    fn active(&self) -> &Segment<F::File> {
-        self.segments.last().expect("there is always a segment")
+    fn segments(&self) -> Segments<F::File> {
+        Arc::clone(&self.segments.read().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// The log offset the next record lands at.
-    fn end(&self) -> u64 {
-        self.active().end()
+    fn replace_segments(&self, _: &Writing, segments: Vec<Arc<Segment<F::File>>>) {
+        *self
+            .segments
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(segments);
+    }
+
+    fn active(&self) -> Arc<Segment<F::File>> {
+        Arc::clone(self.segments().last().expect("there is always a segment"))
     }
 
     /// Bytes no live key points at: overwritten values, deleted values,
     /// Delete records and Batch records.
     #[cfg(test)]
     pub(crate) fn dead(&self) -> u64 {
-        self.segments.iter().map(|s| s.dead).sum()
-    }
-
-    /// The segment holding log offset `offset`.
-    fn segment_of(&self, offset: u64) -> usize {
-        self.segments.partition_point(|s| s.base <= offset) - 1
+        self.segments().iter().map(|s| s.dead()).sum()
     }
 
     /// Sets each segment's dead bytes from the index: what no entry covers.
-    fn count_dead(&mut self) {
-        let mut live = vec![0u64; self.segments.len()];
-        for entry in self.index.values() {
-            live[self.segment_of(entry.offset)] += entry.record_len();
+    fn count_dead(&self, _: &Writing) {
+        let segments = self.segments();
+        let mut live = vec![0u64; segments.len()];
+        self.index.for_each(|entry| {
+            live[segment_of(&segments, entry.offset)] += entry.record_len();
+        });
+        for (segment, live) in segments.iter().zip(live) {
+            segment.set_dead(segment.len() - live);
         }
-        for (segment, live) in self.segments.iter_mut().zip(live) {
-            segment.dead = segment.len - live;
+    }
+
+    fn writable(&self) -> Result<(), Error> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::Poisoned);
         }
+        Ok(())
+    }
+
+    /// Turns writes off until the store is reopened, and returns `err`.
+    fn poison(&self, err: impl Into<Error>) -> Error {
+        let err = err.into();
+        if !self.poisoned.swap(true, Ordering::AcqRel) {
+            log::error!("writes are off until the store is reopened: {err}");
+        }
+        err
     }
 
     /// Rewrites the log with only the latest record of each live key, so
     /// overwritten values and Delete records stop taking space.
     ///
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, fsyncs both and the directory, then
-    /// removes the old segments oldest first, fsyncing the directory after
-    /// each. Until then the old segments are untouched, so any failure while
-    /// copying returns the error and leaves the store as it was. Reads each
-    /// segment in one pass and checks every record it reads, so a corrupt
-    /// record stops compaction with its offset rather than being copied.
-    /// Panics if a directory fsync fails, as for any failed fsync.
-    pub fn compact(&mut self) -> Result<(), Error> {
+    /// into a new segment with a hint, fsyncs both, points the index at the
+    /// copies, then removes the old segments oldest first, fsyncing the
+    /// directory after each. Until then the old segments are untouched, so
+    /// any failure while copying returns the error and leaves the store as
+    /// it was. Reads each segment in one pass and checks every record it
+    /// reads, so a corrupt record stops compaction with its offset rather
+    /// than being copied. Reads go on while it runs; writes wait for it. A
+    /// failed fsync of the log or the directory poisons the store.
+    pub fn compact(&self) -> Result<(), Error> {
+        let writing = hold(&self.writing);
+        self.writable()?;
         let all: Vec<u64> = self
-            .segments
+            .segments()
             .iter()
-            .filter(|s| s.len > 0)
+            .filter(|s| s.len() > 0)
             .map(|s| s.base)
             .collect();
-        self.clean(&all)
+        self.clean(&writing, &all)
     }
 
     /// Copies the live records of the segments based at `chosen` (in log
     /// order) to a fresh segment, then removes them. A Delete record is
     /// copied too while an older segment that is kept might hold a Set it
     /// hides.
-    fn clean(&mut self, chosen: &[u64]) -> Result<(), Error> {
+    fn clean(&self, writing: &Writing, chosen: &[u64]) -> Result<(), Error> {
         if chosen.is_empty() {
             return Ok(());
         }
-        if self.active().len > 0 {
-            self.roll()?;
+        if self.active().len() > 0 {
+            self.roll(writing)?;
         }
-        let oldest_kept = self
-            .segments
+        let segments = self.segments();
+        let (inputs, output) = segments.split_at(segments.len() - 1);
+        let output = &output[0];
+        let oldest_kept = segments
             .iter()
             .filter(|s| !chosen.contains(&s.base))
             .map(|s| s.base)
             .min()
             .expect("the new segment is kept");
-        let hint_path = self.dir.join(hint_name(self.end()));
+        let hint_path = self.dir.join(hint_name(output.base));
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = Vec::new();
-        let copied = self.copy_live(chosen, oldest_kept, &hint_path, &mut moved, &mut carry);
-        let written = match copied {
-            Ok(written) => written,
+        let copied = self
+            .fs
+            .open_or_create(&hint_path)
+            .map_err(Error::from)
+            .and_then(|hint| {
+                let written = self.copy_live(
+                    inputs,
+                    output,
+                    &hint,
+                    chosen,
+                    oldest_kept,
+                    &mut moved,
+                    &mut carry,
+                )?;
+                Ok((hint, written))
+            });
+        let (hint_file, written) = match copied {
+            Ok(copied) => copied,
             Err(err) => {
-                self.restore_offsets(&moved);
-                let active = self.segments.last().expect("there is always a segment");
-                active.file.set_len(0).expect("truncate should not fail");
-                sync(&active.file);
-                if remove_if_present(&self.fs, &hint_path).expect("removing a fresh hint") {
-                    self.fs
-                        .sync_dir(&self.dir)
-                        .expect("directory fsync failed; restart to recover from the log");
-                }
+                self.undo_copy(output, &hint_path);
                 return Err(err);
             }
         };
-        self.segments
-            .last_mut()
-            .expect("there is always a segment")
-            .len = written;
-        for segment in &mut self.segments {
+        if let Err(err) = output.file.sync() {
+            return Err(self.poison(err));
+        }
+        if let Err(err) = hint_file.sync() {
+            self.undo_copy(output, &hint_path);
+            return Err(err.into());
+        }
+        output.set_len_written(written);
+        if let Err(err) = self.repoint(output, &hint_file, &moved) {
+            self.count_dead(writing);
+            return Err(err);
+        }
+        let mut left_behind = 0usize;
+        self.index.for_each(|entry| {
+            if chosen.contains(&segments[segment_of(&segments, entry.offset)].base) {
+                left_behind += 1;
+            }
+        });
+        assert_eq!(left_behind, 0, "every live key in them is copied");
+        for segment in inputs {
             if chosen.contains(&segment.base) {
-                segment.dead = segment.len;
+                segment.set_dead(segment.len());
             }
         }
         if !carry.is_empty() {
@@ -334,44 +453,64 @@ impl<F: Fs> Store<F> {
                     &mut buffer,
                 );
             }
-            self.append_bytes(&buffer)?;
-            let at = self.segments.len() - 1;
-            self.segments[at].dead += buffer.len() as u64;
+            let at = self.append_bytes(writing, &buffer)?;
+            let segments = self.segments();
+            segments[segment_of(&segments, at)].add_dead(buffer.len() as u64);
         }
         for &base in chosen {
-            let at = self.segment_of(base);
             remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
             self.fs.remove(&self.dir.join(log_name(base)))?;
-            self.fs
-                .sync_dir(&self.dir)
-                .expect("directory fsync failed after compaction; restart to recover from the log");
-            self.segments.remove(at);
+            let kept = self
+                .segments()
+                .iter()
+                .filter(|s| s.base != base)
+                .cloned()
+                .collect();
+            self.replace_segments(writing, kept);
+            if let Err(err) = self.fs.sync_dir(&self.dir) {
+                return Err(self.poison(err));
+            }
         }
         Ok(())
     }
 
-    /// Writes each live record of the `chosen` segments to the empty active
-    /// segment, and its key and value length to its hint at `hint_path`,
-    /// and fsyncs both, pointing its index entry at the new offset as it
-    /// goes and pushing the old offset to `moved`, so a failure can put
-    /// them back. Pushes to `carry` the key of each Delete record that must
-    /// outlive its segment: its key isn't live, and a segment older than
-    /// it is kept. Returns the bytes written. One buffered pass per segment:
+    /// Throws away a compaction's copy: empties `output` and removes its
+    /// hint. Poisons the store if it can't, since the next write would land
+    /// after the copy's bytes.
+    fn undo_copy(&self, output: &Segment<F::File>, hint_path: &Path) {
+        let undone = output.file.set_len(0).and_then(|()| output.file.sync());
+        let undone = undone.and_then(|()| {
+            if remove_if_present(&self.fs, hint_path)? {
+                self.fs.sync_dir(&self.dir)?;
+            }
+            Ok(())
+        });
+        if let Err(err) = undone {
+            self.poison(err);
+        }
+    }
+
+    /// Writes each live record of the `chosen` segments among `inputs` to
+    /// the empty segment `output`, and its key and lengths to `hint_file`,
+    /// pushing its old offset to `moved`, in the same order. Pushes to
+    /// `carry` the key of each Delete record that must outlive its segment:
+    /// its key isn't live, and a segment older than it is kept. Returns the
+    /// bytes written; fsyncs neither file. One buffered pass per segment:
     /// reading the dead records in between costs less than a positioned
     /// read per live one.
+    #[allow(clippy::too_many_arguments)]
     fn copy_live(
-        &mut self,
+        &self,
+        inputs: &[Arc<Segment<F::File>>],
+        output: &Segment<F::File>,
+        hint_file: &F::File,
         chosen: &[u64],
         oldest_kept: u64,
-        hint_path: &Path,
         moved: &mut Vec<u64>,
         carry: &mut Vec<Vec<u8>>,
     ) -> Result<u64, Error> {
-        let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
-        let mut hint = hint::Writer::new(&hint_file);
-        let (inputs, output) = self.segments.split_at(self.segments.len() - 1);
-        let output = &output[0];
+        let mut hint = hint::Writer::new(hint_file);
         let mut carried = HashSet::new();
         let mut header_buf = [0u8; HEADER_LEN];
         let mut payload_buf = Vec::new();
@@ -380,27 +519,29 @@ impl<F: Fs> Store<F> {
         let mut expected = 0usize;
         for input in inputs.iter().filter(|s| chosen.contains(&s.base)) {
             let mut reader = BufReader::with_capacity(
-                hint::buffer_for(input.len, COMPACT_BUFFER),
+                hint::buffer_for(input.len(), COMPACT_BUFFER),
                 input.reader_at(input.base),
             );
             let mut offset = input.base;
-            while offset < input.end() {
-                let header_bytes = read_header(&mut reader, &mut header_buf, input.end() - offset)?
-                    .ok_or(Error::Corruption {
+            let end = input.end();
+            while offset < end {
+                let header_bytes = read_header(&mut reader, &mut header_buf, end - offset)?.ok_or(
+                    Error::Corruption {
                         offset,
                         reason: CorruptionReason::CutShort,
-                    })?;
+                    },
+                )?;
                 let header = decode_header(header_bytes).map_err(|err| err.at(offset))?;
                 payload_buf.resize(header.payload_len(), 0);
                 reader.read_exact(&mut payload_buf)?;
                 let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
                 match op {
                     IndexOp::Set { key, .. } => {
-                        if let Some(entry) = self.index.get_mut(key.as_bytes())
-                            && entry.offset == offset
+                        if self
+                            .index
+                            .get(key.as_bytes())
+                            .is_some_and(|entry| entry.offset == offset)
                         {
-                            entry.offset = output.base + written + buffer.len() as u64;
-                            entry.format = Format::Crc64;
                             moved.push(offset);
                             let fields = Fields {
                                 format: Format::Crc64,
@@ -439,125 +580,127 @@ impl<F: Fs> Store<F> {
             expected += 1;
         }
         assert_eq!(expected, chosen.len(), "every chosen segment is read");
-        let left_behind = self
-            .index
-            .values()
-            .filter(|e| {
-                let at = self.segments.partition_point(|s| s.base <= e.offset) - 1;
-                chosen.contains(&self.segments[at].base)
-            })
-            .count();
-        assert_eq!(left_behind, 0, "every live key in them is copied");
         output.file.write_all_at(&buffer, written)?;
         written += buffer.len() as u64;
-        sync(&output.file);
         hint.finish(written)?;
-        sync(&hint_file);
         Ok(written)
     }
 
-    /// Points the entries `copy_live` moved back at their records in the
-    /// old segments, rereading each key from there. Each was read and
-    /// checked moments before, so a failure here panics: the old segments
-    /// are untouched, and a restart rebuilds the index from them.
-    fn restore_offsets(&mut self, moved: &[u64]) {
-        for &offset in moved {
-            let segment = &self.segments[self.segment_of(offset)];
-            let (header, record) = load_record(segment, offset)
-                .expect("rereading a key after a failed compaction; restart to rebuild the index");
-            let Record::Set { key, .. } = record else {
-                unreachable!("only Set records are moved");
-            };
-            let entry = self
-                .index
-                .get_mut(key.as_bytes())
-                .expect("a moved key is still live");
-            entry.offset = offset;
-            entry.format = header.format();
-        }
+    /// Points each key `copy_live` copied at its copy in `output`, as the
+    /// output's durable hint lists them, if the key still points at the old
+    /// record `moved` holds the offset of. A copy left unpointed is dead.
+    fn repoint(
+        &self,
+        output: &Segment<F::File>,
+        hint_file: &F::File,
+        moved: &[u64],
+    ) -> Result<(), Error> {
+        let unreadable = |hint::Invalid(why)| {
+            Error::Io(io::Error::other(format!(
+                "rereading a compaction's hint: {why}"
+            )))
+        };
+        let trailer = hint::trailer(hint_file).map_err(unreadable)?;
+        let mut old = moved.iter();
+        hint::read_entries(hint_file, trailer, HINT_WINDOW, |window| {
+            for (fields, key, offset) in window.entries() {
+                let from = *old.next().expect("one old offset per copy");
+                let entry = Entry {
+                    offset: output.base + offset,
+                    value_len: fields.value_len,
+                    key_len: fields.key_len,
+                    format: fields.format,
+                };
+                if !self.index.replace(key, from, entry) {
+                    output.add_dead(entry.record_len());
+                }
+            }
+        })
+        .map_err(unreadable)?;
+        assert!(old.next().is_none(), "the hint lists every copy");
+        Ok(())
     }
 
     /// Compacts if automatic compaction is on and due, cleaning the
     /// segments with the most dead bytes until it no longer would be. The
     /// caller's write has already succeeded, so a failure is logged, not
     /// returned.
-    fn compact_if_due(&mut self) {
+    fn compact_if_due(&self, writing: &Writing) {
         let Some(auto) = self.auto_compact else {
             return;
         };
+        if self.auto_failed.load(Ordering::Relaxed) || self.writable().is_err() {
+            return;
+        }
         let sizes: Vec<SegmentSize> = self
-            .segments
+            .segments()
             .iter()
             .map(|s| SegmentSize {
                 base: s.base,
-                len: s.len,
-                dead: s.dead,
+                len: s.len(),
+                dead: s.dead(),
             })
             .collect();
         let chosen = deadest(&sizes, auto);
-        if let Err(err) = self.clean(&chosen) {
-            self.auto_compact = None;
+        if let Err(err) = self.clean(writing, &chosen) {
+            self.auto_failed.store(true, Ordering::Relaxed);
             log::warn!("automatic compaction failed, off until the next open: {err}");
         }
     }
 
     /// Starts a new, empty segment at the end of the log, and makes its
     /// name durable before anything is written to it.
-    fn roll(&mut self) -> Result<(), Error> {
-        let base = self.end();
+    fn roll(&self, writing: &Writing) -> Result<(), Error> {
+        let segments = self.segments();
+        let active = segments.last().expect("there is always a segment");
+        let base = active.end();
         let file = self.fs.open_or_create(&self.dir.join(log_name(base)))?;
         self.fs.sync_dir(&self.dir)?;
-        self.segments
-            .last_mut()
-            .expect("there is always a segment")
-            .seal();
-        self.segments.push(Segment {
-            base,
-            file,
-            len: 0,
-            dead: 0,
-            map: None,
-        });
+        active.seal();
+        let mut next = segments.to_vec();
+        next.push(Arc::new(Segment::new(base, file, 0)));
+        self.replace_segments(writing, next);
         Ok(())
-    }
-
-    fn append(&mut self, record: &Record) -> Result<u64, Error> {
-        let mut buffer: Vec<u8> = vec![];
-        encode(record, &mut buffer);
-        self.append_bytes(&buffer)
     }
 
     /// Writes `buffer` at the end of the log in one write and fsyncs it,
     /// first starting a new segment if the active one is full, so a write
-    /// never spans two segments.
-    fn append_bytes(&mut self, buffer: &[u8]) -> Result<u64, Error> {
-        let full = self.active().len;
+    /// never spans two segments. Returns where it landed. A failed write is
+    /// truncated away; a failed truncate, or a failed fsync, poisons the
+    /// store.
+    fn append_bytes(&self, writing: &Writing, buffer: &[u8]) -> Result<u64, Error> {
+        let full = self.active().len();
         if full > 0 && full >= self.segment_bytes {
-            self.roll()?;
+            self.roll(writing)?;
         }
-        let active = self.segments.last_mut().expect("there is always a segment");
+        let active = self.active();
         let offset = active.end();
         if let Err(err) = active.write_all_at(buffer, offset) {
-            active.set_len(offset).expect("truncate should not fail");
-            return Err(Error::Io(err));
+            if let Err(truncate) = active.set_len(offset) {
+                self.poison(truncate);
+            }
+            return Err(err.into());
         }
-        sync(&active.file);
-        active.len += buffer.len() as u64;
+        if let Err(err) = active.file.sync() {
+            return Err(self.poison(err));
+        }
+        #[cfg(test)]
+        self.commits.fetch_add(1, Ordering::Relaxed);
+        active.set_len_written(active.len() + buffer.len() as u64);
         Ok(offset)
     }
 
     /// Appends a Set record, fsyncs, then points the index at it. Then
     /// compacts if automatic compaction is due, as `open_with` describes.
     ///
-    /// If the write fails partway through, truncates the log back to `end`
-    /// and returns the I/O error. Panics if that truncate fails, or if the
-    /// fsync fails.
-    pub fn set(&mut self, key: Key, value: Value) -> Result<(), Error> {
-        let record = Record::Set { key, value };
-        let offset = self.append(&record)?;
-        self.indexed(&record, offset);
-        self.compact_if_due();
-        Ok(())
+    /// Writes from several threads share an fsync (DESIGN.md, Group
+    /// commit): a write waits for the group it lands in, and a failure
+    /// fails every write in that group with the same error. A write that
+    /// fails partway is truncated away. A failed fsync, or a failed truncate
+    /// of a failed write, poisons the store: every later write fails with
+    /// `Poisoned` until it is reopened, and reads still work.
+    pub fn set(&self, key: Key, value: Value) -> Result<(), Error> {
+        self.submit(Write::One(Record::Set { key, value }))
     }
 
     /// Applies every operation in `batch` with one append and one fsync,
@@ -567,55 +710,130 @@ impl<F: Fs> Store<F> {
     /// at that point writes nothing, as `delete` does, and a batch that
     /// writes nothing is a no-op. Then compacts if due, as `set` does.
     /// Failed writes are handled as in `set`.
-    pub fn write(&mut self, batch: Batch) -> Result<(), Error> {
-        let mut live: HashMap<&[u8], bool> = HashMap::new();
-        let mut body = Vec::new();
-        let mut written = Vec::with_capacity(batch.ops.len());
-        for op in &batch.ops {
-            let (Record::Set { key, .. } | Record::Delete { key }) = op else {
-                unreachable!("a Batch holds only sets and deletes");
-            };
-            let is_set = matches!(op, Record::Set { .. });
-            let was_live = live
-                .get(key.as_bytes())
-                .copied()
-                .unwrap_or_else(|| self.index.contains(key.as_bytes()));
-            if !is_set && !was_live {
-                continue;
-            }
-            live.insert(key.as_bytes(), is_set);
-            written.push((body.len() as u64, op));
-            encode(op, &mut body);
-        }
-        if written.is_empty() {
+    pub fn write(&self, batch: Batch) -> Result<(), Error> {
+        if batch.is_empty() {
             return Ok(());
         }
-        let mut buffer = Vec::with_capacity(HEADER_LEN + 8 + body.len());
-        encode(
-            &Record::Batch {
-                body_len: body.len() as u64,
-            },
-            &mut buffer,
-        );
-        let header_len = buffer.len() as u64;
-        buffer.extend_from_slice(&body);
-        let start = self.append_bytes(&buffer)?;
-        let at = self.segments.len() - 1;
-        self.segments[at].dead += header_len;
-        for (at, op) in written {
-            self.indexed(op, start + header_len + at);
+        self.submit(Write::Batch(batch.ops))
+    }
+
+    /// Appends a Delete record, fsyncs, then removes the key from the index.
+    /// Then compacts if automatic compaction is due, as in `set`.
+    ///
+    /// Deleting a key that isn't live is a no-op: nothing is written and it
+    /// returns `Ok`. Failed writes are handled as in `set`.
+    pub fn delete(&self, key: Key) -> Result<(), Error> {
+        if !self.index.contains(key.as_bytes()) {
+            return Ok(());
         }
-        self.compact_if_due();
-        Ok(())
+        self.submit(Write::One(Record::Delete { key }))
+    }
+
+    /// Queues `write` and waits until it is done. If no group is being
+    /// written, this thread leads: it takes the writes waiting, its own
+    /// first among them, writes them with one append and one fsync, and
+    /// wakes their threads.
+    fn submit(&self, write: Write) -> Result<(), Error> {
+        self.writable()?;
+        let mut queue = hold(&self.queue);
+        let ticket = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back((ticket, write));
+        loop {
+            if let Some(result) = queue.done.remove(&ticket) {
+                return result;
+            }
+            if queue.leading {
+                queue = self
+                    .committed
+                    .wait(queue)
+                    .unwrap_or_else(PoisonError::into_inner);
+                continue;
+            }
+            queue.leading = true;
+            let group = queue.take_group();
+            drop(queue);
+            let mut leader = Leader {
+                store: self,
+                tickets: group.iter().map(|&(ticket, _)| ticket).collect(),
+                results: None,
+            };
+            let writes: Vec<Write> = group.into_iter().map(|(_, write)| write).collect();
+            leader.results = Some(self.commit(&writes));
+            drop(leader);
+            queue = hold(&self.queue);
+        }
+    }
+
+    /// Writes a group with one append and one fsync, then updates the index,
+    /// and returns each write's result in order.
+    fn commit(&self, writes: &[Write]) -> Vec<Result<(), Error>> {
+        let writing = hold(&self.writing);
+        if let Err(err) = self.writable() {
+            return each(err, writes.len());
+        }
+        let mut live = HashMap::new();
+        let mut buffer = Vec::new();
+        let mut ops: Vec<(u64, &Record)> = Vec::new();
+        let mut batch_headers = 0u64;
+        for write in writes {
+            match write {
+                Write::One(op) => {
+                    if takes_effect(&self.index, op, &mut live) {
+                        ops.push((buffer.len() as u64, op));
+                        encode(op, &mut buffer);
+                    }
+                }
+                Write::Batch(batch) => {
+                    let mut body = Vec::new();
+                    let mut in_body = Vec::with_capacity(batch.len());
+                    for op in batch {
+                        if takes_effect(&self.index, op, &mut live) {
+                            in_body.push((body.len() as u64, op));
+                            encode(op, &mut body);
+                        }
+                    }
+                    if in_body.is_empty() {
+                        continue;
+                    }
+                    let start = buffer.len() as u64;
+                    encode(
+                        &Record::Batch {
+                            body_len: body.len() as u64,
+                        },
+                        &mut buffer,
+                    );
+                    let header_len = buffer.len() as u64 - start;
+                    batch_headers += header_len;
+                    ops.extend(
+                        in_body
+                            .into_iter()
+                            .map(|(at, op)| (start + header_len + at, op)),
+                    );
+                    buffer.extend_from_slice(&body);
+                }
+            }
+        }
+        if !ops.is_empty() {
+            let start = match self.append_bytes(&writing, &buffer) {
+                Ok(start) => start,
+                Err(err) => return each(err, writes.len()),
+            };
+            let segments = self.segments();
+            segments[segment_of(&segments, start)].add_dead(batch_headers);
+            for (at, op) in ops {
+                self.indexed(&segments, op, start + at);
+            }
+        }
+        self.compact_if_due(&writing);
+        writes.iter().map(|_| Ok(())).collect()
     }
 
     /// Updates the index and the dead bytes for a Set or Delete record now
-    /// durable at `offset`. A Delete's key must be live.
-    fn indexed(&mut self, record: &Record, offset: u64) {
-        let died = |store: &mut Self, at: u64, len: u64| {
-            let segment = store.segment_of(at);
-            store.segments[segment].dead += len;
-        };
+    /// durable at `offset`. A Delete's key must be live. Only the writer
+    /// calls it.
+    fn indexed(&self, segments: &[Arc<Segment<F::File>>], record: &Record, offset: u64) {
+        let died = |at: u64, len: u64| segments[segment_of(segments, at)].add_dead(len);
         match record {
             Record::Set { key, value } => {
                 let old = self.index.insert(
@@ -629,7 +847,7 @@ impl<F: Fs> Store<F> {
                     },
                 );
                 if let Some(old) = old {
-                    died(self, old.offset, old.record_len());
+                    died(old.offset, old.record_len());
                 }
             }
             Record::Delete { key } => {
@@ -638,8 +856,8 @@ impl<F: Fs> Store<F> {
                     .index
                     .remove(key.as_bytes())
                     .expect("deleted keys are live");
-                died(self, old.offset, old.record_len());
-                died(self, offset, (HEADER_LEN + key_len) as u64);
+                died(old.offset, old.record_len());
+                died(offset, (HEADER_LEN + key_len) as u64);
             }
             Record::Batch { .. } => unreachable!("not an index operation"),
         }
@@ -649,31 +867,45 @@ impl<F: Fs> Store<F> {
     ///
     /// Reads the record with two positioned reads (header, then payload) and
     /// verifies both checksums and that the stored key equals `key`. Any failure is a
-    /// corruption error at the record's offset, never `None`.
+    /// corruption error at the record's offset, never `None`. Takes no lock
+    /// while it reads, so it runs alongside writes and compaction.
     pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
-        match self.index.get(key.as_bytes()) {
-            Some(entry) => {
-                if let Record::Set {
-                    key: stored_key,
-                    value,
-                } = load_indexed(&self.segments[self.segment_of(entry.offset)], entry)?
-                {
-                    if *key == stored_key {
-                        Ok(Some(value))
-                    } else {
-                        Err(Error::Corruption {
-                            offset: entry.offset,
-                            reason: CorruptionReason::KeyMismatch,
-                        })
-                    }
-                } else {
-                    Err(Error::Corruption {
-                        offset: entry.offset,
-                        reason: CorruptionReason::NotASet,
-                    })
-                }
+        let Some((entry, segment)) = self
+            .index
+            .get(key.as_bytes())
+            .and_then(|entry| self.locate(key.as_bytes(), entry))
+        else {
+            return Ok(None);
+        };
+        match load_indexed(&*segment, &entry)? {
+            Record::Set {
+                key: stored_key,
+                value,
+            } if *key == stored_key => Ok(Some(value)),
+            Record::Set { .. } => Err(Error::Corruption {
+                offset: entry.offset,
+                reason: CorruptionReason::KeyMismatch,
+            }),
+            _ => Err(Error::Corruption {
+                offset: entry.offset,
+                reason: CorruptionReason::NotASet,
+            }),
+        }
+    }
+
+    /// The segment holding the record `entry`, read from the index for
+    /// `key`, points at. If a compaction moved the key and removed that
+    /// segment since, the entry the index has now and its segment, or
+    /// `None` if the key is no longer live.
+    fn locate(&self, key: &[u8], mut entry: Entry) -> Option<(Entry, Arc<Segment<F::File>>)> {
+        loop {
+            let segments = self.segments();
+            if let Some(segment) = holding(&segments, entry.offset) {
+                return Some((entry, Arc::clone(segment)));
             }
-            None => Ok(None),
+            let moved = self.index.get(key)?;
+            assert_ne!(moved, entry, "an index entry points outside the log");
+            entry = moved;
         }
     }
 
@@ -681,23 +913,25 @@ impl<F: Fs> Store<F> {
     /// checks that they describe exactly the index in memory. `open` skips
     /// the checksums of records a hint covers (DESIGN.md, Hint file); this
     /// is the full check, on demand. Reads the whole log and holds two
-    /// sorted lists of 16 bytes per live key while it compares them.
+    /// sorted lists of 16 bytes per live key while it compares them. Writes
+    /// wait for it.
     ///
     /// Fails with the first bad record's error, or `IndexMismatch` at the
     /// first offset where the log and the index disagree.
     pub fn verify(&self) -> Result<(), Error> {
+        let _writing = hold(&self.writing);
         let mismatch = |offset| Error::Corruption {
             offset,
             reason: CorruptionReason::IndexMismatch,
         };
         let mut scanned = Index::new();
-        for segment in &self.segments {
+        for segment in self.segments().iter() {
             let len = segment.size()?;
             if len != segment.end() {
                 return Err(mismatch(len.min(segment.end())));
             }
             let end = scan(
-                segment,
+                &**segment,
                 &mut scanned,
                 segment.base,
                 segment.end(),
@@ -707,8 +941,10 @@ impl<F: Fs> Store<F> {
                 return Err(mismatch(end));
             }
         }
-        let mut ours: Vec<Entry> = self.index.values().copied().collect();
-        let mut theirs: Vec<Entry> = scanned.values().copied().collect();
+        let mut ours = Vec::with_capacity(self.index.len());
+        self.index.for_each(|entry| ours.push(*entry));
+        let mut theirs = Vec::with_capacity(scanned.len());
+        scanned.for_each(|entry| theirs.push(*entry));
         drop(scanned);
         ours.sort_unstable_by_key(|e| e.offset);
         theirs.sort_unstable_by_key(|e| e.offset);
@@ -726,21 +962,92 @@ impl<F: Fs> Store<F> {
             None => Ok(()),
         }
     }
+}
 
-    /// Appends a Delete record, fsyncs, then removes the key from the index.
-    /// Then compacts if automatic compaction is due, as in `set`.
-    ///
-    /// Deleting a key that isn't live is a no-op: nothing is written and it
-    /// returns `Ok`. Failed writes are handled as in `set`.
-    pub fn delete(&mut self, key: Key) -> Result<(), Error> {
-        if self.index.contains(key.as_bytes()) {
-            let record = Record::Delete { key };
-            let offset = self.append(&record)?;
-            self.indexed(&record, offset);
-            self.compact_if_due();
-        };
-        Ok(())
+/// The leader of a group of writes. Hands each write its result when
+/// dropped, and the next waiting thread the lead. If the leader panicked
+/// before it had the results, the store is poisoned and every write in the
+/// group fails with `Poisoned`.
+struct Leader<'a, F: Fs> {
+    store: &'a Store<F>,
+    tickets: Vec<u64>,
+    results: Option<Vec<Result<(), Error>>>,
+}
+
+impl<F: Fs> Drop for Leader<'_, F> {
+    fn drop(&mut self) {
+        let results = self.results.take().unwrap_or_else(|| {
+            self.store.poisoned.store(true, Ordering::Release);
+            each(Error::Poisoned, self.tickets.len())
+        });
+        let mut queue = hold(&self.store.queue);
+        queue.leading = false;
+        queue.done.extend(self.tickets.drain(..).zip(results));
+        drop(queue);
+        self.store.committed.notify_all();
     }
+}
+
+impl Queue {
+    /// The oldest waiting writes, up to a group's limits, and at least one.
+    fn take_group(&mut self) -> Vec<(u64, Write)> {
+        let mut group = Vec::new();
+        let mut bytes = 0;
+        while let Some((_, write)) = self.waiting.front() {
+            let size = write.size();
+            if !group.is_empty()
+                && (group.len() == GROUP_MOST_WRITES || bytes + size > GROUP_MOST_BYTES)
+            {
+                break;
+            }
+            bytes += size;
+            group.push(self.waiting.pop_front().expect("one is waiting"));
+        }
+        group
+    }
+}
+
+/// `err` for each of `n` writes. `Error` isn't `Clone`: the first write
+/// gets `err` itself, and the rest an `Io` error with its kind and message.
+fn each(err: Error, n: usize) -> Vec<Result<(), Error>> {
+    let copy = |err: &Error| match err {
+        Error::Poisoned => Error::Poisoned,
+        Error::Io(io) => Error::Io(io::Error::new(io.kind(), io.to_string())),
+        other => Error::Io(io::Error::other(other.to_string())),
+    };
+    let mut results: Vec<Result<(), Error>> = (1..n).map(|_| Err(copy(&err))).collect();
+    results.insert(0, Err(err));
+    results
+}
+
+/// Whether the Set or Delete `op` writes anything, given the keys a group
+/// has already set (`true`) or deleted (`false`) in `live`, which it then
+/// updates: a delete of a key that isn't live writes nothing.
+fn takes_effect<'w>(index: &Index, op: &'w Record, live: &mut HashMap<&'w [u8], bool>) -> bool {
+    let (Record::Set { key, .. } | Record::Delete { key }) = op else {
+        unreachable!("only sets and deletes are written");
+    };
+    let is_set = matches!(op, Record::Set { .. });
+    let was_live = live
+        .get(key.as_bytes())
+        .copied()
+        .unwrap_or_else(|| index.contains(key.as_bytes()));
+    if !is_set && !was_live {
+        return false;
+    }
+    live.insert(key.as_bytes(), is_set);
+    true
+}
+
+/// The index in `segments` of the segment starting at or before `offset`.
+fn segment_of<L>(segments: &[Arc<Segment<L>>], offset: u64) -> usize {
+    segments.partition_point(|s| s.base <= offset) - 1
+}
+
+/// The segment in `segments` holding the byte at `offset`, if one does.
+fn holding<L>(segments: &[Arc<Segment<L>>], offset: u64) -> Option<&Arc<Segment<L>>> {
+    let after = segments.partition_point(|s| s.base <= offset);
+    segments[..after].last().filter(|s| s.holds(offset))
 }
 
 /// Whether `side` holds a prefix of `file`'s bytes from `offset` to `len`,
@@ -941,13 +1248,7 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
                 reason: CorruptionReason::SegmentsOverlap,
             });
         }
-        segments.push(Segment {
-            base,
-            file,
-            len,
-            dead: 0,
-            map: None,
-        });
+        segments.push(Segment::new(base, file, len));
     }
     Ok(segments)
 }
@@ -1055,7 +1356,7 @@ fn try_load<F: Fs>(
     }
     // The counts are unchecked until every entry is read: never reserve
     // more than the log could hold.
-    let total: u64 = segments.iter().map(|s| s.len).sum();
+    let total: u64 = segments.iter().map(|s| s.len()).sum();
     let capacity = usize::try_from(count.min(total / SHORTEST_RECORD)).unwrap_or(usize::MAX);
     let mut index = Index::with_capacity(capacity);
     let newest = segments.len() - 1;
@@ -1107,8 +1408,8 @@ fn try_load<F: Fs>(
                 });
             }
             segment.set_len(end)?;
-            sync(&segment.file);
-            segment.len = end - segment.base;
+            segment.file.sync()?;
+            segment.set_len_written(end - segment.base);
             log::warn!(
                 "truncated a torn tail at offset {end}: dropped {} bytes",
                 len - end
@@ -1142,7 +1443,7 @@ fn read_hint<L: LogFile>(
     parallel_from: u64,
 ) -> Result<(u64, hint::Tail), hint::Invalid> {
     let trailer = hint::trailer(file)?;
-    if trailer.log_len > segment.len {
+    if trailer.log_len > segment.len() {
         return Err(hint::Invalid("the segment is shorter than the hint says"));
     }
     let threads = if trailer.count < parallel_from {
@@ -1485,11 +1786,6 @@ fn rest_is_zero(reader: &mut impl Read) -> io::Result<bool> {
 /// Flushes `file` to disk. Panics on failure: after a failed fsync the
 /// kernel may have dropped the dirty pages, so retrying can report success
 /// for data that never reached disk (DESIGN.md, Failed fsync).
-fn sync(file: &impl LogFile) {
-    file.sync()
-        .expect("fsync failed; restart to recover from the log");
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
@@ -1644,13 +1940,13 @@ mod tests {
         encode_as(Format::Crc32c, &set_record(b"z", b"9"), &mut old);
         assert_eq!(old[..18], OLD_SET_A_HI);
         let tmp = store_with_log(&[&old[..], &OLD_DELETE_A[..14]].concat());
-        let mut store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
         assert_eq!(log_bytes(tmp.path()), old, "the torn tail is cut");
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
         store.set(key(b"b"), value(b"2")).unwrap();
         drop(store);
 
-        let mut store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
         let format = |store: &Store, k: &[u8]| store.index.get(k).unwrap().format;
         assert_eq!(format(&store, b"a"), Format::Crc32c);
         assert_eq!(format(&store, b"z"), Format::Crc32c);
@@ -1724,7 +2020,7 @@ mod tests {
     #[test]
     fn writes_after_recovery_land_where_the_tail_was_cut() {
         let tmp = store_with_log(&set_a_hi_then(&DELETE_A[..14]));
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.delete(key(b"a")).unwrap();
         drop(store);
         assert_eq!(log_bytes(tmp.path()), set_a_hi_then(&DELETE_A));
@@ -1974,7 +2270,7 @@ mod tests {
     #[test]
     fn set_then_get() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
     }
@@ -1982,7 +2278,7 @@ mod tests {
     #[test]
     fn set_writes_the_record_format() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
     }
@@ -1990,7 +2286,7 @@ mod tests {
     #[test]
     fn set_overwrites_and_appends() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"a"), value(b"yo")).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"yo")));
@@ -2000,7 +2296,7 @@ mod tests {
     #[test]
     fn keys_are_independent() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"1")));
@@ -2012,7 +2308,7 @@ mod tests {
     #[test]
     fn delete_removes_the_key_and_appends_a_delete_record() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.delete(key(b"a")).unwrap();
         assert_eq!(store.get(&key(b"a")).unwrap(), None);
@@ -2025,7 +2321,7 @@ mod tests {
     #[test]
     fn delete_of_a_missing_key_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.delete(key(b"a")).unwrap();
         assert_eq!(log_bytes(tmp.path()), b"");
     }
@@ -2033,7 +2329,7 @@ mod tests {
     #[test]
     fn delete_of_an_already_deleted_key_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.delete(key(b"a")).unwrap();
         store.delete(key(b"a")).unwrap();
@@ -2046,7 +2342,7 @@ mod tests {
     fn reopen_rebuilds_the_index() {
         let tmp = tempfile::tempdir().unwrap();
         {
-            let mut store = Store::open(tmp.path()).unwrap();
+            let store = Store::open(tmp.path()).unwrap();
             store.set(key(b"a"), value(b"hi")).unwrap();
             store.set(key(b"b"), value(b"1")).unwrap();
             store.set(key(b"a"), value(b"yo")).unwrap();
@@ -2065,11 +2361,11 @@ mod tests {
     fn writes_after_reopen_append_to_the_end() {
         let tmp = tempfile::tempdir().unwrap();
         drop({
-            let mut store = Store::open(tmp.path()).unwrap();
+            let store = Store::open(tmp.path()).unwrap();
             store.set(key(b"a"), value(b"hi")).unwrap();
             store
         });
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.delete(key(b"a")).unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
@@ -2085,7 +2381,7 @@ mod tests {
     #[test]
     fn get_detects_a_corrupted_value_with_the_record_offset() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"hi")).unwrap();
         write_log_at(tmp.path(), 22 + 21, b"x"); // b's value: "hi" -> "hx"
@@ -2102,7 +2398,7 @@ mod tests {
     #[test]
     fn get_detects_a_corrupted_header() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         write_log_at(tmp.path(), 0, &[0x00]);
         assert!(matches!(
@@ -2117,7 +2413,7 @@ mod tests {
     #[test]
     fn get_detects_a_valid_record_for_a_different_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         let mut other = Vec::new();
         encode(
@@ -2140,7 +2436,7 @@ mod tests {
     #[test]
     fn get_detects_a_delete_record_where_the_index_expects_a_set() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         write_log_at(tmp.path(), 0, &DELETE_A);
         assert!(matches!(
@@ -2179,7 +2475,7 @@ mod tests {
     #[test]
     fn compact_keeps_only_the_latest_value_of_each_live_key() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"c"), value(b"3")).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
@@ -2205,7 +2501,7 @@ mod tests {
     #[test]
     fn writes_after_compact_land_in_the_new_log_and_survive_a_reopen() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"old")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
@@ -2225,7 +2521,7 @@ mod tests {
     #[test]
     fn compact_of_an_empty_store_leaves_an_empty_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.delete(key(b"a")).unwrap();
         store.compact().unwrap();
@@ -2237,7 +2533,7 @@ mod tests {
     #[test]
     fn compact_twice_writes_the_same_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
@@ -2250,7 +2546,7 @@ mod tests {
     #[test]
     fn compact_leaves_the_log_its_hint_and_the_lock_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
         assert_eq!(
@@ -2284,12 +2580,18 @@ mod tests {
         assert_eq!(store.get(&key(b"cc")).unwrap(), None);
     }
 
+    fn edit(store: &Store, key: &[u8], change: impl FnOnce(&mut Entry)) {
+        let mut entry = store.index.get(key).unwrap();
+        change(&mut entry);
+        store.index.insert(key, entry);
+    }
+
     #[test]
     fn get_reads_the_record_even_when_the_index_has_its_lengths_wrong() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
-        store.index.get_mut(b"a").unwrap().value_len = 5;
+        edit(&store, b"a", |entry| entry.value_len = 5);
         assert_eq!(
             store.get(&key(b"a")).unwrap(),
             Some(value(b"1")),
@@ -2297,7 +2599,7 @@ mod tests {
         );
 
         store.set(key(b"b"), value(b"2")).unwrap();
-        store.index.get_mut(b"a").unwrap().value_len = 2;
+        edit(&store, b"a", |entry| entry.value_len = 2);
         assert_eq!(
             store.get(&key(b"a")).unwrap(),
             Some(value(b"1")),
@@ -2308,7 +2610,7 @@ mod tests {
     #[test]
     fn verify_passes_a_healthy_store_before_and_after_compaction() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
@@ -2340,7 +2642,7 @@ mod tests {
     fn verify_finds_an_index_that_disagrees_with_the_log() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.index.remove(b"b");
         assert!(matches!(
             store.verify(),
@@ -2349,7 +2651,7 @@ mod tests {
                 reason: CorruptionReason::IndexMismatch
             })
         ));
-        store.index.get_mut(b"a").unwrap().offset = 65;
+        edit(&store, b"a", |entry| entry.offset = 65);
         assert!(matches!(
             store.verify(),
             Err(Error::Corruption {
@@ -2388,7 +2690,7 @@ mod tests {
         }
     }
 
-    fn put(store: &mut Store, k: &[u8], v: &[u8]) {
+    fn put(store: &Store, k: &[u8], v: &[u8]) {
         store.set(key(k), value(v)).unwrap();
     }
 
@@ -2399,11 +2701,11 @@ mod tests {
     #[test]
     fn writes_go_to_a_new_segment_once_one_is_full() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(24)).unwrap();
-        put(&mut store, b"a", b"hi");
-        put(&mut store, b"b", b"2");
+        let store = Store::open_with(tmp.path(), segmented(24)).unwrap();
+        put(&store, b"a", b"hi");
+        put(&store, b"b", b"2");
         assert_eq!(segment_bases(tmp.path()), [0], "22 bytes is not full yet");
-        put(&mut store, b"c", b"3");
+        put(&store, b"c", b"3");
         assert_eq!(segment_bases(tmp.path()), [0, 43], "43 bytes is full");
         store
             .write(batch(&[(b"d", Some(b"4")), (b"a", None)]))
@@ -2435,11 +2737,11 @@ mod tests {
     /// One record per segment: a=1 at 0, b=2 at 21, a deleted at 42, c=3
     /// at 62.
     fn one_record_per_segment(dir: &Path) -> Store {
-        let mut store = Store::open_with(dir, segmented(1)).unwrap();
-        put(&mut store, b"a", b"1");
-        put(&mut store, b"b", b"2");
+        let store = Store::open_with(dir, segmented(1)).unwrap();
+        put(&store, b"a", b"1");
+        put(&store, b"b", b"2");
         store.delete(key(b"a")).unwrap();
-        put(&mut store, b"c", b"3");
+        put(&store, b"c", b"3");
         assert_eq!(segment_bases(dir), [0, 21, 42, 62]);
         store
     }
@@ -2447,8 +2749,8 @@ mod tests {
     #[test]
     fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = one_record_per_segment(tmp.path());
-        store.clean(&[42]).unwrap();
+        let store = one_record_per_segment(tmp.path());
+        store.clean(&hold(&store.writing), &[42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [0, 21, 62, 83]);
         assert_eq!(
             fs::read(tmp.path().join(log_name(83))).unwrap(),
@@ -2465,8 +2767,8 @@ mod tests {
     #[test]
     fn cleaning_a_delete_with_every_older_segment_drops_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = one_record_per_segment(tmp.path());
-        store.clean(&[0, 21, 42]).unwrap();
+        let store = one_record_per_segment(tmp.path());
+        store.clean(&hold(&store.writing), &[0, 21, 42]).unwrap();
         assert_eq!(segment_bases(tmp.path()), [62, 83]);
         assert_eq!(
             fs::read(tmp.path().join(log_name(83))).unwrap(),
@@ -2535,10 +2837,10 @@ mod tests {
             auto_compact: AutoCompact::new(50, 0),
             segment_bytes: 1,
         };
-        let mut store = Store::open_with(tmp.path(), options).unwrap();
-        put(&mut store, b"a", b"1");
-        put(&mut store, b"b", b"2");
-        put(&mut store, b"b", b"3");
+        let store = Store::open_with(tmp.path(), options).unwrap();
+        put(&store, b"a", b"1");
+        put(&store, b"b", b"2");
+        put(&store, b"b", b"3");
         // b=3 at 42 made b=2 at 21 dead: 21 of 63, not due. Deleting b
         // makes 21 + 21 + 20 of 83 dead. Cleaning the segment at 21 leaves
         // 41 of 62, still due; then 42 leaves 20 of 41, not due. Neither has
@@ -2736,7 +3038,7 @@ mod tests {
     #[test]
     fn write_appends_one_batch_and_applies_it_in_order() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store
             .write(batch(&[
                 (b"a", Some(b"1")),
@@ -2770,7 +3072,7 @@ mod tests {
     #[test]
     fn a_batch_deletes_only_keys_live_at_that_point_in_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.write(batch(&[(b"a", None), (b"b", None)])).unwrap();
         assert_eq!(
             log_bytes(tmp.path()),
@@ -2887,7 +3189,7 @@ mod tests {
     #[test]
     fn compaction_after_a_batch_keeps_only_the_live_sets() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store
             .write(batch(&[
                 (b"a", Some(b"1")),
@@ -2914,7 +3216,7 @@ mod tests {
     /// a=hi at 0 and b=2 at 22, compacted into the segment at 43, so a is
     /// at 43, b at 65, and the segment's hint covers both.
     fn compacted_a_and_b(dir: &Path) {
-        let mut store = Store::open(dir).unwrap();
+        let store = Store::open(dir).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.compact().unwrap();
@@ -2922,21 +3224,21 @@ mod tests {
 
     fn mapped(store: &Store) -> Vec<(u64, bool)> {
         store
-            .segments
+            .segments()
             .iter()
-            .map(|s| (s.base, s.map.is_some()))
+            .map(|s| (s.base, s.is_mapped()))
             .collect()
     }
 
     #[test]
     fn every_segment_but_the_active_one_is_mapped() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = one_record_per_segment(tmp.path());
+        let store = one_record_per_segment(tmp.path());
         assert_eq!(
             mapped(&store),
             [(0, true), (21, true), (42, true), (62, false)]
         );
-        put(&mut store, b"d", b"4");
+        put(&store, b"d", b"4");
         assert_eq!(mapped(&store)[3..], [(62, true), (83, false)]);
         assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
         assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
@@ -2955,8 +3257,8 @@ mod tests {
     fn a_value_damaged_in_a_mapped_segment_fails_its_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        put(&mut store, b"c", b"3");
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&store, b"c", b"3");
         drop(store);
         let file = OpenOptions::new()
             .write(true)
@@ -2997,7 +3299,7 @@ mod tests {
     #[test]
     fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(
+        let store = Store::open_with(
             tmp.path(),
             Options {
                 auto_compact: None,
@@ -3021,13 +3323,11 @@ mod tests {
             panic!("compaction leaves one segment");
         };
         let file = fs.open_existing(&tmp.path().join(hint_name(base))).unwrap();
-        let segment = Segment {
+        let segment = Segment::new(
             base,
-            file: fs.open_existing(&tmp.path().join(log_name(base))).unwrap(),
-            len: log_bytes(tmp.path()).len() as u64,
-            dead: 0,
-            map: None,
-        };
+            fs.open_existing(&tmp.path().join(log_name(base))).unwrap(),
+            log_bytes(tmp.path()).len() as u64,
+        );
         let mut one = Index::new();
         let (len_one, _) = read_hint(&file, &segment, &mut one, HINT_WINDOW, u64::MAX).unwrap();
         let mut many = Index::new();
@@ -3145,7 +3445,7 @@ mod tests {
     fn records_written_after_the_hint_are_read_from_the_log() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"c"), value(b"3")).unwrap();
         store.delete(key(b"a")).unwrap();
         store.set(key(b"b"), value(b"22")).unwrap();
@@ -3200,7 +3500,7 @@ mod tests {
         let repaired = Store::repair(tmp.path()).unwrap().unwrap();
         assert_eq!(repaired.offset, 65);
         assert!(!hint_path(tmp.path()).exists());
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         assert_eq!(store.get(&key(b"b")).unwrap(), None);
         store.set(key(b"c"), value(b"3")).unwrap();
         drop(store);
@@ -3213,7 +3513,7 @@ mod tests {
     fn a_second_compaction_replaces_the_hint() {
         let tmp = tempfile::tempdir().unwrap();
         compacted_a_and_b(tmp.path());
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.delete(key(b"a")).unwrap();
         store.compact().unwrap();
         drop(store);
@@ -3249,12 +3549,12 @@ mod tests {
     #[test]
     fn open_writes_a_hint_for_each_sealed_segment_it_reads() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
         store
             .write(batch(&[(b"a", Some(b"1")), (b"b", Some(b"2"))]))
             .unwrap();
         store.delete(key(b"a")).unwrap();
-        put(&mut store, b"c", b"3");
+        put(&store, b"c", b"3");
         drop(store);
         assert_eq!(segment_bases(tmp.path()), [0, 69, 89]);
 
@@ -3313,12 +3613,12 @@ mod tests {
     #[test]
     fn open_extends_a_hint_that_covers_only_the_start_of_a_sealed_segment() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(50)).unwrap();
-        put(&mut store, b"a", b"hi");
-        put(&mut store, b"b", b"2");
+        let store = Store::open_with(tmp.path(), segmented(50)).unwrap();
+        put(&store, b"a", b"hi");
+        put(&store, b"b", b"2");
         store.compact().unwrap();
-        put(&mut store, b"c", b"3");
-        put(&mut store, b"d", b"4");
+        put(&store, b"c", b"3");
+        put(&store, b"d", b"4");
         drop(store);
         assert_eq!(segment_bases(tmp.path()), [43, 107]);
 
@@ -3353,7 +3653,7 @@ mod tests {
     #[test]
     fn a_store_opened_from_the_hints_open_wrote_matches_a_full_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(64)).unwrap();
+        let store = Store::open_with(tmp.path(), segmented(64)).unwrap();
         let mut model = HashMap::new();
         for i in 0..90u8 {
             let k = [b'k', i % 7];
@@ -3371,7 +3671,7 @@ mod tests {
                     model.remove(&other);
                 }
                 _ => {
-                    put(&mut store, &k, &[i]);
+                    put(&store, &k, &[i]);
                     model.insert(k, vec![i]);
                 }
             }
@@ -3400,8 +3700,8 @@ mod tests {
         let mut old = Vec::new();
         encode_as(Format::Crc32c, &set_record(b"a", b"hi"), &mut old);
         let tmp = store_with_log(&old);
-        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        put(&mut store, b"b", b"2");
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&store, b"b", b"2");
         drop(store);
 
         drop(Store::open_with(tmp.path(), segmented(1)).unwrap());
@@ -3432,7 +3732,7 @@ mod tests {
     #[test]
     fn a_hint_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
         let fs = MemFs::new();
-        let mut store = open_on(&fs, segmented(1));
+        let store = open_on(&fs, segmented(1));
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         drop(store);
@@ -3463,7 +3763,7 @@ mod tests {
     #[test]
     fn a_hint_extension_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
         let fs = MemFs::new();
-        let mut store = open_on(&fs, segmented(50));
+        let store = open_on(&fs, segmented(50));
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.compact().unwrap();
@@ -3510,9 +3810,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-        put(&mut store, b"a", b"1");
-        put(&mut store, b"b", b"2");
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&store, b"a", b"1");
+        put(&store, b"b", b"2");
         drop(store);
 
         let mode = |mode| fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode));
@@ -3533,7 +3833,7 @@ mod tests {
     #[test]
     fn compact_stops_at_a_corrupt_dead_record_too() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
@@ -3555,7 +3855,7 @@ mod tests {
     fn compact_overwrites_a_compact_file_left_by_a_crash() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join(COMPACT_FILE_NAME), [0xAB; 100]).unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
         assert_eq!(log_bytes(tmp.path()), SET_A_HI);
@@ -3564,7 +3864,7 @@ mod tests {
     #[test]
     fn the_lock_still_holds_after_compact_replaces_the_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.compact().unwrap();
         assert!(matches!(Store::open(tmp.path()), Err(Error::Locked)));
@@ -3576,7 +3876,7 @@ mod tests {
     #[test]
     fn compact_stops_at_a_corrupt_live_record_and_leaves_the_log_untouched() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.delete(key(b"b")).unwrap();
@@ -3598,7 +3898,7 @@ mod tests {
     #[test]
     fn a_failed_compaction_points_every_key_back_at_the_old_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"c"), value(b"3")).unwrap();
@@ -3621,7 +3921,7 @@ mod tests {
     #[test]
     fn a_compaction_that_fails_after_writing_copies_empties_the_new_segment() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         let big = vec![b'v'; 700 << 10];
         store.set(key(b"a"), value(&big)).unwrap();
         store.set(key(b"b"), value(&big)).unwrap();
@@ -3641,7 +3941,7 @@ mod tests {
         assert!(!tmp.path().join(hint_name(end)).exists());
         assert_eq!(read(&store, b"a"), Some(big.clone()));
         assert_eq!(read(&store, b"b"), Some(big));
-        put(&mut store, b"d", b"4");
+        put(&store, b"d", b"4");
         assert_eq!(
             fs::read(tmp.path().join(log_name(end))).unwrap(),
             encoded(&[set_record(b"d", b"4")])
@@ -3659,7 +3959,7 @@ mod tests {
     #[test]
     fn a_write_that_leaves_half_the_log_dead_compacts_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.set(key(b"a"), value(b"3")).unwrap();
@@ -3682,7 +3982,7 @@ mod tests {
     #[test]
     fn a_delete_counts_its_own_record_as_dead_too() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         store.delete(key(b"a")).unwrap();
@@ -3692,7 +3992,7 @@ mod tests {
     #[test]
     fn a_log_below_the_minimum_size_is_not_compacted() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), auto(50, 43)).unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 43)).unwrap();
         store.set(key(b"a"), value(b"1")).unwrap();
         store.set(key(b"a"), value(b"2")).unwrap();
         assert_eq!(log_bytes(tmp.path()).len(), 42);
@@ -3707,7 +4007,7 @@ mod tests {
             auto_compact: None,
             ..Options::default()
         };
-        let mut store = Store::open_with(tmp.path(), options).unwrap();
+        let store = Store::open_with(tmp.path(), options).unwrap();
         for v in [b"1", b"2", b"3"] {
             store.set(key(b"a"), value(v)).unwrap();
         }
@@ -3720,7 +4020,7 @@ mod tests {
     #[test]
     fn open_compacts_a_log_that_is_due() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(
+        let store = Store::open_with(
             tmp.path(),
             Options {
                 auto_compact: None,
@@ -3740,7 +4040,7 @@ mod tests {
     #[test]
     fn open_counts_the_dead_bytes_already_in_the_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(
+        let store = Store::open_with(
             tmp.path(),
             Options {
                 auto_compact: None,
@@ -3753,7 +4053,7 @@ mod tests {
         store.set(key(b"a"), value(b"3")).unwrap();
         drop(store);
 
-        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
         assert_eq!(log_bytes(tmp.path()).len(), 63, "21 of 63 dead");
         store.set(key(b"b"), value(b"4")).unwrap();
         assert_eq!(
@@ -3765,17 +4065,281 @@ mod tests {
     #[test]
     fn a_failed_automatic_compaction_keeps_the_write_and_stays_off() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
         store.set(key(b"a"), value(b"hi")).unwrap();
         store.set(key(b"b"), value(b"2")).unwrap();
         write_log_at(tmp.path(), 21, b"X");
         store.set(key(b"b"), value(b"3")).unwrap();
         store.set(key(b"b"), value(b"4")).unwrap();
-        assert_eq!(store.auto_compact, AutoCompact::new(50, 0), "42 of 85 dead");
+        assert!(!store.auto_failed.load(Ordering::Relaxed), "42 of 85 dead");
 
         store.set(key(b"b"), value(b"5")).unwrap();
-        assert_eq!(store.auto_compact, None);
+        assert!(store.auto_failed.load(Ordering::Relaxed));
         assert_eq!(log_bytes(tmp.path()).len(), 106);
         assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"5")));
+    }
+
+    #[test]
+    fn a_store_can_be_shared_between_threads() {
+        fn shared<T: Send + Sync>() {}
+        shared::<Store>();
+    }
+
+    #[test]
+    fn writes_waiting_for_the_writer_share_one_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let writing = hold(&store.writing);
+        thread::scope(|scope| {
+            for i in 0..8u8 {
+                let store = &store;
+                scope.spawn(move || store.set(key(&[i]), value(&[i])).unwrap());
+            }
+            // The first to queue leads alone and waits for `writing`; the
+            // other seven queue behind it.
+            while hold(&store.queue).waiting.len() < 7 {
+                thread::yield_now();
+            }
+            drop(writing);
+        });
+        assert_eq!(store.commits.load(Ordering::Relaxed), 2);
+        assert_eq!(log_bytes(tmp.path()).len(), 8 * 21);
+        for i in 0..8u8 {
+            assert_eq!(read(&store, &[i]), Some(vec![i]));
+        }
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn a_group_applies_its_writes_in_order_with_one_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        put(&store, b"b", b"0");
+        let results = store.commit(&[
+            Write::One(set_record(b"a", b"1")),
+            Write::One(delete_record(b"a")),
+            Write::One(delete_record(b"c")),
+            Write::Batch(vec![delete_record(b"a"), set_record(b"b", b"2")]),
+            Write::Batch(vec![delete_record(b"c")]),
+        ]);
+        assert_eq!(results.len(), 5);
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(store.commits.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            log_bytes(tmp.path()),
+            encoded(&[
+                set_record(b"b", b"0"),
+                set_record(b"a", b"1"),
+                delete_record(b"a"),
+                Record::Batch { body_len: 21 },
+                set_record(b"b", b"2"),
+            ])
+        );
+        assert_eq!(read(&store, b"a"), None);
+        assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+        assert_eq!(store.dead(), 21 + 21 + 20 + 27);
+        store.verify().unwrap();
+    }
+
+    #[test]
+    fn a_failed_group_fails_every_write_in_it() {
+        let results = each(Error::Io(io::Error::other("disk on fire")), 3);
+        let messages: Vec<String> = results
+            .into_iter()
+            .map(|r| match r {
+                Err(Error::Io(err)) => err.to_string(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(messages, ["disk on fire"; 3]);
+    }
+
+    fn log_on(fs: &MemFs) -> Vec<u8> {
+        fs.read(&Path::new("/db").join(log_name(0))).unwrap()
+    }
+
+    #[test]
+    fn a_failed_fsync_fails_its_write_and_every_write_after_until_reopen() {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1 << 20));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        fs.fail_syncs(true);
+        let err = store.set(key(b"b"), value(b"2")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(io) if io.to_string() == "injected fsync failure"),
+            "{err:?}"
+        );
+        fs.fail_syncs(false);
+        assert!(matches!(
+            store.set(key(b"c"), value(b"3")),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(store.delete(key(b"a")), Err(Error::Poisoned)));
+        assert!(matches!(
+            store.write(batch(&[(b"c", Some(b"3"))])),
+            Err(Error::Poisoned)
+        ));
+        assert!(matches!(store.compact(), Err(Error::Poisoned)));
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b"), None);
+        drop(store);
+
+        let store = open_on(&fs, segmented(1 << 20));
+        assert_eq!(
+            get_on(&store, b"b").as_deref(),
+            Some(&b"2"[..]),
+            "the write reached the file; only its fsync failed"
+        );
+        store.set(key(b"c"), value(b"3")).unwrap();
+        assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    }
+
+    #[test]
+    fn a_write_that_fails_is_truncated_away_and_the_store_stays_writable() {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1 << 20));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        fs.limit_free_space(Some(5));
+        let err = store.set(key(b"b"), value(b"2")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(io) if io.kind() == ErrorKind::StorageFull),
+            "{err:?}"
+        );
+        assert_eq!(log_on(&fs), encoded(&[set_record(b"a", b"1")]));
+
+        fs.limit_free_space(None);
+        store.set(key(b"c"), value(b"3")).unwrap();
+        assert_eq!(
+            log_on(&fs),
+            encoded(&[set_record(b"a", b"1"), set_record(b"c", b"3")])
+        );
+        drop(store);
+        let store = open_on(&fs, segmented(1 << 20));
+        assert_eq!(get_on(&store, b"b"), None);
+        assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    }
+
+    #[test]
+    fn a_failed_truncate_after_a_failed_write_poisons_the_store() {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1 << 20));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        fs.limit_free_space(Some(5));
+        fs.fail_truncates(true);
+        let err = store.set(key(b"b"), value(b"2")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(io) if io.kind() == ErrorKind::StorageFull),
+            "{err:?}"
+        );
+        fs.limit_free_space(None);
+        fs.fail_truncates(false);
+        assert!(matches!(
+            store.set(key(b"c"), value(b"3")),
+            Err(Error::Poisoned)
+        ));
+        assert_eq!(log_on(&fs).len(), 21 + 5, "the torn write is still there");
+        drop(store);
+
+        let store = open_on(&fs, segmented(1 << 20));
+        assert_eq!(log_on(&fs), encoded(&[set_record(b"a", b"1")]));
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        store.set(key(b"c"), value(b"3")).unwrap();
+    }
+
+    #[test]
+    fn a_failed_fsync_during_compaction_poisons_the_store_and_keeps_the_old_segments() {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"a"), value(b"2")).unwrap();
+        store.set(key(b"b"), value(b"3")).unwrap();
+        fs.fail_syncs(true);
+        assert!(matches!(store.compact(), Err(Error::Io(_))));
+        fs.fail_syncs(false);
+        assert!(matches!(
+            store.set(key(b"c"), value(b"4")),
+            Err(Error::Poisoned)
+        ));
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
+        drop(store);
+
+        let store = open_on(&fs, segmented(1));
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
+        assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"3"[..]));
+        store.verify().unwrap();
+        store.compact().unwrap();
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
+    }
+
+    #[test]
+    fn a_read_that_finds_its_segment_removed_follows_the_key_to_its_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+        put(&store, b"a", b"1");
+        put(&store, b"b", b"2");
+        let before = store.index.get(b"a").unwrap();
+        assert_eq!(before.offset, 0);
+        store.compact().unwrap();
+        assert_eq!(segment_bases(tmp.path()), [42]);
+
+        let (entry, segment) = store.locate(b"a", before).unwrap();
+        assert_eq!(
+            entry,
+            Entry {
+                offset: 42,
+                value_len: 1,
+                key_len: 1,
+                format: Format::Crc64,
+            }
+        );
+        assert_eq!(segment.base, 42);
+        store.delete(key(b"a")).unwrap();
+        assert!(store.locate(b"a", before).is_none());
+    }
+
+    #[test]
+    fn reads_while_other_threads_write_and_compact_see_every_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with(tmp.path(), segmented(256)).unwrap();
+        for i in 0..64u8 {
+            put(&store, &[b's', i], &[i]);
+            put(&store, &[b's', i], &[i, i]);
+        }
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    while !stop.load(Ordering::Relaxed) {
+                        for i in 0..64u8 {
+                            assert_eq!(read(&store, &[b's', i]), Some(vec![i, i]));
+                        }
+                    }
+                });
+            }
+            for t in 0..4u8 {
+                let store = &store;
+                scope.spawn(move || {
+                    for i in 0..50u8 {
+                        put(store, &[b'w', t, i % 8], &[i]);
+                    }
+                });
+            }
+            for _ in 0..20 {
+                store.compact().unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        for t in 0..4u8 {
+            for i in 0..8u8 {
+                let last = if i < 2 { 48 + i } else { 40 + i };
+                assert_eq!(read(&store, &[b'w', t, i]), Some(vec![last]));
+            }
+        }
+        store.verify().unwrap();
+        drop(store);
+        let store = Store::open_with(tmp.path(), segmented(256)).unwrap();
+        assert_eq!(read(&store, &[b's', 7]), Some(vec![7, 7]));
+        store.verify().unwrap();
     }
 }

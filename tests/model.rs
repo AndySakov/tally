@@ -3,11 +3,16 @@
 //! automatic compaction off, the log must be exactly as long as the writes
 //! that reached it; with it on, at least as long as the live records.
 //!
+//! A second test runs several threads on one store at once, each with keys
+//! of its own and a `HashMap` of its own, while compactions run between
+//! their writes.
+//!
 //! Every `set` and `delete` fsyncs (about 5 ms on macOS), so the default case
 //! count is small. For a longer run: `PROPTEST_CASES=2000 cargo test --test model`.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::thread;
 
 use proptest::prelude::*;
 use tally::{AutoCompact, Batch, Key, Options, Store, Value};
@@ -42,6 +47,92 @@ fn op() -> impl Strategy<Value = Op> {
         )
         .prop_map(Op::Batch),
     ]
+}
+
+#[derive(Debug, Clone)]
+enum ThreadOp {
+    Set(u8, Vec<u8>),
+    Get(u8),
+    Delete(u8),
+    Batch(Vec<(u8, Option<Vec<u8>>)>),
+    Compact,
+}
+
+fn thread_op() -> impl Strategy<Value = ThreadOp> {
+    let key = 0..KEY_SPACE;
+    let value = || prop::collection::vec(any::<u8>(), 1..64);
+    prop_oneof![
+        4 => (key.clone(), value()).prop_map(|(k, v)| ThreadOp::Set(k, v)),
+        3 => key.clone().prop_map(ThreadOp::Get),
+        2 => key.clone().prop_map(ThreadOp::Delete),
+        2 => prop::collection::vec((key, prop::option::of(value())), 0..6)
+            .prop_map(ThreadOp::Batch),
+        1 => Just(ThreadOp::Compact),
+    ]
+}
+
+const THREADS: u8 = 4;
+
+/// Thread `t`'s key `k`.
+fn thread_key(t: u8, k: u8) -> Key {
+    Key::try_from(&[b't', t, k][..]).unwrap()
+}
+
+fn run_thread(store: &Store, t: u8, ops: Vec<ThreadOp>) -> HashMap<u8, Vec<u8>> {
+    let mut model = HashMap::new();
+    for op in ops {
+        match op {
+            ThreadOp::Set(k, v) => {
+                store
+                    .set(thread_key(t, k), Value::try_from(&v[..]).unwrap())
+                    .unwrap();
+                model.insert(k, v);
+            }
+            ThreadOp::Get(k) => {
+                let got = store.get(&thread_key(t, k)).unwrap();
+                assert_eq!(
+                    got.as_ref().map(Value::as_bytes),
+                    model.get(&k).map(Vec::as_slice),
+                    "thread {t}, key {k}"
+                );
+            }
+            ThreadOp::Delete(k) => {
+                store.delete(thread_key(t, k)).unwrap();
+                model.remove(&k);
+            }
+            ThreadOp::Batch(ops) => {
+                let mut batch = Batch::new();
+                for (k, v) in ops {
+                    match v {
+                        Some(v) => {
+                            batch.set(thread_key(t, k), Value::try_from(&v[..]).unwrap());
+                            model.insert(k, v);
+                        }
+                        None => {
+                            batch.delete(thread_key(t, k));
+                            model.remove(&k);
+                        }
+                    }
+                }
+                store.write(batch).unwrap();
+            }
+            ThreadOp::Compact => store.compact().unwrap(),
+        }
+    }
+    model
+}
+
+fn check_models(store: &Store, models: &[HashMap<u8, Vec<u8>>]) {
+    for (t, model) in models.iter().enumerate() {
+        for k in 0..KEY_SPACE {
+            let got = store.get(&thread_key(t as u8, k)).unwrap();
+            assert_eq!(
+                got.as_ref().map(Value::as_bytes),
+                model.get(&k).map(Vec::as_slice),
+                "thread {t}, key {k}"
+            );
+        }
+    }
 }
 
 /// Small segments, so writes roll into new ones and reads and reopens
@@ -164,5 +255,31 @@ proptest! {
                 model.get(&k).map(Vec::as_slice)
             );
         }
+    }
+
+    #[test]
+    fn threads_on_one_store_match_their_own_hashmaps(
+        auto in any::<bool>(),
+        ops in prop::collection::vec(prop::collection::vec(thread_op(), 1..30), THREADS as usize),
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with(tmp.path(), options(auto)).unwrap();
+        let models: Vec<HashMap<u8, Vec<u8>>> = thread::scope(|scope| {
+            let threads: Vec<_> = ops
+                .into_iter()
+                .enumerate()
+                .map(|(t, ops)| {
+                    let store = &store;
+                    scope.spawn(move || run_thread(store, t as u8, ops))
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        check_models(&store, &models);
+        store.verify().unwrap();
+        drop(store);
+        let store = Store::open_with(tmp.path(), options(auto)).unwrap();
+        check_models(&store, &models);
+        store.verify().unwrap();
     }
 }

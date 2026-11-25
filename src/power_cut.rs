@@ -186,7 +186,7 @@ fn check_recovery(
     }
 
     let fs = MemFs::after(snapshot, cut);
-    let mut store = Store::open_in(fs.clone(), dir, options())
+    let store = Store::open_in(fs.clone(), dir, options())
         .unwrap_or_else(|err| panic!("{context}: open after the cut failed: {err}"));
     let observed = read_state(&store);
     assert!(
@@ -321,7 +321,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
 fn what_open_reads_survives_a_power_cut() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, options()).unwrap();
     store
         .set(key(1), Value::try_from(&b"synced"[..]).unwrap())
         .unwrap();
@@ -363,7 +363,7 @@ fn what_open_reads_survives_a_power_cut() {
 fn a_removed_hint_stays_removed_after_a_power_cut() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
         .unwrap();
@@ -380,7 +380,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
     let fs = MemFs::new();
     fs.put(&dir.join(log_name(0)), &log[..23]);
     fs.put(&dir.join(hint_name(0)), &hint);
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(3), Value::try_from(&b"3"[..]).unwrap())
         .unwrap();
@@ -406,7 +406,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
 fn a_power_cut_while_moving_to_segments_loses_nothing() {
     let dir = Path::new(DIR);
     let fs = MemFs::new();
-    let mut store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
+    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
     store
         .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
         .unwrap();

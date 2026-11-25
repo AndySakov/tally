@@ -267,7 +267,7 @@ fn run(dir: &Path, seed: u64) {
         candidates.len()
     );
 
-    let mut store = store;
+    let store = store;
     store
         .set(key(0), Value::try_from(&b"after recovery"[..]).unwrap())
         .unwrap();

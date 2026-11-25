@@ -13,7 +13,8 @@
 //!
 //! `limit_free_space` makes the disk fill up: a write that doesn't fit
 //! lands what does and fails with `StorageFull`, as a full disk does, and
-//! truncating a file frees what it cut.
+//! truncating a file frees what it cut. `fail_syncs` and `fail_truncates`
+//! make every file sync or truncate fail, changing nothing.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
@@ -271,6 +272,8 @@ struct State {
     snapshot: Option<Disk>,
     /// Bytes writes can still add, or `None` for no limit.
     free: Option<u64>,
+    fail_syncs: bool,
+    fail_truncates: bool,
 }
 
 #[derive(Clone)]
@@ -294,6 +297,8 @@ impl MemFs {
             cut_before: None,
             snapshot: None,
             free: None,
+            fail_syncs: false,
+            fail_truncates: false,
         })))
     }
 
@@ -326,6 +331,14 @@ impl MemFs {
     /// `None`.
     pub(crate) fn limit_free_space(&self, bytes: Option<u64>) {
         self.0.borrow_mut().free = bytes;
+    }
+
+    pub(crate) fn fail_syncs(&self, fail: bool) {
+        self.0.borrow_mut().fail_syncs = fail;
+    }
+
+    pub(crate) fn fail_truncates(&self, fail: bool) {
+        self.0.borrow_mut().fail_truncates = fail;
     }
 
     /// How much of a `len`-byte write fits, taking that space.
@@ -563,6 +576,9 @@ impl LogFile for MemFile {
 
     fn set_len(&self, len: u64) -> io::Result<()> {
         self.fs.step();
+        if self.fs.0.borrow().fail_truncates {
+            return Err(io::Error::other("injected truncate failure"));
+        }
         let cut = self.fs.with_inode(self.ino, |inode| {
             (inode.data.len() as u64).saturating_sub(len)
         });
@@ -577,6 +593,9 @@ impl LogFile for MemFile {
 
     fn sync(&self) -> io::Result<()> {
         self.fs.step();
+        if self.fs.0.borrow().fail_syncs {
+            return Err(io::Error::other("injected fsync failure"));
+        }
         self.fs.with_inode(self.ino, |inode| {
             inode.synced = inode.data.clone();
             inode.pending.clear();
@@ -634,5 +653,31 @@ mod tests {
         fs.limit_free_space(None);
         file.write_all_at(b"!", 5).unwrap();
         assert_eq!(fs.read(path).unwrap(), b"abxyz!");
+    }
+
+    #[test]
+    fn a_failed_sync_or_truncate_changes_nothing() {
+        let fs = MemFs::new();
+        let path = Path::new("/f");
+        let file = fs.open_or_create(path).unwrap();
+        file.write_all_at(b"abc", 0).unwrap();
+        fs.fail_syncs(true);
+        fs.fail_truncates(true);
+        assert_eq!(
+            file.sync().unwrap_err().to_string(),
+            "injected fsync failure"
+        );
+        assert_eq!(
+            file.set_len(1).unwrap_err().to_string(),
+            "injected truncate failure"
+        );
+        assert_eq!(fs.read(path).unwrap(), b"abc");
+        assert_eq!(fs.disk().inodes[0].synced, b"");
+
+        fs.fail_syncs(false);
+        fs.fail_truncates(false);
+        file.set_len(1).unwrap();
+        file.sync().unwrap();
+        assert_eq!(fs.disk().inodes[0].synced, b"a");
     }
 }

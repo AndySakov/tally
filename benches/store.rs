@@ -73,7 +73,7 @@ fn set(c: &mut Criterion) {
         .measurement_time(Duration::from_secs(10));
 
     let tmp = tempfile::tempdir().unwrap();
-    let mut store = Store::open(tmp.path()).unwrap();
+    let store = Store::open(tmp.path()).unwrap();
     let mut i = 0;
     group.bench_function("1KiB value", |b| {
         b.iter_batched(
@@ -105,7 +105,7 @@ fn set(c: &mut Criterion) {
     // every 1,000 writes and its pauses land in the measurement.
     const KEYS: u64 = 1000;
     let churn = tempfile::tempdir().unwrap();
-    let mut store = Store::open(churn.path()).unwrap();
+    let store = Store::open(churn.path()).unwrap();
     let mut writes = 0;
     group.bench_function("1KiB value, overwriting 1,000 keys", |b| {
         b.iter_batched(
@@ -207,7 +207,7 @@ fn compact(c: &mut Criterion) {
     for n in [10_000u64, 100_000] {
         let tmp = tempfile::tempdir().unwrap();
         write_fixture(tmp.path(), n, 100);
-        let mut store = Store::open(tmp.path()).unwrap();
+        let store = Store::open(tmp.path()).unwrap();
         group.throughput(Throughput::Elements(n));
         group.bench_with_input(
             BenchmarkId::new("live records, 100B values", n),
@@ -225,7 +225,7 @@ fn write(c: &mut Criterion) {
         .sample_size(samples(20))
         .measurement_time(Duration::from_secs(10));
     let tmp = tempfile::tempdir().unwrap();
-    let mut store = Store::open(tmp.path()).unwrap();
+    let store = Store::open(tmp.path()).unwrap();
     let mut i = 0;
     for size in [10u64, 100, 1000] {
         group.throughput(Throughput::Elements(size));
