@@ -430,21 +430,29 @@ impl<F: Fs> Store<F> {
         let hint_path = self.dir.join(hint_name(output.base));
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = Vec::new();
+        // The hint gets its trailer only once the copies are durable:
+        // nothing orders writes to two files, so a valid hint could
+        // otherwise reach the disk ahead of the copies it vouches for.
         let copied = self
             .fs
             .open_or_create(&hint_path)
             .map_err(Error::from)
-            .and_then(|hint| {
-                let written = self.copy_live(
+            .and_then(|hint_file| {
+                let (hint, written) = self.copy_live(
                     inputs,
                     output,
-                    &hint,
+                    &hint_file,
                     chosen,
                     oldest_kept,
                     &mut moved,
                     &mut carry,
                 )?;
-                Ok((hint, written))
+                if let Err(err) = output.file.sync() {
+                    return Err(self.poison(err));
+                }
+                hint.finish(written)?;
+                hint_file.sync()?;
+                Ok((hint_file, written))
             });
         let (hint_file, written) = match copied {
             Ok(copied) => copied,
@@ -453,14 +461,6 @@ impl<F: Fs> Store<F> {
                 return Err(err);
             }
         };
-        if let Err(err) = output.file.sync() {
-            self.undo_copy(output, &hint_path);
-            return Err(self.poison(err));
-        }
-        if let Err(err) = hint_file.sync() {
-            self.undo_copy(output, &hint_path);
-            return Err(err.into());
-        }
         output.set_len_written(written);
         if let Err(err) = self.repoint(output, &hint_file, &moved) {
             self.count_dead(writing);
@@ -532,20 +532,21 @@ impl<F: Fs> Store<F> {
     /// pushing its old offset to `moved`, in the same order. Pushes to
     /// `carry` the key of each Delete record that must outlive its segment:
     /// its key isn't live, and a segment older than it is kept. Returns the
-    /// bytes written; fsyncs neither file. One buffered pass per segment:
+    /// hint, still without its trailer, and the bytes written; fsyncs
+    /// neither file. One buffered pass per segment:
     /// reading the dead records in between costs less than a positioned
     /// read per live one.
     #[allow(clippy::too_many_arguments)]
-    fn copy_live(
+    fn copy_live<'h>(
         &self,
         inputs: &[Arc<Segment<F::File>>],
         output: &Segment<F::File>,
-        hint_file: &F::File,
+        hint_file: &'h F::File,
         chosen: &[u64],
         oldest_kept: u64,
         moved: &mut Vec<u64>,
         carry: &mut Vec<Vec<u8>>,
-    ) -> Result<u64, Error> {
+    ) -> Result<(hint::Writer<'h, F::File>, u64), Error> {
         hint_file.set_len(0)?;
         let mut hint = hint::Writer::new(hint_file);
         let mut carried = HashSet::new();
@@ -619,8 +620,7 @@ impl<F: Fs> Store<F> {
         assert_eq!(expected, chosen.len(), "every chosen segment is read");
         output.file.write_all_at(&buffer, written)?;
         written += buffer.len() as u64;
-        hint.finish(written)?;
-        Ok(written)
+        Ok((hint, written))
     }
 
     /// Points each key `copy_live` copied at its copy in `output`, as the
@@ -692,7 +692,11 @@ impl<F: Fs> Store<F> {
         let active = segments.last().expect("there is always a segment");
         let base = active.end();
         let file = self.fs.open_or_create(&self.dir.join(log_name(base)))?;
-        self.fs.sync_dir(&self.dir)?;
+        if let Err(err) = self.fs.sync_dir(&self.dir) {
+            // A retry would fsync a new descriptor, which Linux need not
+            // tell about this failure.
+            return Err(self.poison(err));
+        }
         active.seal();
         let mut next = segments.to_vec();
         next.push(Arc::new(Segment::new(base, file, 0)));
@@ -702,9 +706,9 @@ impl<F: Fs> Store<F> {
 
     /// Writes `buffer` at the end of the log in one write and fsyncs it,
     /// first starting a new segment if the active one is full, so a write
-    /// never spans two segments. Returns where it landed. A failed write is
-    /// truncated away and the truncation fsynced; if that fails, or the
-    /// write's fsync does, the store is poisoned.
+    /// never spans two segments. Returns where it landed. A failed write or
+    /// fsync is truncated away and the truncation fsynced. A failed fsync
+    /// poisons the store, and so does a failed truncation.
     fn append_bytes(&self, writing: &Writing, buffer: &[u8]) -> Result<u64, Error> {
         let full = self.active().len();
         if full > 0 && full >= self.segment_bytes {
@@ -720,6 +724,10 @@ impl<F: Fs> Store<F> {
         }
         let started = Instant::now();
         if let Err(err) = active.file.sync() {
+            // Linux can mark the pages clean while reads still see them, so
+            // a reopen would take the group as written and a later fsync
+            // would not write it, leaving a hole before later writes.
+            let _ = active.set_len(offset).and_then(|()| active.sync());
             return Err(self.poison(err));
         }
         let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1438,7 +1446,7 @@ fn try_load<F: Fs>(
         let hint = match fs.open_existing(&dir.join(hint_name(segment.base))) {
             Ok(file) => match hint::trailer(&file) {
                 Ok(trailer) => {
-                    count = count.max(trailer.count);
+                    count = count.max(trailer.count.min(trailer.most_sets));
                     Some(file)
                 }
                 Err(invalid) => return Ok(Err((segment.base, invalid))),
@@ -1887,7 +1895,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::mem_fs::MemFs;
+    use crate::mem_fs::{Cut, MemFs, Torn};
     use crate::record::tests::{DELETE_A, OLD_DELETE_A, OLD_SET_A_HI, SET_A_HI};
     use crate::record::{Record, encode, encode_as};
     use crate::{CorruptionReason, Error, UnsupportedReason};
@@ -4279,13 +4287,43 @@ mod tests {
         drop(store);
 
         let store = open_on(&fs, segmented(1 << 20));
-        assert_eq!(
-            get_on(&store, b"b").as_deref(),
-            Some(&b"2"[..]),
-            "the write reached the file; only its fsync failed"
-        );
+        assert_eq!(get_on(&store, b"b"), None);
         store.set(key(b"c"), value(b"3")).unwrap();
+        drop(store);
+
+        let store = open_on(&power_cut(&fs), segmented(1 << 20));
+        assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+        assert_eq!(get_on(&store, b"b"), None);
         assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    }
+
+    /// The disk after power fails with nothing unsynced landing.
+    fn power_cut(fs: &MemFs) -> MemFs {
+        let nothing = Cut {
+            keep: 0,
+            torn: Torn::Nothing,
+            entries: 0,
+            whole: None,
+        };
+        MemFs::after(&fs.disk(), nothing)
+    }
+
+    #[test]
+    fn a_failed_directory_fsync_when_starting_a_segment_poisons_the_store() {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(21));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        fs.fail_dir_syncs(true);
+        let err = store.set(key(b"b"), value(b"2")).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(io) if io.to_string() == "injected directory fsync failure"),
+            "{err:?}"
+        );
+        fs.fail_dir_syncs(false);
+        assert!(matches!(
+            store.set(key(b"b"), value(b"2")),
+            Err(Error::Poisoned)
+        ));
     }
 
     #[test]

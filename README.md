@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 216,898 possible disk states.
+cut before every disk operation of a workload, across 300,989 possible disk states.
 
 ## Status
 
@@ -100,7 +100,7 @@ Each layer below was checked by breaking the code on purpose and watching it fai
   sets, deletes, batches, compactions and a group of writes sharing one fsync, with 64-byte segments so most compactions clean some segments and keep
   others, has the power cut before each write, truncate, fsync, rename and directory sync, and after its last
   one. Every way the disk could be left is checked: any prefix of each file's unsynced writes, the next one torn
-  or zeroed, and any of the directory changes since the last directory sync, in any order that keeps each name's
+  or zeroed, one file's writes landing while another's don't, and any of the directory changes since the last directory sync, in any order that keeps each name's
   changes in order. `open` must then return every acknowledged write, and recovery is itself cut at every step.
   The same is done for `repair` and for the move from one file to segments. A single directory fsync after
   removing all of a compaction's cleaned segments, instead of one after each, fails it: a deleted key comes back.

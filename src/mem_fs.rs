@@ -13,8 +13,11 @@
 //!
 //! `limit_free_space` makes the disk fill up: a write that doesn't fit
 //! lands what does and fails with `StorageFull`, as a full disk does, and
-//! truncating a file frees what it cut. `fail_syncs` and `fail_truncates`
-//! make every file sync or truncate fail, changing nothing.
+//! truncating a file frees what it cut. `fail_truncates` makes every
+//! truncate fail, changing nothing, and `fail_dir_syncs` every directory
+//! sync. `fail_syncs` makes every file sync fail the way Linux does: the
+//! pending changes never reach the disk, even after a later sync, while
+//! reads still see them.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
@@ -76,6 +79,9 @@ pub(crate) struct Cut {
     pub torn: Torn,
     /// Bit `i` set: the `i`th unsynced entry change lands.
     pub entries: u16,
+    /// The file at this index in the disk's inodes lands all its pending
+    /// changes, whatever `keep` says: nothing orders writes across files.
+    pub whole: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +152,7 @@ impl Disk {
                 keep,
                 torn: Torn::Nothing,
                 entries: 0,
+                whole: None,
             });
             let next_write = self
                 .inodes
@@ -161,6 +168,7 @@ impl Disk {
                             keep,
                             torn: Torn::Bytes(n),
                             entries: 0,
+                            whole: None,
                         });
                     }
                 }
@@ -168,7 +176,23 @@ impl Disk {
                     keep,
                     torn: Torn::Zeros(len),
                     entries: 0,
+                    whole: None,
                 });
+            }
+        }
+        let pending: Vec<usize> = (0..self.inodes.len())
+            .filter(|&i| !self.inodes[i].pending.is_empty())
+            .collect();
+        if pending.len() > 1 {
+            for &i in &pending {
+                for torn in [Torn::Nothing, Torn::Zeros(usize::MAX)] {
+                    cuts.push(Cut {
+                        keep: 0,
+                        torn,
+                        entries: 0,
+                        whole: Some(i),
+                    });
+                }
             }
         }
         cuts
@@ -179,12 +203,18 @@ impl Disk {
         let inodes = self
             .inodes
             .iter()
-            .map(|inode| {
+            .enumerate()
+            .map(|(i, inode)| {
+                let keep = if cut.whole == Some(i) {
+                    inode.pending.len()
+                } else {
+                    cut.keep
+                };
                 let mut data = inode.synced.clone();
-                for change in inode.pending.iter().take(cut.keep) {
+                for change in inode.pending.iter().take(keep) {
                     apply(&mut data, change);
                 }
-                if let Some(Change::Write { offset, bytes }) = inode.pending.get(cut.keep) {
+                if let Some(Change::Write { offset, bytes }) = inode.pending.get(keep) {
                     let landed = match cut.torn {
                         Torn::Nothing => None,
                         Torn::Bytes(n) => Some(bytes[..n.min(bytes.len())].to_vec()),
@@ -273,6 +303,7 @@ struct State {
     /// Bytes writes can still add, or `None` for no limit.
     free: Option<u64>,
     fail_syncs: bool,
+    fail_dir_syncs: bool,
     fail_truncates: bool,
 }
 
@@ -298,6 +329,7 @@ impl MemFs {
             snapshot: None,
             free: None,
             fail_syncs: false,
+            fail_dir_syncs: false,
             fail_truncates: false,
         })))
     }
@@ -335,6 +367,10 @@ impl MemFs {
 
     pub(crate) fn fail_syncs(&self, fail: bool) {
         self.0.borrow_mut().fail_syncs = fail;
+    }
+
+    pub(crate) fn fail_dir_syncs(&self, fail: bool) {
+        self.0.borrow_mut().fail_dir_syncs = fail;
     }
 
     pub(crate) fn fail_truncates(&self, fail: bool) {
@@ -502,6 +538,9 @@ impl Fs for MemFs {
     /// creations, replacements, renames away and removals all land together.
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.step();
+        if self.0.borrow().fail_dir_syncs {
+            return Err(io::Error::other("injected directory fsync failure"));
+        }
         let mut state = self.0.borrow_mut();
         let disk = &mut state.disk;
         disk.has_dir(path)?;
@@ -593,13 +632,17 @@ impl LogFile for MemFile {
 
     fn sync(&self) -> io::Result<()> {
         self.fs.step();
-        if self.fs.0.borrow().fail_syncs {
+        let failed = self.fs.0.borrow().fail_syncs;
+        self.fs.with_inode(self.ino, |inode| {
+            for change in inode.pending.drain(..) {
+                if !failed {
+                    apply(&mut inode.synced, &change);
+                }
+            }
+        });
+        if failed {
             return Err(io::Error::other("injected fsync failure"));
         }
-        self.fs.with_inode(self.ino, |inode| {
-            inode.synced = inode.data.clone();
-            inode.pending.clear();
-        });
         Ok(())
     }
 
@@ -656,28 +699,81 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_sync_or_truncate_changes_nothing() {
+    fn a_failed_truncate_changes_nothing() {
         let fs = MemFs::new();
         let path = Path::new("/f");
         let file = fs.open_or_create(path).unwrap();
         file.write_all_at(b"abc", 0).unwrap();
-        fs.fail_syncs(true);
+        file.sync().unwrap();
         fs.fail_truncates(true);
-        assert_eq!(
-            file.sync().unwrap_err().to_string(),
-            "injected fsync failure"
-        );
         assert_eq!(
             file.set_len(1).unwrap_err().to_string(),
             "injected truncate failure"
         );
         assert_eq!(fs.read(path).unwrap(), b"abc");
-        assert_eq!(fs.disk().inodes[0].synced, b"");
+        assert_eq!(fs.disk().inodes[0].synced, b"abc");
+    }
 
+    #[test]
+    fn a_failed_sync_loses_its_writes_from_the_disk_but_not_from_reads() {
+        let fs = MemFs::new();
+        let path = Path::new("/f");
+        let file = fs.open_or_create(path).unwrap();
+        file.write_all_at(b"abc", 0).unwrap();
+        fs.fail_syncs(true);
+        assert_eq!(
+            file.sync().unwrap_err().to_string(),
+            "injected fsync failure"
+        );
         fs.fail_syncs(false);
-        fs.fail_truncates(false);
-        file.set_len(1).unwrap();
+        file.write_all_at(b"d", 3).unwrap();
         file.sync().unwrap();
-        assert_eq!(fs.disk().inodes[0].synced, b"a");
+        assert_eq!(fs.read(path).unwrap(), b"abcd");
+        assert_eq!(fs.disk().inodes[0].synced, b"\0\0\0d");
+    }
+
+    #[test]
+    fn a_failed_directory_sync_leaves_the_entry_unsynced() {
+        let fs = MemFs::new();
+        fs.open_or_create(Path::new("/f")).unwrap();
+        fs.fail_dir_syncs(true);
+        assert_eq!(
+            fs.sync_dir(Path::new("/")).unwrap_err().to_string(),
+            "injected directory fsync failure"
+        );
+        assert!(fs.disk().durable_files.is_empty());
+    }
+
+    #[test]
+    fn a_cut_can_land_one_file_whole_and_nothing_of_another() {
+        let fs = MemFs::new();
+        let a = fs.open_or_create(Path::new("/a")).unwrap();
+        let b = fs.open_or_create(Path::new("/b")).unwrap();
+        fs.sync_dir(Path::new("/")).unwrap();
+        a.write_all_at(b"1", 0).unwrap();
+        a.write_all_at(b"2", 1).unwrap();
+        b.write_all_at(b"3", 0).unwrap();
+        let disk = fs.disk();
+        let landed: Vec<(Vec<u8>, Vec<u8>)> = disk
+            .cuts()
+            .into_iter()
+            .filter(|cut| cut.whole.is_some())
+            .map(|cut| {
+                let after = MemFs::after(&disk, cut);
+                (
+                    after.read(Path::new("/a")).unwrap(),
+                    after.read(Path::new("/b")).unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            landed,
+            [
+                (b"12".to_vec(), b"".to_vec()),
+                (b"12".to_vec(), b"\0".to_vec()),
+                (b"".to_vec(), b"3".to_vec()),
+                (b"\0".to_vec(), b"3".to_vec()),
+            ]
+        );
     }
 }
