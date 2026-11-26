@@ -415,7 +415,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
         .set(key(2), Value::try_from(&b"2"[..]).unwrap())
         .unwrap();
     store
-        .set(key(9), Value::try_from(&b"9"[..]).unwrap())
+        .set(key(4), Value::try_from(&b"4"[..]).unwrap())
         .unwrap();
     drop(store);
     drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());

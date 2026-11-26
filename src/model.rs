@@ -6,8 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::fs::{Fs, LogFile};
-use crate::record::{BATCH_PAYLOAD_LEN, HEADER_LEN};
-use crate::segment::{FILE_HEADER_LEN, parse_log_name};
+use crate::segment::parse_log_name;
 use crate::store::Write;
 use crate::{AutoCompact, Batch, Key, Options, Store, Value};
 
@@ -39,7 +38,12 @@ pub fn key(t: u8, k: u8) -> Key {
     Key::try_from(&[t, k % KEY_SPACE][..]).unwrap()
 }
 
+/// Lengths in the format, written out rather than taken from the code
+/// under test, so a change to the format fails here.
 const KEY_LEN: u64 = 2;
+const HEADER_LEN: u64 = 19;
+const BATCH_LEN: u64 = HEADER_LEN + 8;
+const FILE_HEADER_LEN: u64 = 17;
 
 fn value(v: &[u8]) -> Value {
     Value::try_from(v).unwrap()
@@ -72,11 +76,11 @@ fn apply<'c>(state: &mut State, changes: impl IntoIterator<Item = &'c Change>) -
             None if state.remove(&k).is_some() => 0,
             None => continue,
         };
-        bytes += HEADER_LEN as u64 + KEY_LEN + len;
+        bytes += HEADER_LEN + KEY_LEN + len;
         records += 1;
     }
     if records > 1 {
-        bytes += HEADER_LEN as u64 + u64::from(BATCH_PAYLOAD_LEN);
+        bytes += BATCH_LEN;
     }
     bytes
 }
@@ -85,7 +89,7 @@ fn apply<'c>(state: &mut State, changes: impl IntoIterator<Item = &'c Change>) -
 pub fn live_len(state: &State) -> u64 {
     state
         .values()
-        .map(|v| HEADER_LEN as u64 + KEY_LEN + v.len() as u64)
+        .map(|v| HEADER_LEN + KEY_LEN + v.len() as u64)
         .sum()
 }
 
@@ -232,7 +236,7 @@ impl<F: Fs + Clone> Model<F> {
 mod tests {
     //! Every `set` and `delete` fsyncs on the real disk (about 5 ms on
     //! macOS), so the default case count is small. For a longer run:
-    //! `PROPTEST_CASES=2000 cargo test model`.
+    //! `PROPTEST_CASES=2000 cargo test model::`.
 
     use std::thread;
 
@@ -310,6 +314,9 @@ mod tests {
                     .collect();
                 threads.into_iter().map(|t| t.join().unwrap()).collect()
             });
+            for (t, state) in states.iter().enumerate() {
+                check(&store, t as u8, state);
+            }
             store.verify().unwrap();
             drop(store);
             let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();

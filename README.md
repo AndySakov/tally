@@ -109,7 +109,7 @@ Each layer below was checked by breaking the code on purpose and watching it fai
   index without writing the record fails it.
 - **Model test** (`src/model.rs`): random sets, gets, deletes, batches, groups, compactions and reopens against a
   `BTreeMap`, with 100-byte segments and, in half the cases, automatic compaction with no floor, checking every read
-  after each step. A second test runs four threads on one store, each against its own map, with compactions between them. The same broken
+  and the log's length. A second test runs four threads on one store, each against its own map, with compactions between them. The same broken
   `set` fails it, and so does dropping the Delete records compaction must keep.
 - **Fuzzing** (`fuzz/`): `decode` on arbitrary bytes at arbitrary offsets, `open` on cut, changed and zeroed logs, `hint` on damaged hint files, and
   `ops` as a coverage-guided model test on the in-memory disk.
