@@ -19,7 +19,7 @@ mod repair;
 mod scan;
 
 use commit::Queue;
-#[cfg(test)]
+#[cfg(any(test, fuzzing))]
 pub(crate) use commit::Write;
 use open::{load, open_segments};
 use scan::scan;
