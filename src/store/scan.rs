@@ -206,9 +206,7 @@ pub(super) fn scan_into(
             let (header, op) = reader
                 .next(at, body_end, Place::Inner)
                 .map_err(|err| err.moved_to(offset))?;
-            reader
-                .show(at, header, &op, record)
-                .map_err(|err| err.moved_to(offset))?;
+            reader.show(at, header, &op, record)?;
             batch.push(change(at, header, op));
             at += header.record_len();
         }

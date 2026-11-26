@@ -163,7 +163,14 @@ pub fn encode(record: &Record, place: Place, offset: u64, buf: &mut Vec<u8>) {
         Record::Delete { key } => {
             encode_parts(Kind::Delete, place, key.as_bytes(), &[], offset, buf)
         }
-        Record::Batch { body_len } => encode_batch(*body_len, offset, buf),
+        Record::Batch { body_len } => encode_parts(
+            Kind::Batch,
+            place,
+            &[],
+            &body_len.to_le_bytes(),
+            offset,
+            buf,
+        ),
     }
 }
 

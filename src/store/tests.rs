@@ -1485,6 +1485,7 @@ fn a_batch_inside_a_batch_or_a_record_past_its_end_is_corrupt() {
         &mut nested,
     );
     encode_op(&set_record(b"a", b"1"), Place::Inner, 54, &mut nested);
+    assert_eq!(nested[27 + 4], 0x73);
     let mut short = Vec::new();
     encode_batch(10, 0, &mut short);
     encode_op(&set_record(b"a", b"1"), Place::Inner, 27, &mut short);
@@ -2767,5 +2768,35 @@ fn a_leader_stops_waiting_after_a_tenth_of_the_last_fsync() {
         hold(&store.queue).last_group,
         1,
         "the next leader won't wait"
+    );
+}
+
+#[test]
+fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    put(&store, b"a", b"1");
+    store
+        .write(batch(&[(b"b", Some(b"2")), (b"b", None)]))
+        .unwrap();
+    put(&store, b"c", b"3");
+    assert_eq!(segment_bases(tmp.path()), [0, 21, 89]);
+    let file = OpenOptions::new()
+        .write(true)
+        .open(tmp.path().join(log_name(0)))
+        .unwrap();
+    file.write_all_at(b"9", FILE_HEADER_LEN + 20).unwrap();
+
+    let err = store.clean(&store.writer(), &[21]).unwrap_err();
+
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 0,
+                reason: CorruptionReason::PayloadChecksum
+            }
+        ),
+        "{err:?}"
     );
 }
