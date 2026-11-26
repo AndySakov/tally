@@ -148,7 +148,8 @@ pub fn encode_batch(body_len: u64, offset: u64, buf: &mut Vec<u8>) {
     );
 }
 
-/// Appends `record` as `encode_op` and `encode_batch` would.
+/// Appends `record` at `place`, a Batch too, which `encode_batch` writes
+/// only at the top.
 #[cfg(any(test, fuzzing))]
 pub fn encode(record: &Record, place: Place, offset: u64, buf: &mut Vec<u8>) {
     match record {

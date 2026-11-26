@@ -138,7 +138,7 @@ pub(super) fn scan_on(
             SCAN_BUFFER,
             &mut |key, entry| {
                 window.push(key.as_bytes(), entry);
-                if window.changes.len() == WINDOW {
+                if window.len() == WINDOW {
                     sent(mem::take(&mut window));
                 }
             },
@@ -240,10 +240,14 @@ fn bad_batch_at(offset: u64) -> Error {
 #[derive(Default)]
 pub(super) struct Window {
     keys: Vec<u8>,
-    pub changes: Vec<(usize, Option<Entry>)>,
+    changes: Vec<(usize, Option<Entry>)>,
 }
 
 impl Window {
+    pub(super) fn len(&self) -> usize {
+        self.changes.len()
+    }
+
     pub(super) fn push(&mut self, key: &[u8], entry: Option<Entry>) {
         self.keys.extend_from_slice(key);
         self.changes.push((self.keys.len(), entry));

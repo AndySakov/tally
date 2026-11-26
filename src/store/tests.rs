@@ -1039,6 +1039,24 @@ fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
 }
 
 #[test]
+fn cleaning_a_delete_carries_it_when_the_older_set_is_only_in_a_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert!(tmp.path().join(hint_name(0)).exists());
+
+    store.clean(&store.writer(), &[42]).unwrap();
+
+    assert_eq!(
+        segment_records(tmp.path(), 83),
+        encoded_at(83, &[delete_record(b"a")])
+    );
+    drop(store);
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"a"), None);
+}
+
+#[test]
 fn cleaning_a_delete_while_older_kept_segments_lack_its_key_drops_it() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());

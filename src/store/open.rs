@@ -237,7 +237,7 @@ pub(super) fn read_hint<L: LogFile>(
             Kind::Batch => return,
         };
         changes.push(key, entry);
-        if changes.changes.len() == window {
+        if changes.len() == window {
             mem::take(&mut changes).apply_to(index, threads);
         }
     })?;
