@@ -14,7 +14,7 @@ use std::thread;
 
 use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
-use crate::record::{Place, Record, encode};
+use crate::record::{self, Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
 use crate::store::{LOG_FILE_NAME, Write};
 use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
@@ -108,13 +108,13 @@ fn apply(state: &mut State, op: &Op) {
     }
 }
 
-fn record(k: u8, v: &Option<Vec<u8>>) -> Record {
+fn record(k: u8, v: &Option<Vec<u8>>) -> record::Op {
     match v {
-        Some(v) => Record::Set {
+        Some(v) => record::Op::Set {
             key: key(k),
             value: Value::try_from(&v[..]).unwrap(),
         },
-        None => Record::Delete { key: key(k) },
+        None => record::Op::Delete { key: key(k) },
     }
 }
 

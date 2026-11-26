@@ -87,7 +87,7 @@ impl Header {
     }
 
     pub fn payload_len(self) -> usize {
-        usize::from(self.fields.key_len) + self.fields.value_len as usize
+        self.fields.payload_len()
     }
 
     pub fn record_len(self) -> u64 {
@@ -95,7 +95,62 @@ impl Header {
     }
 }
 
-/// Appends `record`, to be written at log offset `offset`, to `buf`.
+/// A Set or Delete, as a caller writes it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Op {
+    Set { key: Key, value: Value },
+    Delete { key: Key },
+}
+
+impl Op {
+    pub fn key(&self) -> &Key {
+        let (Op::Set { key, .. } | Op::Delete { key }) = self;
+        key
+    }
+
+    fn value(&self) -> &[u8] {
+        match self {
+            Op::Set { value, .. } => value.as_bytes(),
+            Op::Delete { .. } => &[],
+        }
+    }
+
+    /// The fields of its record, on its own in the log.
+    pub fn fields(&self) -> Fields {
+        Fields {
+            kind: match self {
+                Op::Set { .. } => Kind::Set,
+                Op::Delete { .. } => Kind::Delete,
+            },
+            place: Place::Top,
+            key_len: u16::try_from(self.key().as_bytes().len())
+                .expect("Key guarantees len fits u16"),
+            value_len: u32::try_from(self.value().len()).expect("Value guarantees len fits u32"),
+        }
+    }
+}
+
+/// Appends the record of `op`, to be written at log offset `offset` in
+/// `place`, to `buf`.
+pub fn encode_op(op: &Op, place: Place, offset: u64, buf: &mut Vec<u8>) {
+    let kind = op.fields().kind;
+    encode_parts(kind, place, op.key().as_bytes(), op.value(), offset, buf);
+}
+
+/// Appends a Batch record whose body is the next `body_len` bytes.
+pub fn encode_batch(body_len: u64, offset: u64, buf: &mut Vec<u8>) {
+    encode_parts(
+        Kind::Batch,
+        Place::Top,
+        &[],
+        &body_len.to_le_bytes(),
+        offset,
+        buf,
+    );
+}
+
+/// Appends `record` as `encode_op` and `encode_batch` would.
+#[cfg(any(test, fuzzing))]
 pub fn encode(record: &Record, place: Place, offset: u64, buf: &mut Vec<u8>) {
     match record {
         Record::Set { key, value } => encode_parts(
@@ -109,14 +164,7 @@ pub fn encode(record: &Record, place: Place, offset: u64, buf: &mut Vec<u8>) {
         Record::Delete { key } => {
             encode_parts(Kind::Delete, place, key.as_bytes(), &[], offset, buf)
         }
-        Record::Batch { body_len } => encode_parts(
-            Kind::Batch,
-            place,
-            &[],
-            &body_len.to_le_bytes(),
-            offset,
-            buf,
-        ),
+        Record::Batch { body_len } => encode_batch(*body_len, offset, buf),
     }
 }
 
@@ -214,6 +262,10 @@ impl Fields {
         bytes
     }
 
+    pub fn payload_len(self) -> usize {
+        usize::from(self.key_len) + self.value_len as usize
+    }
+
     pub fn record_len(self) -> u64 {
         record_len(self.key_len, self.value_len)
     }
@@ -269,23 +321,34 @@ pub fn decode_fields(bytes: &[u8; FIELDS_LEN]) -> Result<Fields, DecodeError> {
 /// Panics if `payload.len() != header.payload_len()`: that means the
 /// caller read the wrong number of bytes, which is a bug, not bad data.
 pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeError> {
-    match decode_index_op(header, payload)? {
-        IndexOp::Set { key, .. } => Ok(Record::Set {
+    Ok(match decode_index_op(header, payload)? {
+        IndexOp::Set { key } => Record::Set {
             key,
             value: Value::try_from(&payload[usize::from(header.fields.key_len)..])
                 .expect("decode_header checked value_len"),
-        }),
-        IndexOp::Delete { key } => Ok(Record::Delete { key }),
-        IndexOp::Batch { body_len } => Ok(Record::Batch { body_len }),
-    }
+        },
+        IndexOp::Delete { key } => Record::Delete { key },
+        IndexOp::Batch { body_len } => Record::Batch { body_len },
+    })
 }
 
-/// What a record does to the index, without the value bytes.
+/// What a record does to the index, without the value bytes, whose length
+/// its header has.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IndexOp {
-    Set { key: Key, value_len: u32 },
+    Set { key: Key },
     Delete { key: Key },
     Batch { body_len: u64 },
+}
+
+impl IndexOp {
+    /// The key's bytes, none for a Batch.
+    pub fn key(&self) -> &[u8] {
+        match self {
+            IndexOp::Set { key } | IndexOp::Delete { key } => key.as_bytes(),
+            IndexOp::Batch { .. } => &[],
+        }
+    }
 }
 
 /// Checks the payload checksum and returns what the record does to the
@@ -293,6 +356,14 @@ pub enum IndexOp {
 ///
 /// Panics if `payload.len() != header.payload_len()`, as `decode_payload`.
 pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, DecodeError> {
+    check_payload(header, payload)?;
+    Ok(index_op(header, payload))
+}
+
+/// Checks the payload checksum.
+///
+/// Panics if `payload.len() != header.payload_len()`, as `decode_payload`.
+pub fn check_payload(header: Header, payload: &[u8]) -> Result<(), DecodeError> {
     assert_eq!(
         payload.len(),
         header.payload_len(),
@@ -301,22 +372,22 @@ pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, Decode
     if header.payload_checksum != crc_fast::checksum(CrcAlgorithm::Crc64Nvme, payload) {
         return Err(DecodeError::Corrupt(CorruptionReason::PayloadChecksum));
     }
-    let Fields {
-        kind,
-        key_len,
-        value_len,
-        ..
-    } = header.fields;
-    if kind == Kind::Batch {
-        let body_len = u64::from_le_bytes(payload.try_into().expect("decode_header checked it"));
-        return Ok(IndexOp::Batch { body_len });
+    Ok(())
+}
+
+/// What the record with this header and checked payload does to the index.
+pub fn index_op(header: Header, payload: &[u8]) -> IndexOp {
+    let key = || {
+        Key::try_from(&payload[..usize::from(header.fields.key_len)])
+            .expect("decode_header checked key_len")
+    };
+    match header.fields.kind {
+        Kind::Set => IndexOp::Set { key: key() },
+        Kind::Delete => IndexOp::Delete { key: key() },
+        Kind::Batch => IndexOp::Batch {
+            body_len: u64::from_le_bytes(payload.try_into().expect("decode_header checked it")),
+        },
     }
-    let key =
-        Key::try_from(&payload[..usize::from(key_len)]).expect("decode_header checked key_len");
-    Ok(match kind {
-        Kind::Set => IndexOp::Set { key, value_len },
-        _ => IndexOp::Delete { key },
-    })
 }
 
 #[cfg(test)]
@@ -436,10 +507,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             decode_index_op(h, &SET_A_HI[HEADER_LEN..]),
-            Ok(IndexOp::Set {
-                key: key(b"a"),
-                value_len: 2
-            })
+            Ok(IndexOp::Set { key: key(b"a") })
         );
 
         let inner = &BATCH_OF_SET_AND_DELETE[27 + 22..];

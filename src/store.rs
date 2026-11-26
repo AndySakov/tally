@@ -14,8 +14,9 @@ use crate::hint;
 use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
 use crate::record::{
-    BATCH_PAYLOAD_LEN, Fields, HEADER_LEN, Header, IndexOp, Kind, Place, Record, decode_header,
-    decode_index_op, decode_payload, encode, move_header, record_len, starts_a_record,
+    BATCH_PAYLOAD_LEN, Fields, HEADER_LEN, Header, IndexOp, Kind, Op, Place, Record, check_payload,
+    decode_header, decode_payload, encode_batch, encode_op, index_op, move_header, record_len,
+    starts_a_record,
 };
 use crate::segment::{
     FILE_HEADER_LEN, FileHeader, Segment, check_file_header, compact_name, create, hint_name,
@@ -103,30 +104,23 @@ impl Drop for Writing<'_> {
     }
 }
 
-/// A write a caller asked for: one record, or a batch.
+/// A write a caller asked for: one operation, or a batch.
 pub(crate) enum Write {
-    One(Record),
-    Batch(Vec<Record>),
+    One(Op),
+    Batch(Vec<Op>),
 }
 
 impl Write {
-    fn records(&self) -> &[Record] {
+    fn ops(&self) -> &[Op] {
         match self {
-            Write::One(record) => std::slice::from_ref(record),
-            Write::Batch(records) => records,
+            Write::One(op) => std::slice::from_ref(op),
+            Write::Batch(ops) => ops,
         }
     }
 
     /// About how many bytes it writes, to cap a group.
     fn size(&self) -> usize {
-        self.records()
-            .iter()
-            .map(|record| match record {
-                Record::Set { key, value } => key.as_bytes().len() + value.as_bytes().len(),
-                Record::Delete { key } => key.as_bytes().len(),
-                Record::Batch { .. } => 0,
-            })
-            .sum()
+        self.ops().iter().map(|op| op.fields().payload_len()).sum()
     }
 }
 
@@ -282,7 +276,7 @@ impl<F: Fs> Store<F> {
                 segment.base,
                 segment.end(),
                 newest,
-                &mut |_, _| {},
+                &mut |_| Ok(()),
             ) {
                 Ok(_) => {}
                 Err(Error::Corruption { offset, .. }) => {
@@ -457,16 +451,9 @@ impl<F: Fs> Store<F> {
             }
         }
         if !carry.is_empty() {
-            let dead = carry
-                .iter()
-                .map(|key| record_len(entry_key_len(key), 0))
-                .sum();
-            let deletes: Vec<Record> = carry
-                .into_iter()
-                .map(|key| Record::Delete { key })
-                .collect();
-            let deletes: Vec<&Record> = deletes.iter().collect();
-            self.append_records(writing, &deletes)?;
+            let deletes: Vec<Op> = carry.into_iter().map(|key| Op::Delete { key }).collect();
+            let dead = deletes.iter().map(|op| op.fields().record_len()).sum();
+            self.append(writing, &deletes.iter().collect::<Vec<_>>())?;
             self.active().add_dead(dead);
         }
         for &base in chosen {
@@ -513,45 +500,41 @@ impl<F: Fs> Store<F> {
         let mut buffer = Vec::new();
         let mut written = 0u64;
         for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
-            each_record(
-                input,
-                input.base,
-                |offset, header_buf, payload, header, op| {
-                    match op {
-                        IndexOp::Set { key, .. } => {
-                            if self
-                                .index
-                                .get(key.as_bytes())
-                                .is_some_and(|entry| entry.offset == offset)
-                            {
-                                moved.push(offset);
-                                let fields = Fields {
-                                    place: Place::Top,
-                                    ..header.fields()
-                                };
-                                hint.push(fields, key.as_bytes())?;
-                                move_header(header_buf, base + written + buffer.len() as u64);
-                                buffer.extend_from_slice(header_buf);
-                                buffer.extend_from_slice(payload);
-                                if buffer.len() >= COMPACT_BUFFER {
-                                    output.write_all_at(&buffer, base + written)?;
-                                    written += buffer.len() as u64;
-                                    buffer.clear();
-                                }
+            each_record(input, input.base, |read| {
+                match read.op {
+                    IndexOp::Set { key } => {
+                        if self
+                            .index
+                            .get(key.as_bytes())
+                            .is_some_and(|entry| entry.offset == read.offset)
+                        {
+                            moved.push(read.offset);
+                            let fields = Fields {
+                                place: Place::Top,
+                                ..read.header.fields()
+                            };
+                            hint.push(fields, key.as_bytes())?;
+                            move_header(read.header_bytes, base + written + buffer.len() as u64);
+                            buffer.extend_from_slice(read.header_bytes);
+                            buffer.extend_from_slice(read.payload);
+                            if buffer.len() >= COMPACT_BUFFER {
+                                output.write_all_at(&buffer, base + written)?;
+                                written += buffer.len() as u64;
+                                buffer.clear();
                             }
                         }
-                        IndexOp::Delete { key } => {
-                            if !self.index.contains(key.as_bytes())
-                                && self.kept_set_of(segments, chosen, input.base, &key)?
-                            {
-                                carry.insert(key);
-                            }
-                        }
-                        IndexOp::Batch { .. } => {}
                     }
-                    Ok(())
-                },
-            )?;
+                    IndexOp::Delete { key } => {
+                        if !self.index.contains(key.as_bytes())
+                            && self.kept_set_of(segments, chosen, input.base, key)?
+                        {
+                            carry.insert(Key::try_from(key.as_bytes()).expect("a key"));
+                        }
+                    }
+                    IndexOp::Batch { .. } => {}
+                }
+                Ok(())
+            })?;
         }
         output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
@@ -598,11 +581,9 @@ impl<F: Fs> Store<F> {
                 if trailer.log_len > segment.len() {
                     return Err(hint::Invalid("the segment is shorter than the hint says"));
                 }
-                hint::read_entries(&file, trailer, HINT_WINDOW, |window| {
-                    for (fields, key, _) in window.entries() {
-                        if fields.kind == Kind::Set {
-                            keys.add(key);
-                        }
+                hint::read_entries(&file, trailer, |fields, key, _| {
+                    if fields.kind == Kind::Set {
+                        keys.add(key);
                     }
                 })?;
                 Ok(trailer.log_len)
@@ -612,8 +593,8 @@ impl<F: Fs> Store<F> {
                 Err(_) => keys.clear(),
             }
         }
-        each_record(segment, from, |_, _, _, _, op| {
-            if let IndexOp::Set { key, .. } = op {
+        each_record(segment, from, |read| {
+            if let IndexOp::Set { key } = read.op {
                 keys.add(key.as_bytes());
             }
             Ok(())
@@ -637,21 +618,21 @@ impl<F: Fs> Store<F> {
         };
         let trailer = hint::trailer(hint_file).map_err(unreadable)?;
         let mut old = moved.iter();
-        hint::read_entries(hint_file, trailer, HINT_WINDOW, |window| {
-            for (fields, key, offset) in window.entries() {
-                let from = *old.next().expect("one old offset per copy");
-                let entry = Entry {
-                    offset: output.base + offset,
-                    value_len: fields.value_len,
-                    key_len: fields.key_len,
-                };
-                if !self.index.replace(key, from, entry) {
-                    output.add_dead(entry.record_len());
-                }
+        let mut unmatched = false;
+        hint::read_entries(hint_file, trailer, |fields, key, offset| {
+            let Some(&from) = old.next() else {
+                unmatched = true;
+                return;
+            };
+            let entry = Entry::new(output.base + offset, fields);
+            if !self.index.replace(key, from, entry) {
+                output.add_dead(entry.record_len());
             }
         })
         .map_err(unreadable)?;
-        assert!(old.next().is_none(), "the hint lists every copy");
+        if unmatched || old.next().is_some() {
+            return Err(unreadable(hint::Invalid("not one entry per copy")));
+        }
         Ok(())
     }
 
@@ -700,21 +681,21 @@ impl<F: Fs> Store<F> {
         Ok(())
     }
 
-    /// Appends Set and Delete `records` in one write and fsyncs it, and
+    /// Appends the records of `ops` in one write and fsyncs it, and
     /// returns where each landed. One record is written on its own, and
     /// more inside a Batch record, so a crash keeps all of them or none;
     /// the Batch header counts as dead. Starts a new segment first if the
     /// active one is full, so an append never spans two. A failed write or
     /// fsync is truncated away and the truncation fsynced. A failed fsync
     /// poisons the store, and so does a failed truncation.
-    fn append_records(&self, writing: &Writing, records: &[&Record]) -> Result<Vec<u64>, Error> {
+    fn append(&self, writing: &Writing, ops: &[&Op]) -> Result<Vec<u64>, Error> {
         let full = self.active().len();
         if full > 0 && full >= self.segment_bytes {
             self.roll(writing)?;
         }
         let active = self.active();
         let start = active.end();
-        let framed = records.len() > 1;
+        let framed = ops.len() > 1;
         let frame_len = if framed {
             record_len(0, BATCH_PAYLOAD_LEN)
         } else {
@@ -722,16 +703,15 @@ impl<F: Fs> Store<F> {
         };
         let place = if framed { Place::Inner } else { Place::Top };
         let mut buffer = vec![0u8; frame_len as usize];
-        let mut offsets = Vec::with_capacity(records.len());
-        for record in records {
+        let mut offsets = Vec::with_capacity(ops.len());
+        for op in ops {
             let offset = start + buffer.len() as u64;
             offsets.push(offset);
-            encode(record, place, offset, &mut buffer);
+            encode_op(op, place, offset, &mut buffer);
         }
         if framed {
             let mut frame = Vec::with_capacity(frame_len as usize);
-            let body_len = buffer.len() as u64 - frame_len;
-            encode(&Record::Batch { body_len }, Place::Top, start, &mut frame);
+            encode_batch(buffer.len() as u64 - frame_len, start, &mut frame);
             buffer[..frame.len()].copy_from_slice(&frame);
         }
         if let Err(err) = active.write_all_at(&buffer, start) {
@@ -767,7 +747,7 @@ impl<F: Fs> Store<F> {
     /// of a failed write, poisons the store: every later write fails with
     /// `Poisoned` until it is reopened, and reads still work.
     pub fn set(&self, key: Key, value: Value) -> Result<(), Error> {
-        self.submit(Write::One(Record::Set { key, value }))
+        self.submit(Write::One(Op::Set { key, value }))
     }
 
     /// Applies every operation in `batch` with one append and one fsync,
@@ -793,7 +773,7 @@ impl<F: Fs> Store<F> {
         if !self.index.contains(key.as_bytes()) {
             return Ok(());
         }
-        self.submit(Write::One(Record::Delete { key }))
+        self.submit(Write::One(Op::Delete { key }))
     }
 
     /// Queues `write` and waits until it is done. If no group is being
@@ -887,54 +867,42 @@ impl<F: Fs> Store<F> {
             return (each(err, writes.len()), false);
         }
         let mut live = HashMap::new();
-        let records: Vec<&Record> = writes
+        let ops: Vec<&Op> = writes
             .iter()
-            .flat_map(Write::records)
+            .flat_map(Write::ops)
             .filter(|op| takes_effect(&self.index, op, &mut live))
             .collect();
-        if records.is_empty() {
+        if ops.is_empty() {
             return (writes.iter().map(|_| Ok(())).collect(), false);
         }
-        let offsets = match self.append_records(writing, &records) {
+        let offsets = match self.append(writing, &ops) {
             Ok(offsets) => offsets,
             Err(err) => return (each(err, writes.len()), false),
         };
         let segments = self.segments();
-        for (record, offset) in records.into_iter().zip(offsets) {
-            self.indexed(&segments, record, offset);
+        for (op, offset) in ops.into_iter().zip(offsets) {
+            self.indexed(&segments, op, offset);
         }
         (writes.iter().map(|_| Ok(())).collect(), true)
     }
 
-    /// Updates the index and the dead bytes for a Set or Delete record now
+    /// Updates the index and the dead bytes for the record of `op`, now
     /// durable at `offset`. A Delete's key must be live. Only the writer
     /// calls it.
-    fn indexed(&self, segments: &[Arc<Segment<F::File>>], record: &Record, offset: u64) {
+    fn indexed(&self, segments: &[Arc<Segment<F::File>>], op: &Op, offset: u64) {
         let died = |at: u64, len: u64| segments[segment_of(segments, at)].add_dead(len);
-        match record {
-            Record::Set { key, value } => {
-                let old = self.index.insert(
-                    key.as_bytes(),
-                    Entry {
-                        offset,
-                        value_len: u32::try_from(value.as_bytes().len())
-                            .expect("Value guarantees len fits u32"),
-                        key_len: entry_key_len(key),
-                    },
-                );
-                if let Some(old) = old {
+        let key = op.key().as_bytes();
+        match op {
+            Op::Set { .. } => {
+                if let Some(old) = self.index.insert(key, Entry::new(offset, op.fields())) {
                     died(old.offset, old.record_len());
                 }
             }
-            Record::Delete { key } => {
-                let old = self
-                    .index
-                    .remove(key.as_bytes())
-                    .expect("deleted keys are live");
+            Op::Delete { .. } => {
+                let old = self.index.remove(key).expect("deleted keys are live");
                 died(old.offset, old.record_len());
-                died(offset, record_len(entry_key_len(key), 0));
+                died(offset, op.fields().record_len());
             }
-            Record::Batch { .. } => unreachable!("not an index operation"),
         }
     }
 
@@ -1011,7 +979,7 @@ impl<F: Fs> Store<F> {
                 segment.base,
                 segment.end(),
                 false,
-                &mut |_, _| {},
+                &mut |_| Ok(()),
             )?;
             if end != segment.end() {
                 return Err(mismatch(end));
@@ -1103,22 +1071,20 @@ fn each(err: Error, n: usize) -> Vec<Result<(), Error>> {
     results
 }
 
-/// Whether the Set or Delete `op` writes anything, given the keys a group
-/// has already set (`true`) or deleted (`false`) in `live`, which it then
-/// updates: a delete of a key that isn't live writes nothing.
-fn takes_effect<'w>(index: &Index, op: &'w Record, live: &mut HashMap<&'w [u8], bool>) -> bool {
-    let (Record::Set { key, .. } | Record::Delete { key }) = op else {
-        unreachable!("only sets and deletes are written");
-    };
-    let is_set = matches!(op, Record::Set { .. });
+/// Whether `op` writes anything, given the keys a group has already set
+/// (`true`) or deleted (`false`) in `live`, which it then updates: a
+/// delete of a key that isn't live writes nothing.
+fn takes_effect<'w>(index: &Index, op: &'w Op, live: &mut HashMap<&'w [u8], bool>) -> bool {
+    let key = op.key().as_bytes();
+    let is_set = matches!(op, Op::Set { .. });
     let was_live = live
-        .get(key.as_bytes())
+        .get(key)
         .copied()
-        .unwrap_or_else(|| index.contains(key.as_bytes()));
+        .unwrap_or_else(|| index.contains(key));
     if !is_set && !was_live {
         return false;
     }
-    live.insert(key.as_bytes(), is_set);
+    live.insert(key, is_set);
     true
 }
 
@@ -1168,38 +1134,21 @@ fn starts_tail(
     }
 }
 
-/// Reads the records of `segment` from `start` to its end in one buffered
-/// pass, a batch's records as their own, and calls `each` with each one's
-/// offset, header bytes, payload bytes, header and operation.
+/// Calls `each` with every record of `segment` from `start` to its end, a
+/// batch's records as their own, checked as `scan` checks them.
 fn each_record<L: LogFile>(
     segment: &Segment<L>,
     start: u64,
-    mut each: impl FnMut(u64, &mut [u8; HEADER_LEN], &[u8], Header, IndexOp) -> Result<(), Error>,
+    mut each: impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    let end = segment.end();
-    let mut reader = BufReader::with_capacity(
-        hint::buffer_for(end - start, COMPACT_BUFFER),
-        segment.reader_at(start),
-    );
-    let mut header_buf = [0u8; HEADER_LEN];
-    let mut payload_buf = Vec::new();
-    let mut offset = start;
-    while offset < end {
-        if end - offset < HEADER_LEN as u64 {
-            return Err(Error::Corruption {
-                offset,
-                reason: CorruptionReason::CutShort,
-            });
-        }
-        read_header(&mut reader, &mut header_buf)?;
-        let header = decode_header(&header_buf, offset).map_err(|err| err.at(offset))?;
-        payload_buf.resize(header.payload_len(), 0);
-        reader.read_exact(&mut payload_buf)?;
-        let op = decode_index_op(header, &payload_buf).map_err(|err| err.at(offset))?;
-        each(offset, &mut header_buf, &payload_buf, header, op)?;
-        offset += header.record_len();
-    }
-    Ok(())
+    scan_into(
+        segment,
+        start,
+        segment.end(),
+        COMPACT_BUFFER,
+        &mut |_, _| {},
+        &mut each,
+    )
 }
 
 /// The shortest record there can be: a one-byte key and no value.
@@ -1470,7 +1419,7 @@ fn try_load<F: Fs>(
     let newest = segments.len() - 1;
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
         let (hinted, tail) = match &hint {
-            Some(file) => match read_hint(file, segment, &mut index, HINT_WINDOW, PARALLEL_FROM) {
+            Some(file) => match read_hint(file, segment, &mut index, WINDOW, PARALLEL_FROM) {
                 Ok((hinted, tail)) => (hinted, Some(tail)),
                 Err(invalid) => return Ok(Err((segment.base, invalid))),
             },
@@ -1499,13 +1448,14 @@ fn try_load<F: Fs>(
             hinted,
             len,
             i == newest,
-            &mut |fields, key| {
+            &mut |read| {
                 if let Some(hint) = &mut writer
-                    && let Err(err) = hint.push(fields, key)
+                    && let Err(err) = hint.push(read.header.fields(), read.op.key())
                 {
                     hint_not_written(segment.base, &err);
                     writer = None;
                 }
+                Ok(())
             },
         )?;
         if let Some(hint) = writer.take()
@@ -1544,18 +1494,17 @@ fn hint_not_written(base: u64, err: &io::Error) {
 /// Hints with fewer Set entries than this are read on one thread.
 const PARALLEL_FROM: u64 = 100_000;
 const MAX_THREADS: usize = 8;
-const HINT_WINDOW: usize = 2 << 20;
 
 /// Applies the records `segment`'s hint `file` describes to `index`, in
-/// order, a window of `window_bytes` at a time: on one thread below
-/// `parallel_from` Set entries, on up to `MAX_THREADS` from there. Returns
-/// the log offset the hint covers to, and where to extend it from. On
-/// `Err`, what it applied must be thrown away.
+/// order, `window` at a time: on one thread below `parallel_from` Set
+/// entries, on up to `MAX_THREADS` from there. Returns the log offset the
+/// hint covers to, and where to extend it from. On `Err`, what it applied
+/// must be thrown away.
 fn read_hint<L: LogFile>(
     file: &impl LogFile,
     segment: &Segment<L>,
     index: &mut Index,
-    window_bytes: usize,
+    window: usize,
     parallel_from: u64,
 ) -> Result<(u64, hint::Tail), hint::Invalid> {
     let trailer = hint::trailer(file)?;
@@ -1570,32 +1519,27 @@ fn read_hint<L: LogFile>(
             .min(MAX_THREADS)
     };
     let base = segment.base;
-    let tail = hint::read_entries(file, trailer, window_bytes, |window| {
-        let changes: Vec<(&[u8], Option<Entry>)> = window
-            .entries()
-            .filter_map(|(fields, key, offset)| match fields.kind {
-                Kind::Set => Some((
-                    key,
-                    Some(Entry {
-                        offset: base + offset,
-                        value_len: fields.value_len,
-                        key_len: fields.key_len,
-                    }),
-                )),
-                Kind::Delete => Some((key, None)),
-                Kind::Batch => None,
-            })
-            .collect();
-        index.apply_in_order(threads, &changes);
+    let mut changes = Window::default();
+    let tail = hint::read_entries(file, trailer, |fields, key, offset| {
+        let entry = match fields.kind {
+            Kind::Set => Some(Entry::new(base + offset, fields)),
+            Kind::Delete => None,
+            Kind::Batch => return,
+        };
+        changes.push(key, entry);
+        if changes.changes.len() == window {
+            mem::take(&mut changes).apply_to(index, threads);
+        }
     })?;
+    changes.apply_to(index, threads);
     Ok((base + trailer.log_len, tail))
 }
 
 /// Scans of fewer bytes than this apply each record as it is read, on one
 /// thread.
 const PARALLEL_SCAN_FROM: u64 = 16 << 20;
-/// Records a parallel scan reads before applying them.
-const SCAN_WINDOW: usize = 1 << 16;
+/// Records a parallel scan or hint read takes before applying them.
+const WINDOW: usize = 1 << 16;
 const SCAN_BUFFER: usize = 1 << 20;
 
 /// Applies the records from `start` to `len` to `index`, and returns where
@@ -1607,14 +1551,15 @@ const SCAN_BUFFER: usize = 1 << 20;
 /// its start, so `repair` moves the whole batch. From `PARALLEL_SCAN_FROM`
 /// bytes, the index takes the records a window at a time on up to
 /// `MAX_THREADS` threads. Calls `record` with every record read, in log
-/// order, Batch records too, including any in a torn tail.
+/// order, Batch records too, including any in a torn tail; an error from
+/// it stops the scan.
 fn scan(
     file: &impl LogFile,
     index: &mut Index,
     start: u64,
     len: u64,
     newest: bool,
-    record: &mut impl FnMut(Fields, &[u8]),
+    record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<u64, Error> {
     let threads = if len - start < PARALLEL_SCAN_FROM {
         1
@@ -1702,14 +1647,15 @@ fn scan_on(
     start: u64,
     len: u64,
     threads: usize,
-    record: &mut impl FnMut(Fields, &[u8]),
+    record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if threads == 1 {
         return scan_into(
             file,
             start,
             len,
-            &mut |offset, op| apply(index, offset, op),
+            SCAN_BUFFER,
+            &mut |key, entry| apply(index, &key, entry),
             record,
         );
     }
@@ -1729,9 +1675,10 @@ fn scan_on(
             file,
             start,
             len,
-            &mut |offset, op| {
-                window.push(offset, op);
-                if window.changes.len() == SCAN_WINDOW {
+            SCAN_BUFFER,
+            &mut |key, entry| {
+                window.push(key.as_bytes(), entry);
+                if window.changes.len() == WINDOW {
                     sent(mem::take(&mut window));
                 }
             },
@@ -1747,31 +1694,45 @@ fn scan_on(
     })
 }
 
-/// Calls `sink` with each record from `start` to `len` that is to be
-/// applied, in order, with its offset, and `record` with every record read.
+/// A record a scan read: where it is, its header and operation, and its
+/// bytes as read, which the callee may change.
+struct Scanned<'r> {
+    offset: u64,
+    header: Header,
+    op: &'r IndexOp,
+    header_bytes: &'r mut [u8; HEADER_LEN],
+    payload: &'r [u8],
+}
+
+/// Reads the records from `start` to `len` through a buffer of up to
+/// `buffer` bytes. Calls `record` with every record read, and `sink` with
+/// the key and new index entry, `None` for a Delete, of each Set and Delete
+/// to apply, in order: a batch's once all of it has been read.
 fn scan_into(
     file: &impl LogFile,
     start: u64,
     len: u64,
-    sink: &mut impl FnMut(u64, IndexOp),
-    record: &mut impl FnMut(Fields, &[u8]),
+    buffer: usize,
+    sink: &mut impl FnMut(Key, Option<Entry>),
+    record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut reader = Reader {
         inner: BufReader::with_capacity(
-            hint::buffer_for(len - start, SCAN_BUFFER),
+            hint::buffer_for(len - start, buffer),
             file.reader_at(start),
         ),
-        header_buf: [0u8; HEADER_LEN],
-        payload_buf: Vec::new(),
+        header_bytes: [0u8; HEADER_LEN],
+        payload: Vec::new(),
     };
     let mut batch = Vec::new();
     let mut offset = start;
     while offset < len {
         let (header, op) = reader.next(offset, len, Place::Top)?;
-        record(header.fields(), key_of(&op));
+        reader.show(offset, header, &op, record)?;
         let record_len = header.record_len();
         let IndexOp::Batch { body_len } = op else {
-            sink(offset, op);
+            let (key, entry) = change(offset, header, op);
+            sink(key, entry);
             offset += record_len;
             continue;
         };
@@ -1788,16 +1749,28 @@ fn scan_into(
             let (header, op) = reader
                 .next(at, body_end, Place::Inner)
                 .map_err(|err| err.moved_to(offset))?;
-            record(header.fields(), key_of(&op));
-            batch.push((at, op));
+            reader
+                .show(at, header, &op, record)
+                .map_err(|err| err.moved_to(offset))?;
+            batch.push(change(at, header, op));
             at += header.record_len();
         }
-        for (at, op) in batch.drain(..) {
-            sink(at, op);
+        for (key, entry) in batch.drain(..) {
+            sink(key, entry);
         }
         offset = body_end;
     }
     Ok(())
+}
+
+/// The key of the Set or Delete record at `offset`, and its index entry,
+/// `None` for a Delete.
+fn change(offset: u64, header: Header, op: IndexOp) -> (Key, Option<Entry>) {
+    match op {
+        IndexOp::Set { key } => (key, Some(Entry::new(offset, header.fields()))),
+        IndexOp::Delete { key } => (key, None),
+        IndexOp::Batch { .. } => unreachable!("scan_into reads a batch's records itself"),
+    }
 }
 
 fn bad_batch_at(offset: u64) -> Error {
@@ -1816,21 +1789,8 @@ struct Window {
 }
 
 impl Window {
-    fn push(&mut self, offset: u64, op: IndexOp) {
-        let (key, entry) = match op {
-            IndexOp::Set { key, value_len } => {
-                let key_len = entry_key_len(&key);
-                let entry = Entry {
-                    offset,
-                    value_len,
-                    key_len,
-                };
-                (key, Some(entry))
-            }
-            IndexOp::Delete { key } => (key, None),
-            IndexOp::Batch { .. } => unreachable!("scan handles batches"),
-        };
-        self.keys.extend_from_slice(key.as_bytes());
+    fn push(&mut self, key: &[u8], entry: Option<Entry>) {
+        self.keys.extend_from_slice(key);
         self.changes.push((self.keys.len(), entry));
     }
 
@@ -1849,31 +1809,22 @@ impl Window {
     }
 }
 
-fn apply(index: &mut Index, offset: u64, op: IndexOp) {
-    match op {
-        IndexOp::Set { key, value_len } => {
-            let key_len = entry_key_len(&key);
-            index.insert(
-                key.as_bytes(),
-                Entry {
-                    offset,
-                    value_len,
-                    key_len,
-                },
-            );
+fn apply(index: &mut Index, key: &Key, entry: Option<Entry>) {
+    match entry {
+        Some(entry) => {
+            index.insert(key.as_bytes(), entry);
         }
-        IndexOp::Delete { key } => {
+        None => {
             index.remove(key.as_bytes());
         }
-        IndexOp::Batch { .. } => unreachable!("scan handles batches"),
     }
 }
 
-/// Reads records one after another for `scan`.
+/// Reads records one after another for `scan_into`.
 struct Reader<R> {
     inner: BufReader<R>,
-    header_buf: [u8; HEADER_LEN],
-    payload_buf: Vec<u8>,
+    header_bytes: [u8; HEADER_LEN],
+    payload: Vec<u8>,
 }
 
 impl<R: Read> Reader<R> {
@@ -1892,30 +1843,36 @@ impl<R: Read> Reader<R> {
         if end - offset < HEADER_LEN as u64 {
             return Err(cut_short);
         }
-        read_header(&mut self.inner, &mut self.header_buf)?;
-        let header = decode_header(&self.header_buf, offset).map_err(|err| err.at(offset))?;
+        read_header(&mut self.inner, &mut self.header_bytes)?;
+        let header = decode_header(&self.header_bytes, offset).map_err(|err| err.at(offset))?;
         if header.fields().place != place {
             return Err(bad_batch_at(offset));
         }
         if end - offset < header.record_len() {
             return Err(cut_short);
         }
-        self.payload_buf.resize(header.payload_len(), 0u8);
-        self.inner.read_exact(&mut self.payload_buf)?;
-        let op = decode_index_op(header, &self.payload_buf).map_err(|err| err.at(offset))?;
-        Ok((header, op))
+        self.payload.resize(header.payload_len(), 0u8);
+        self.inner.read_exact(&mut self.payload)?;
+        check_payload(header, &self.payload).map_err(|err| err.at(offset))?;
+        Ok((header, index_op(header, &self.payload)))
     }
-}
 
-fn key_of(op: &IndexOp) -> &[u8] {
-    match op {
-        IndexOp::Set { key, .. } | IndexOp::Delete { key } => key.as_bytes(),
-        IndexOp::Batch { .. } => &[],
+    /// Shows `record` the record `next` just read.
+    fn show(
+        &mut self,
+        offset: u64,
+        header: Header,
+        op: &IndexOp,
+        record: &mut impl FnMut(Scanned) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        record(Scanned {
+            offset,
+            header,
+            op,
+            header_bytes: &mut self.header_bytes,
+            payload: &self.payload,
+        })
     }
-}
-
-fn entry_key_len(key: &Key) -> u16 {
-    u16::try_from(key.as_bytes().len()).expect("Key guarantees len fits u16")
 }
 
 /// Removes `path`. Returns whether it was there.
@@ -1995,34 +1952,30 @@ mod tests {
         file.write_all_at(bytes, FILE_HEADER_LEN + offset).unwrap();
     }
 
-    /// `records`, each on its own, the first at `start`.
-    fn encoded_at(start: u64, records: &[Record]) -> Vec<u8> {
+    /// The records of `ops`, each on its own, the first at `start`.
+    fn encoded_at(start: u64, ops: &[Op]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        for record in records {
-            encode(record, Place::Top, start + bytes.len() as u64, &mut bytes);
+        for op in ops {
+            encode_op(op, Place::Top, start + bytes.len() as u64, &mut bytes);
         }
         bytes
     }
 
-    fn encoded(records: &[Record]) -> Vec<u8> {
-        encoded_at(0, records)
+    fn encoded(ops: &[Op]) -> Vec<u8> {
+        encoded_at(0, ops)
     }
 
-    /// `records` inside one Batch record at `start`, as an append of more
-    /// than one writes them.
-    fn batched_at(start: u64, records: &[Record]) -> Vec<u8> {
+    /// The records of `ops` inside one Batch record at `start`, as an
+    /// append of more than one writes them.
+    fn batched_at(start: u64, ops: &[Op]) -> Vec<u8> {
         let frame = record_len(0, BATCH_PAYLOAD_LEN);
         let mut body = Vec::new();
-        for record in records {
+        for op in ops {
             let offset = start + frame + body.len() as u64;
-            encode(record, Place::Inner, offset, &mut body);
+            encode_op(op, Place::Inner, offset, &mut body);
         }
-        let mut bytes = encoded_at(
-            start,
-            &[Record::Batch {
-                body_len: body.len() as u64,
-            }],
-        );
+        let mut bytes = Vec::new();
+        encode_batch(body.len() as u64, start, &mut bytes);
         bytes.extend(body);
         bytes
     }
@@ -2645,8 +2598,8 @@ mod tests {
         names
     }
 
-    fn set_record(k: &[u8], v: &[u8]) -> Record {
-        Record::Set {
+    fn set_record(k: &[u8], v: &[u8]) -> Op {
+        Op::Set {
             key: key(k),
             value: value(v),
         }
@@ -3262,8 +3215,8 @@ mod tests {
         batch
     }
 
-    fn delete_record(k: &[u8]) -> Record {
-        Record::Delete { key: key(k) }
+    fn delete_record(k: &[u8]) -> Op {
+        Op::Delete { key: key(k) }
     }
 
     #[test]
@@ -3397,16 +3350,18 @@ mod tests {
 
     #[test]
     fn a_batch_inside_a_batch_or_a_record_past_its_end_is_corrupt() {
-        let mut nested = encoded(&[Record::Batch { body_len: 48 }]);
+        let mut nested = Vec::new();
+        encode_batch(48, 0, &mut nested);
         encode(
             &Record::Batch { body_len: 21 },
             Place::Inner,
             27,
             &mut nested,
         );
-        encode(&set_record(b"a", b"1"), Place::Inner, 54, &mut nested);
-        let mut short = encoded(&[Record::Batch { body_len: 10 }]);
-        encode(&set_record(b"a", b"1"), Place::Inner, 27, &mut short);
+        encode_op(&set_record(b"a", b"1"), Place::Inner, 54, &mut nested);
+        let mut short = Vec::new();
+        encode_batch(10, 0, &mut short);
+        encode_op(&set_record(b"a", b"1"), Place::Inner, 27, &mut short);
         for mut log in [nested, short] {
             log.extend(encoded_at(log.len() as u64, &[set_record(b"b", b"2")]));
             let tmp = tempfile::tempdir().unwrap();
@@ -3535,9 +3490,9 @@ mod tests {
             log_bytes(tmp.path()).len() as u64,
         );
         let mut one = Index::new();
-        let (len_one, _) = read_hint(&file, &segment, &mut one, HINT_WINDOW, u64::MAX).unwrap();
+        let (len_one, _) = read_hint(&file, &segment, &mut one, WINDOW, u64::MAX).unwrap();
         let mut many = Index::new();
-        let (len_many, _) = read_hint(&file, &segment, &mut many, 4096, 0).unwrap();
+        let (len_many, _) = read_hint(&file, &segment, &mut many, 100, 0).unwrap();
 
         assert_eq!((len_one, len_many), (segment.end(), segment.end()));
         assert_eq!(many.len(), 3000);
@@ -3562,15 +3517,15 @@ mod tests {
                 set_at = at;
             }
             let records = if i % 7 == 3 {
-                encoded_at(at, &[Record::Delete { key: k(i) }])
+                encoded_at(at, &[Op::Delete { key: k(i) }])
             } else if i % 1000 == 0 {
-                let set = Record::Set {
+                let set = Op::Set {
                     key: k(i),
                     value: value(b"batched"),
                 };
-                batched_at(at, &[set, Record::Delete { key: k(i + 1) }])
+                batched_at(at, &[set, Op::Delete { key: k(i + 1) }])
             } else {
-                let set = Record::Set {
+                let set = Op::Set {
                     key: k(i),
                     value: value(&i.to_le_bytes()),
                 };
@@ -3595,7 +3550,7 @@ mod tests {
         for (index, threads) in [(&mut one, 1), (&mut many, 4)] {
             assert!(
                 matches!(
-                    scan_on(&file, index, 0, len, threads, &mut |_, _| {}),
+                    scan_on(&file, index, 0, len, threads, &mut |_| Ok(())),
                     Err(Error::Corruption {
                         offset,
                         reason: CorruptionReason::CutShort
@@ -3628,7 +3583,7 @@ mod tests {
                         0,
                         log.len() as u64,
                         threads,
-                        &mut |_, _| {},
+                        &mut |_| Ok(()),
                     ),
                     Err(Error::Corruption {
                         offset,

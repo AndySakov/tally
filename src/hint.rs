@@ -146,50 +146,20 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     })
 }
 
-/// Entries whose fields have been checked, in log order.
-#[derive(Debug, Default)]
-pub(crate) struct Window {
-    bytes: Vec<u8>,
-    offset: u64,
-}
-
-impl Window {
-    /// Each entry's fields, key and record offset from the segment's start.
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (Fields, &[u8], u64)> {
-        let mut at = 0;
-        let mut offset = self.offset;
-        std::iter::from_fn(move || {
-            let bytes = self.bytes.get(at..at + FIELDS_LEN)?;
-            let fields = decode_fields(bytes.try_into().unwrap()).expect("read_entries checked it");
-            let key_start = at + FIELDS_LEN;
-            let key = &self.bytes[key_start..key_start + usize::from(fields.key_len)];
-            let entry = (fields, key, offset);
-            at = key_start + key.len();
-            offset += fields.record_len();
-            Some(entry)
-        })
-    }
-
-    fn clear(&mut self) {
-        self.bytes.clear();
-    }
-}
-
 /// A read buffer of `most` bytes, or of `len` if that is less: a 1 MiB
 /// buffer is zeroed before its first read.
 pub(crate) fn buffer_for(len: u64, most: usize) -> usize {
     usize::try_from(len).map_or(most, |len| len.min(most))
 }
 
-/// Checks each entry's fields and passes them to `window` in windows of
-/// about `window_bytes`, then checks the checksum and that the entries
-/// account for exactly `trailer`. On `Err`, whatever `window` saw must be
-/// thrown away.
+/// Checks each entry's fields and passes them to `entry` with its key and
+/// its record's offset from the segment's start, in log order, then checks
+/// the checksum and that the entries account for exactly `trailer`. On
+/// `Err`, whatever `entry` saw must be thrown away.
 pub(crate) fn read_entries(
     file: &impl LogFile,
     trailer: Trailer,
-    window_bytes: usize,
-    mut window: impl FnMut(&Window),
+    mut entry: impl FnMut(Fields, &[u8], u64),
 ) -> Result<Tail, Invalid> {
     let size = file.size()?;
     let entries_end = size - TRAILER_LEN;
@@ -213,7 +183,6 @@ pub(crate) fn read_entries(
     let mut count = 0u64;
     let mut header = [0u8; FIELDS_LEN];
     let mut key = Vec::new();
-    let mut current = Window::default();
     while at < entries_end {
         if entries_end - at < FIELDS_LEN as u64 {
             return Err(Invalid("torn entry"));
@@ -233,22 +202,11 @@ pub(crate) fn read_entries(
         {
             return Err(Invalid("entries run past the log length"));
         }
-        if current.bytes.is_empty() {
-            current.offset = offset;
-        }
-        current.bytes.extend_from_slice(&header);
-        current.bytes.extend_from_slice(&key);
-        if current.bytes.len() >= window_bytes {
-            window(&current);
-            current.clear();
-        }
+        entry(fields, &key, offset);
         offset += fields.record_len();
         if fields.kind == Kind::Set {
             count += 1;
         }
-    }
-    if !current.bytes.is_empty() {
-        window(&current);
     }
 
     let checksum = reader.get_ref().checksum;
@@ -321,25 +279,16 @@ mod tests {
 
     type Entries = Vec<(Fields, Vec<u8>, u64)>;
 
-    fn windows(bytes: &[u8], window_bytes: usize) -> Result<Vec<Entries>, Invalid> {
+    fn read(bytes: &[u8]) -> Result<Entries, Invalid> {
         let fs = MemFs::new();
         fs.put(Path::new("/hint"), bytes);
         let file = fs.open_existing(Path::new("/hint")).unwrap();
         let trailer = trailer(&file)?;
         let mut seen = Vec::new();
-        read_entries(&file, trailer, window_bytes, |window| {
-            seen.push(
-                window
-                    .entries()
-                    .map(|(fields, key, offset)| (fields, key.to_vec(), offset))
-                    .collect(),
-            )
+        read_entries(&file, trailer, |fields, key, offset| {
+            seen.push((fields, key.to_vec(), offset))
         })?;
         Ok(seen)
-    }
-
-    fn read(bytes: &[u8]) -> Result<Entries, Invalid> {
-        Ok(windows(bytes, 1 << 20)?.into_iter().flatten().collect())
     }
 
     fn at(entries: &[(Fields, Vec<u8>)], offsets: &[u64]) -> Entries {
@@ -406,7 +355,7 @@ mod tests {
         let mut writer = Writer::new(fs.open_or_create(path).unwrap());
         writer.push(set(b"a", 2).0, b"a").unwrap();
         let file = writer.finish(22).unwrap();
-        let tail = read_entries(&file, trailer(&file).unwrap(), 1 << 20, |_| {}).unwrap();
+        let tail = read_entries(&file, trailer(&file).unwrap(), |_, _, _| {}).unwrap();
         let mut writer = Writer::extend(file, tail).unwrap();
         let (fields, key) = fields(Kind::Delete, b"a", 0);
         writer.push(fields, &key).unwrap();
@@ -456,28 +405,6 @@ mod tests {
         let crc_at = bytes.len() - 8;
         let crc = crc_fast::checksum(CrcAlgorithm::Crc64Nvme, &bytes[..crc_at]);
         bytes[crc_at..].copy_from_slice(&crc.to_le_bytes());
-    }
-
-    #[test]
-    fn entries_are_cut_into_windows_in_log_order() {
-        // Entries of 8, 9, 8, 9 and 8 bytes; windows close at 15 bytes.
-        let entries = [
-            set(b"a", 2),
-            set(b"bc", 1),
-            set(b"d", 1),
-            set(b"ef", 3),
-            set(b"g", 1),
-        ];
-        let bytes = write(&entries, 22 + 22 + 21 + 24 + 21);
-        let offsets = [0, 22, 44, 65, 89];
-        assert_eq!(
-            windows(&bytes, 15),
-            Ok(vec![
-                at(&entries[..2], &offsets[..2]),
-                at(&entries[2..4], &offsets[2..4]),
-                at(&entries[4..], &offsets[4..]),
-            ])
-        );
     }
 
     #[test]
