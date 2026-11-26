@@ -117,9 +117,7 @@ impl Index {
     /// A panic while a shard is locked can't leave its map half changed,
     /// so a poisoned lock is used as it is.
     fn read(&self, hash: u128) -> RwLockReadGuard<'_, Map> {
-        self.shards[shard_of(hash)]
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.shard(shard_of(hash))
     }
 
     fn write(&self, hash: u128) -> RwLockWriteGuard<'_, Map> {

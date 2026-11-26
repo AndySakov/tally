@@ -20,7 +20,7 @@ use std::io::{self, BufReader, Read};
 
 use crc_fast::{CrcAlgorithm, Digest};
 
-use crate::fs::LogFile;
+use crate::fs::{LogFile, buffer_for};
 use crate::record::{FIELDS_LEN, Fields, Kind, decode_fields};
 
 const MAGIC: &[u8; 4] = b"TLYH";
@@ -146,12 +146,6 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     })
 }
 
-/// A read buffer of `most` bytes, or of `len` if that is less: a 1 MiB
-/// buffer is zeroed before its first read.
-pub(crate) fn buffer_for(len: u64, most: usize) -> usize {
-    usize::try_from(len).map_or(most, |len| len.min(most))
-}
-
 /// Checks each entry's fields and passes them to `entry` with its key and
 /// its record's offset from the segment's start, in log order, then checks
 /// the checksum and that the entries account for exactly `trailer`. On
@@ -164,7 +158,7 @@ pub(crate) fn read_entries(
     let size = file.size()?;
     let entries_end = size - TRAILER_LEN;
     // Checksummed under the buffer, so the checksum takes a buffer at a
-    // time: fed an entry at a time, it took most of the time to read one.
+    // time, not an entry.
     let mut reader = BufReader::with_capacity(
         buffer_for(entries_end, FLUSH_AT),
         Checksummed {
@@ -461,11 +455,5 @@ mod tests {
             read(&bytes),
             Err(Invalid("entries don't match the trailer"))
         );
-    }
-
-    #[test]
-    fn a_read_buffer_is_no_larger_than_what_it_reads() {
-        assert_eq!(buffer_for(53, 1 << 20), 53);
-        assert_eq!(buffer_for(5 << 20, 1 << 20), 1 << 20);
     }
 }

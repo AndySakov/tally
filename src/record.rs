@@ -3,9 +3,8 @@
 use crc_fast::CrcAlgorithm;
 use crc32c::{crc32c, crc32c_append};
 
-use crate::{
-    CorruptionReason, DecodeError, Field, Key, MAX_KEY_LEN, MAX_VALUE_LEN, UnsupportedReason, Value,
-};
+use crate::error::DecodeError;
+use crate::{CorruptionReason, Field, Key, MAX_KEY_LEN, MAX_VALUE_LEN, UnsupportedReason, Value};
 
 /// Header checksum, type byte, key length, value length, payload checksum.
 pub const HEADER_LEN: usize = 4 + 1 + 2 + 4 + 8;

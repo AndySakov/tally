@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{mem, thread};
 
 use crate::filter::Filter;
-use crate::fs::{Fs, LogFile, OsFs};
+use crate::fs::{Fs, LogFile, OsFs, buffer_for};
 use crate::hint;
 use crate::index::{Entry, Index};
 use crate::options::{AutoCompact, Options};
@@ -88,6 +88,22 @@ pub struct Store<F: Fs = OsFs> {
 
 type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
 
+/// What `copy_live` wrote.
+struct Copied<L: LogFile> {
+    /// The new segment, fsynced, under its temporary name.
+    output: Segment<L>,
+    /// Its hint, without the trailer.
+    hint: hint::Writer<L>,
+    /// The bytes copied.
+    written: u64,
+    /// Where each record copied was, in the order copied.
+    moved: Vec<u64>,
+    /// The keys of the Delete records that must outlive their segment:
+    /// the key isn't live, and a kept segment older than it may hold a Set
+    /// of it.
+    carry: BTreeSet<Key>,
+}
+
 /// Holds `Store::writing`, and is the evidence that the caller does. A
 /// thread that panics holding it may have left the log half changed, so
 /// the store is poisoned.
@@ -136,7 +152,7 @@ struct Queue {
 }
 
 /// The share of the last fsync's time, in percent, a leader waits for its
-/// group to fill (DESIGN.md, Group commit). 25 and 50 gained nothing more.
+/// group to fill (DESIGN.md, Group commit).
 const GROUP_WAIT_PERCENT: u64 = 10;
 
 /// A group takes waiting writes until it has this many, or this many bytes.
@@ -160,9 +176,6 @@ impl Store {
     /// tally fails with `Unsupported`. Takes an exclusive lock on
     /// `tally.lock`: a second `open` of the same directory fails with
     /// `Locked` until this `Store` is dropped.
-    ///
-    /// Creating any file requires an fsync of its parent directory (see
-    /// DESIGN.md, New files).
     ///
     /// A torn tail of the newest segment is saved to a side file unless it
     /// is all zeros, then truncated, fsynced and logged as a warning before
@@ -393,12 +406,22 @@ impl<F: Fs> Store<F> {
         let base = segments.last().expect("there is always a segment").end();
         let copy_path = self.dir.join(compact_name(base));
         let hint_path = self.dir.join(hint_name(base));
-        let mut moved = Vec::with_capacity(self.index.len());
-        let mut carry = BTreeSet::new();
-        let copied = self.copy_live(
-            &segments, &copy_path, &hint_path, chosen, &mut moved, &mut carry,
-        );
-        let (output, hint, written) = match copied {
+        // The copy is complete and durable before it takes a segment's name,
+        // so the newest segment never holds more than one append that a
+        // crash could tear.
+        let copied = self
+            .copy_live(&segments, &copy_path, &hint_path, chosen)
+            .and_then(|copied| {
+                self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
+                Ok(copied)
+            });
+        let Copied {
+            output,
+            hint,
+            written,
+            moved,
+            carry,
+        } = match copied {
             Ok(copied) => copied,
             Err(err) => {
                 let _ = remove_if_present(&self.fs, &copy_path);
@@ -406,14 +429,6 @@ impl<F: Fs> Store<F> {
                 return Err(err);
             }
         };
-        // The copy is complete and durable before it takes a segment's name,
-        // so the newest segment never holds more than one append that a
-        // crash could tear.
-        if let Err(err) = self.fs.rename(&copy_path, &self.dir.join(log_name(base))) {
-            let _ = remove_if_present(&self.fs, &copy_path);
-            let _ = remove_if_present(&self.fs, &hint_path);
-            return Err(err.into());
-        }
         if let Err(err) = self.fs.sync_dir(&self.dir) {
             return Err(self.poison(err));
         }
@@ -475,28 +490,23 @@ impl<F: Fs> Store<F> {
 
     /// Writes each live record of the `chosen` segments to a new segment at
     /// `copy_path`, based where the log ends, and its key and lengths to a
-    /// hint at `hint_path`, pushing its old offset to `moved`, in the same
-    /// order. Adds to `carry` the key of each Delete record that must
-    /// outlive its segment: its key isn't live, and a kept segment older
-    /// than it may hold a Set of it. Fsyncs the copy, not the hint, which is
-    /// returned without its trailer, along with the bytes copied. One
-    /// buffered pass per segment: reading the dead records in between costs
-    /// less than a positioned read per live one.
-    #[allow(clippy::type_complexity)]
+    /// hint at `hint_path`, and fsyncs the copy. One buffered pass per
+    /// segment: reading the dead records in between costs less than a
+    /// positioned read per live one.
     fn copy_live(
         &self,
         segments: &[Arc<Segment<F::File>>],
         copy_path: &Path,
         hint_path: &Path,
         chosen: &[u64],
-        moved: &mut Vec<u64>,
-        carry: &mut BTreeSet<Key>,
-    ) -> Result<(Segment<F::File>, hint::Writer<F::File>, u64), Error> {
+    ) -> Result<Copied<F::File>, Error> {
         let base = segments.last().expect("there is always a segment").end();
         let output = create(&self.fs, copy_path, base)?;
         let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
         let mut hint = hint::Writer::new(hint_file);
+        let mut moved = Vec::with_capacity(self.index.len());
+        let mut carry = BTreeSet::new();
         let mut buffer = Vec::new();
         let mut written = 0u64;
         for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
@@ -539,7 +549,13 @@ impl<F: Fs> Store<F> {
         output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
         output.file.sync()?;
-        Ok((output, hint, written))
+        Ok(Copied {
+            output,
+            hint,
+            written,
+            moved,
+            carry,
+        })
     }
 
     /// Whether a segment older than `before` that is not being cleaned may
@@ -908,10 +924,10 @@ impl<F: Fs> Store<F> {
 
     /// Returns the value for `key`, or `None` if it isn't live.
     ///
-    /// Reads the record in one positioned read and
-    /// verifies both checksums and that the stored key equals `key`. Any failure is a
-    /// corruption error at the record's offset, never `None`. Takes no lock
-    /// while it reads, so it runs alongside writes and compaction.
+    /// Reads the record in one positioned read and verifies both checksums
+    /// and that the stored key equals `key`. Any failure is a corruption
+    /// error at the record's offset, never `None`. Takes no lock while it
+    /// reads, so it runs alongside writes and compaction.
     pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
         let Some((entry, segment)) = self
             .index
@@ -1253,11 +1269,6 @@ fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
     chosen
 }
 
-/// Opens every segment in `dir`, in log order, after removing hints whose
-/// segment is gone and copies a compaction left unfinished. Refuses a
-/// directory another version of tally wrote, and segments that overlap.
-/// A newest segment whose header a crash cut short is started again: no
-/// record was written to it before its header was fsynced.
 /// Where `repair` saves the bytes from log offset `offset`.
 fn corrupt_name(dir: &Path, offset: u64) -> PathBuf {
     dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"))
@@ -1315,6 +1326,11 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
     })
 }
 
+/// Opens every segment in `dir`, in log order, after removing hints whose
+/// segment is gone and copies a compaction left unfinished. Refuses a
+/// directory another version of tally wrote, and segments that overlap.
+/// A newest segment whose header a crash cut short is started again: no
+/// record was written to it before its header was fsynced.
 fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
     let names = fs.list(dir)?;
     if names.iter().any(|n| n == LOG_FILE_NAME) {
@@ -1374,8 +1390,8 @@ fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Err
 fn load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Result<Index, Error> {
     loop {
         match try_load(fs, dir, segments)? {
-            Ok(index) => return Ok(index),
-            Err((base, hint::Invalid(why))) => {
+            Loaded::Index(index) => return Ok(index),
+            Loaded::BadHint(base, hint::Invalid(why)) => {
                 log::warn!(
                     "ignored the hint for the segment at {base} ({why}); reading the segment instead"
                 );
@@ -1386,13 +1402,13 @@ fn load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Result<
     }
 }
 
-type HintFailure = (u64, hint::Invalid);
+enum Loaded {
+    Index(Index),
+    /// The hint of the segment at this base can't be used.
+    BadHint(u64, hint::Invalid),
+}
 
-fn try_load<F: Fs>(
-    fs: &F,
-    dir: &Path,
-    segments: &mut [Segment<F::File>],
-) -> Result<Result<Index, HintFailure>, Error> {
+fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Result<Loaded, Error> {
     let mut hints = Vec::with_capacity(segments.len());
     // The largest hint's Set count, not their sum: a key overwritten in
     // every segment is counted in each.
@@ -1404,7 +1420,7 @@ fn try_load<F: Fs>(
                     count = count.max(trailer.count.min(trailer.most_sets));
                     Some(file)
                 }
-                Err(invalid) => return Ok(Err((segment.base, invalid))),
+                Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
             },
             Err(err) if err.kind() == ErrorKind::NotFound => None,
             Err(err) => return Err(err.into()),
@@ -1421,7 +1437,7 @@ fn try_load<F: Fs>(
         let (hinted, tail) = match &hint {
             Some(file) => match read_hint(file, segment, &mut index, WINDOW, PARALLEL_FROM) {
                 Ok((hinted, tail)) => (hinted, Some(tail)),
-                Err(invalid) => return Ok(Err((segment.base, invalid))),
+                Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
             },
             None => (segment.base, None),
         };
@@ -1482,7 +1498,7 @@ fn try_load<F: Fs>(
             }
         }
     }
-    Ok(Ok(index))
+    Ok(Loaded::Index(index))
 }
 
 fn hint_not_written(base: u64, err: &io::Error) {
@@ -1494,6 +1510,16 @@ fn hint_not_written(base: u64, err: &io::Error) {
 /// Hints with fewer Set entries than this are read on one thread.
 const PARALLEL_FROM: u64 = 100_000;
 const MAX_THREADS: usize = 8;
+
+/// One thread for less `work` than `from`, else up to `MAX_THREADS`.
+fn threads_for(work: u64, from: u64) -> usize {
+    if work < from {
+        return 1;
+    }
+    thread::available_parallelism()
+        .map_or(1, NonZero::get)
+        .min(MAX_THREADS)
+}
 
 /// Applies the records `segment`'s hint `file` describes to `index`, in
 /// order, `window` at a time: on one thread below `parallel_from` Set
@@ -1511,13 +1537,7 @@ fn read_hint<L: LogFile>(
     if trailer.log_len > segment.len() {
         return Err(hint::Invalid("the segment is shorter than the hint says"));
     }
-    let threads = if trailer.count < parallel_from {
-        1
-    } else {
-        thread::available_parallelism()
-            .map_or(1, NonZero::get)
-            .min(MAX_THREADS)
-    };
+    let threads = threads_for(trailer.count, parallel_from);
     let base = segment.base;
     let mut changes = Window::default();
     let tail = hint::read_entries(file, trailer, |fields, key, offset| {
@@ -1561,13 +1581,7 @@ fn scan(
     newest: bool,
     record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<u64, Error> {
-    let threads = if len - start < PARALLEL_SCAN_FROM {
-        1
-    } else {
-        thread::available_parallelism()
-            .map_or(1, NonZero::get)
-            .min(MAX_THREADS)
-    };
+    let threads = threads_for(len - start, PARALLEL_SCAN_FROM);
     match scan_on(file, index, start, len, threads, record) {
         Err(Error::Corruption { offset, .. })
             if newest && !record_starts_after(file, offset, len)? =>
@@ -1717,10 +1731,7 @@ fn scan_into(
     record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut reader = Reader {
-        inner: BufReader::with_capacity(
-            hint::buffer_for(len - start, buffer),
-            file.reader_at(start),
-        ),
+        inner: BufReader::with_capacity(buffer_for(len - start, buffer), file.reader_at(start)),
         header_bytes: [0u8; HEADER_LEN],
         payload: Vec::new(),
     };

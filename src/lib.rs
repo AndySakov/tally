@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 mod batch;
-mod constants;
 mod error;
 mod filter;
 pub mod fs;
@@ -18,10 +17,8 @@ mod segment;
 mod store;
 
 pub use batch::Batch;
-pub use constants::{MAX_KEY_LEN, MAX_VALUE_LEN};
-pub(crate) use error::DecodeError;
 pub use error::{CorruptionReason, Error, Field, UnsupportedReason};
-pub use kv::{Key, Value};
+pub use kv::{Key, MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 pub use options::{AutoCompact, Options};
 pub use store::{Repaired, Store};
 
