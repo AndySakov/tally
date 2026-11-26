@@ -62,12 +62,17 @@ pub trait LogFile: sealed::Sealed {
 
     fn set_len(&self, len: u64) -> io::Result<()>;
 
-    /// Makes the contents and length durable. Returns the error instead of
-    /// panicking: the panic policy belongs to `Store`.
+    /// Makes the contents and length durable.
     fn sync(&self) -> io::Result<()>;
 
     /// Takes an exclusive lock, released when the file is dropped.
     fn try_lock(&self) -> Result<(), TryLockError>;
+}
+
+/// A buffer for reading `len` bytes with `reader_at`: `most` bytes, or
+/// `len` if that is less, since a buffer is zeroed before its first read.
+pub(crate) fn buffer_for(len: u64, most: usize) -> usize {
+    usize::try_from(len).map_or(most, |len| len.min(most))
 }
 
 /// The operating system's file system.
@@ -157,8 +162,7 @@ impl LogFile for OsFile {
     }
 
     fn sync(&self) -> io::Result<()> {
-        // Fuzzing can't observe durability, and a 5 ms fsync per run would
-        // cut fuzzing throughput a hundredfold.
+        // Fuzzing can't observe durability (DESIGN.md, Testing).
         if cfg!(fuzzing) {
             return Ok(());
         }
@@ -181,5 +185,16 @@ impl Read for OsReader<'_> {
         let n = self.file.read_at(buf, self.offset)?;
         self.offset += n as u64;
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_buffer_is_no_larger_than_what_it_reads() {
+        assert_eq!(buffer_for(53, 1 << 20), 53);
+        assert_eq!(buffer_for(5 << 20, 1 << 20), 1 << 20);
     }
 }

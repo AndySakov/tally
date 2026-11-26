@@ -21,7 +21,7 @@ use std::thread;
 
 use siphasher::sip128::SipHasher13;
 
-use crate::record;
+use crate::record::{self, Fields};
 
 /// Where a live key's latest Set record sits in the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +32,15 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// An entry for the record at `offset` with these fields.
+    pub fn new(offset: u64, fields: Fields) -> Entry {
+        Entry {
+            offset,
+            value_len: fields.value_len,
+            key_len: fields.key_len,
+        }
+    }
+
     /// Length on disk of the record the entry points at.
     pub fn record_len(&self) -> u64 {
         record::record_len(self.key_len, self.value_len)
@@ -108,9 +117,7 @@ impl Index {
     /// A panic while a shard is locked can't leave its map half changed,
     /// so a poisoned lock is used as it is.
     fn read(&self, hash: u128) -> RwLockReadGuard<'_, Map> {
-        self.shards[shard_of(hash)]
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.shard(shard_of(hash))
     }
 
     fn write(&self, hash: u128) -> RwLockWriteGuard<'_, Map> {
