@@ -25,7 +25,7 @@
 //! The power-cut simulation covers that.
 //!
 //! `cargo test --test kill` runs `TALLY_KILL_RUNS` runs (default 20) from
-//! `TALLY_KILL_SEED`. The done criterion is `TALLY_KILL_RUNS=1000`.
+//! `TALLY_KILL_SEED`. CI runs `TALLY_KILL_RUNS=1000` on Linux.
 
 use std::collections::BTreeMap;
 use std::io::Read;
