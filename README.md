@@ -143,8 +143,8 @@ The log is a run of segment files, each named for the log offset of its first re
 that names its format and base, so offsets in the index and in errors address the whole log. Compaction copies the
 live records of the segments it cleans into a new segment, under a temporary name until the copies are durable,
 with a hint file of its keys, then deletes the cleaned segments oldest first, fsyncing the directory
-after each. A Delete record is copied forward while an older, kept segment may still hold the value it hides.
-The new segment is durable before the first old one goes, so a crash at any point leaves the same live data.
-The lock lives on a separate `tally.lock`, which no compaction removes.
+after each. A Delete record is copied forward only while an older, kept segment may still hold a value it hides,
+which a filter of each segment's keys answers. The new segment is durable before the first old one goes, so a crash
+at any point leaves the same live data. The lock lives on a separate `tally.lock`, which no compaction removes.
 
 The on-disk format, durability contract, recovery rules and trade-offs are in [DESIGN.md](DESIGN.md).

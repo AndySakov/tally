@@ -6,8 +6,10 @@
 use std::fs::TryLockError;
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::filter::Filter;
 use crate::fs::sealed::Sealed;
 use crate::fs::{Fs, LogFile};
 
@@ -135,6 +137,9 @@ pub(crate) struct Segment<L> {
     len: AtomicU64,
     /// Bytes in the file no live key points at.
     dead: AtomicU64,
+    /// The keys it holds a Set record for, once a compaction has asked.
+    /// Only ever built for a sealed segment, which no longer changes.
+    pub sets: OnceLock<Filter>,
 }
 
 impl<L> Segment<L> {
@@ -144,6 +149,7 @@ impl<L> Segment<L> {
             file,
             len: AtomicU64::new(len),
             dead: AtomicU64::new(0),
+            sets: OnceLock::new(),
         }
     }
 
