@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use super::{
     LOG_FILE_NAME,
     repair::copy_to_end,
-    scan::{WINDOW, Window, scan, threads_for},
+    scan::{WINDOW, Window, applying, scan, threads_for},
 };
 use crate::fs::{Fs, LogFile};
 use crate::hint;
@@ -213,9 +213,9 @@ const PARALLEL_FROM: u64 = 100_000;
 
 /// Applies the records `segment`'s hint `file` describes to `index`, in
 /// order, `window` at a time: on one thread below `parallel_from` Set
-/// entries, on up to `MAX_THREADS` from there. Returns the log offset the
-/// hint covers to, and where to extend it from. On `Err`, what it applied
-/// must be thrown away.
+/// entries, from there on up to `MAX_THREADS` while this one reads on.
+/// Returns the log offset the hint covers to, and where to extend it from.
+/// On `Err`, what it applied must be thrown away.
 pub(super) fn read_hint<L: LogFile>(
     file: &impl LogFile,
     segment: &Segment<L>,
@@ -229,19 +229,22 @@ pub(super) fn read_hint<L: LogFile>(
     }
     let threads = threads_for(trailer.count, parallel_from);
     let base = segment.base;
-    let mut changes = Window::default();
-    let tail = hint::read_entries(file, trailer, |fields, key, offset| {
-        let entry = match fields.kind {
-            Kind::Set => Some(Entry::new(base + offset, fields)),
-            Kind::Delete => None,
-            Kind::Batch => return,
-        };
-        changes.push(key, entry);
-        if changes.len() == window {
-            mem::take(&mut changes).apply_to(index, threads);
-        }
+    let tail = applying(index, threads, |sent| {
+        let mut changes = Window::default();
+        let tail = hint::read_entries(file, trailer, |fields, key, offset| {
+            let entry = match fields.kind {
+                Kind::Set => Some(Entry::new(base + offset, fields)),
+                Kind::Delete => None,
+                Kind::Batch => return,
+            };
+            changes.push(key, entry);
+            if changes.len() == window {
+                sent(mem::take(&mut changes));
+            }
+        });
+        sent(changes);
+        tail
     })?;
-    changes.apply_to(index, threads);
     Ok((base + trailer.log_len, tail))
 }
 

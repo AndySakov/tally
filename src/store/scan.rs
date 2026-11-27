@@ -119,18 +119,8 @@ pub(super) fn scan_on(
             record,
         );
     }
-    let (send, receive) = mpsc::sync_channel::<Window>(1);
-    thread::scope(|scope| {
-        scope.spawn(move || {
-            for window in receive {
-                window.apply_to(index, threads);
-            }
-        });
+    applying(index, threads, |sent| {
         let mut window = Window::default();
-        let sent = |window| {
-            send.send(window)
-                .expect("the applier runs until the sender is dropped")
-        };
         let scanned = scan_into(
             file,
             start,
@@ -147,10 +137,36 @@ pub(super) fn scan_on(
         // Sent even after an error: the records in it all come before the
         // damage, which may be a torn tail.
         sent(window);
+        scanned
+    })
+}
+
+/// Calls `read` with `sent`, which hands a window to `index`: applied at
+/// once on one thread, else applied by `threads` threads while `read`
+/// reads on, one window behind.
+pub(super) fn applying<T>(
+    index: &mut Index,
+    threads: usize,
+    read: impl FnOnce(&mut dyn FnMut(Window)) -> T,
+) -> T {
+    if threads <= 1 {
+        return read(&mut |window| window.apply_to(index, 1));
+    }
+    let (send, receive) = mpsc::sync_channel::<Window>(1);
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            for window in receive {
+                window.apply_to(index, threads);
+            }
+        });
+        let result = read(&mut |window| {
+            send.send(window)
+                .expect("the applier runs until the sender is dropped");
+        });
         // The applier stops once the channel closes, and the scope waits
         // for it.
         drop(send);
-        scanned
+        result
     })
 }
 
