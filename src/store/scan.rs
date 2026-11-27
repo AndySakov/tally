@@ -253,8 +253,8 @@ fn bad_batch_at(offset: u64) -> Error {
     }
 }
 
-/// Records a scan has read and not yet applied, with their keys' bytes end
-/// to end in `keys`, and where each key ends.
+/// Changes a scan or a hint read has read and not yet applied, with
+/// their keys' bytes end to end in `keys`, and where each key ends.
 #[derive(Default)]
 pub(super) struct Window {
     keys: Vec<u8>,

@@ -154,7 +154,7 @@ A value whose bytes form a valid header for its own offset, which takes a CRC32C
 
 Recovery is idempotent: a crash during recovery followed by a rerun yields the same result. A rerun saves the same bytes to the same side file.
 
-A scan of 16 MiB or more (from `pos` to the segment's end) runs on several threads. This thread reads and checks the records as above, and hands the operations to an applier thread 65,536 at a time, then reads on while that window is applied. The applier (`Index::apply_in_order`) hashes the window's keys on up to 8 threads, then has each thread apply, in log order, the operations for the shards it owns. Every operation on a key falls in that key's shard, so they still apply in the order they were written. The window read before damage is applied too, since the damage may be a torn tail. Segments written by appends have no hint, so in steady state most of a log is scanned: at 10M keys after 20M random overwrites (2.6 GB in 10 segments, 7 with hints), `open` takes 1.8 s against 3.8 s on one thread. What remains is mostly this thread's reading: a `pread` per MiB, the checksums, and an allocation per key.
+A scan of 16 MiB or more (from `pos` to the segment's end) runs on several threads. This thread reads and checks the records as above, and hands the operations to an applier thread 65,536 at a time, then reads on while that window is applied. The applier (`Index::apply_in_order`) hashes the window's keys on up to 8 threads, then has each thread apply, in log order, the operations for the shards it owns. Every operation on a key falls in that key's shard, so they still apply in the order they were written. The window read before damage is applied too, since the damage may be a torn tail. Segments written by appends have no hint, so in steady state most of a log is scanned: at 10M keys after 20M random overwrites (2.6 GB in 10 segments, 7 with hints), `open` takes 1.8 s against 3.8 s on one thread. What remains is mostly this thread's reading: a `pread` per MiB and the checksums.
 
 ### Repair
 
@@ -210,7 +210,7 @@ entry: type u8 | key_len u16 | value_len u32 | key
 - Version 3. An entry is its record's header without the two checksums (bytes 4 to 11), then the key: Set, Delete and Batch records each have one, and an entry must pass the same type, length and validity rules as a header. A Batch entry has no key; the records of its body follow it as their own entries, with `0x40` in their types. The checksum is CRC-64/NVME, for the same reason as the records': a hint that passes it wrongly would put wrong offsets in the index, and compaction would then drop what they hide.
 - A hint of another version is rejected like any other bad hint: removed, and its segment read in full.
 
-- Offsets are not stored. A hint has an entry for every record from the segment's start, end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after a compaction, and the Delete records its step 5 appended) are scanned.
+- Offsets are not stored. A hint has an entry for every record from the segment's start, end to end, so each offset is the segment's base plus the sum of the record lengths before it, and the sum of them all must equal `log_len`, the bytes it covers. That doubles as a check that the hint and the segment agree. Records after `log_len` (writes after a compaction) are scanned.
 - `count` is the number of Set entries, at most the keys the hint adds. `open` reads every trailer first, with one positioned read each, and sizes the index for the largest count, never more than the log could hold (its length over 17, the shortest record), since the count is unchecked until every entry is read. Not the sum: a key overwritten in every segment would be counted once per segment. On the store below that sum is about 20M for 10M live keys, and sizing for it would raise the peak from 854 MB to 1.14 GB; past the largest hint, the map grows a shard at a time.
 - The count and log length trail the entries because files are only written at the end, and neither is known until the hint is done.
 - The checksum covers every byte before it. It is computed under the read buffer, a buffer at a time: fed an entry at a time, CRC-64 takes most of the time to read a hint, and `open` of a compacted 10M-key store took 0.70 s instead of 0.40 s, measured with each window applied before the next was read. Entries go into the index every segment shares before the checksum is checked. If anything fails, what this hint changed can't be told apart from what earlier segments did, so the hint is removed and the whole index is built again without it.
@@ -222,7 +222,7 @@ On `open`, a hint is used only if its magic, version and checksum hold, every en
 
 The cost is that `open` does not check the checksums of records the hint covers, which, with the hints `open` writes, is every sealed segment after its first `open`. Damage there shows up as a corruption error from `get`, or from the next compaction, which reads every record; `repair` then finds it with a full scan, and `verify` checks every record on demand. This is the Bitcask trade.
 
-At 10M live records of 100 bytes in one segment, `open` from the hint takes 0.40 s and peaks at 570 MB. The hint is 23 bytes per key. With 100 values of 16 MiB, `open` takes 38 ms from the hint against 1.18 s for a full scan.
+At 10M live records of 100 bytes in one segment, `open` from the hint takes 0.345 s and peaks at 575 MB. The hint is 23 bytes per key. With 100 values of 16 MiB, `open` takes 38 ms from the hint against 1.18 s for a full scan.
 
 ### Hints written by open
 
@@ -234,7 +234,7 @@ Compaction's hints cover only what it copied, so a store that compacts a few seg
 - Hints are best effort. A hint that can't be created or written is logged and left, and `open` goes on: the next `open` removes what was written and reads that segment again. Tests fill the in-memory disk partway through a new hint and through an extension, and the next `open` writes the whole hint.
 - Entries are applied in order, as the records would be, so a hint can repeat a key and hold Deletes.
 
-On the store above, `open` takes 0.87 to 0.89 s at 854 MB, against 1.48 to 1.77 s at 910 MB without these hints, after one `open` of 2.42 s that writes 460 MB of them. Most of what is left is the newest segment, read past its hint every time. Compacted into one segment, the same store opens in 0.40 s at 570 MB.
+On the store above, `open` takes 0.87 to 0.89 s at 854 MB, against 1.48 to 1.77 s at 910 MB without these hints, after one `open` of 2.42 s that writes 460 MB of them. Most of what is left is the newest segment, read past its hint every time. Compacted into one segment, the same store opens in 0.345 s at 575 MB.
 
 ### When it runs
 
