@@ -61,6 +61,10 @@ fn workload() -> Vec<Op> {
             vec![(4, Some(b"g4".to_vec()))],
         ]),
         Batch(vec![(6, None), (4, Some(b"four".to_vec())), (2, None)]),
+        Compact,
+        Set(0, b"zero".to_vec()),
+        Set(1, b"one again".to_vec()),
+        Compact,
     ]
 }
 

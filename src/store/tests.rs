@@ -2540,6 +2540,24 @@ fn an_open_whose_compaction_poisons_the_store_fails() {
 }
 
 #[test]
+fn compaction_with_no_delete_left_behind_fsyncs_its_removals_once() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // One after the copy's rename, one after removing all three segments.
+    fs.fail_dir_syncs_after(2);
+    store.compact().unwrap();
+    fs.fail_dir_syncs(false);
+    drop(store);
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+}
+
+#[test]
 fn a_write_that_fails_is_truncated_away_and_the_store_stays_writable() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1 << 20));

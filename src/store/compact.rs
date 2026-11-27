@@ -34,6 +34,9 @@ struct Copied<L: LogFile> {
     /// the key isn't live, and a kept segment older than it may hold a Set
     /// of it.
     carry: BTreeSet<Key>,
+    /// Whether it left behind a Delete record of a key that isn't live, which
+    /// may hide a Set in an older segment being cleaned.
+    dropped_delete: bool,
 }
 
 /// Calls `each` with every record of `segment` from `start` to its end, a
@@ -93,11 +96,12 @@ impl<F: Fs> Store<F> {
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
     /// into a new segment with a hint, points the index at the copies, then
     /// removes the old segments oldest first, fsyncing the directory after
-    /// each. Until then the old segments are untouched, so any failure while
-    /// copying returns the error and leaves the store as it was. Checks
-    /// every record it reads, so a corrupt record stops compaction with its
-    /// offset rather than being copied. Reads go on while it runs; writes
-    /// wait for it. A failed directory fsync poisons the store.
+    /// each if it dropped a Delete record, else once after the last. Until
+    /// then the old segments are untouched, so any failure while copying
+    /// returns the error and leaves the store as it was. Checks every record
+    /// it reads, so a corrupt record stops compaction with its offset rather
+    /// than being copied. Reads go on while it runs; writes wait for it. A
+    /// failed directory fsync poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         let writing = self.writer();
         self.writable()?;
@@ -137,6 +141,7 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carry,
+            dropped_delete,
         } = match copied {
             Ok(copied) => copied,
             Err(err) => {
@@ -187,7 +192,10 @@ impl<F: Fs> Store<F> {
             self.append(writing, &deletes.iter().collect::<Vec<_>>())?;
             self.active().add_dead(dead);
         }
-        for &base in chosen {
+        // A Delete left behind must not outlive the Set it hides, so then
+        // each removal is made durable before the next, oldest first. Without
+        // one, the removals may land in any order.
+        for (i, &base) in chosen.iter().enumerate() {
             remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
             self.fs.remove(&self.dir.join(log_name(base)))?;
             let kept = self
@@ -197,7 +205,9 @@ impl<F: Fs> Store<F> {
                 .cloned()
                 .collect();
             self.replace_segments(writing, kept);
-            if let Err(err) = self.fs.sync_dir(&self.dir) {
+            if (dropped_delete || i + 1 == chosen.len())
+                && let Err(err) = self.fs.sync_dir(&self.dir)
+            {
                 return Err(self.poison(err));
             }
         }
@@ -223,6 +233,7 @@ impl<F: Fs> Store<F> {
         let mut hint = hint::Writer::new(hint_file);
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = BTreeSet::new();
+        let mut dropped_delete = false;
         let mut buffer = Vec::new();
         let mut written = 0u64;
         for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
@@ -251,10 +262,12 @@ impl<F: Fs> Store<F> {
                         }
                     }
                     IndexOp::Delete { key } => {
-                        if !self.index.contains(key)
-                            && self.kept_set_of(segments, chosen, input.base, key)?
-                        {
-                            carry.insert(Key::try_from(*key).expect("a key"));
+                        if !self.index.contains(key) {
+                            if self.kept_set_of(segments, chosen, input.base, key)? {
+                                carry.insert(Key::try_from(*key).expect("a key"));
+                            } else {
+                                dropped_delete = true;
+                            }
                         }
                     }
                     IndexOp::Batch { .. } => {}
@@ -271,6 +284,7 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carry,
+            dropped_delete,
         })
     }
 
