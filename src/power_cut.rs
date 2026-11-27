@@ -65,6 +65,8 @@ fn workload() -> Vec<Op> {
         Set(0, b"zero".to_vec()),
         Set(1, b"one again".to_vec()),
         Compact,
+        Set(2, vec![b'w'; 100]),
+        Batch(vec![(2, None), (3, None)]),
     ]
 }
 

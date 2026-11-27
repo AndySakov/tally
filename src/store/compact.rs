@@ -16,7 +16,7 @@ use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::Entry;
 use crate::options::AutoCompact;
-use crate::record::{Fields, IndexOp, Kind, Op, Place, move_header};
+use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
 use crate::{Error, Key};
 
@@ -28,12 +28,11 @@ struct Copied<L: LogFile> {
     hint: hint::Writer<L>,
     /// The bytes copied.
     written: u64,
-    /// Where each record copied was, in the order copied.
+    /// Where each Set record copied was, in the order copied.
     moved: Vec<u64>,
-    /// The keys of the Delete records that must outlive their segment:
-    /// the key isn't live, and a kept segment older than it may hold a Set
-    /// of it.
-    carry: BTreeSet<Key>,
+    /// The bytes of the Delete records written after the copies, which are
+    /// dead.
+    carried: u64,
     /// Whether it left behind a Delete record of a key that isn't live, which
     /// may hide a Set in an older segment being cleaned.
     dropped_delete: bool,
@@ -140,7 +139,7 @@ impl<F: Fs> Store<F> {
             hint,
             written,
             moved,
-            carry,
+            carried,
             dropped_delete,
         } = match copied {
             Ok(copied) => copied,
@@ -154,6 +153,7 @@ impl<F: Fs> Store<F> {
             return Err(self.poison(err));
         }
         output.set_len_written(written);
+        output.add_dead(carried);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
@@ -186,12 +186,6 @@ impl<F: Fs> Store<F> {
                 segment.set_dead(segment.len());
             }
         }
-        if !carry.is_empty() {
-            let deletes: Vec<Op> = carry.into_iter().map(|key| Op::Delete { key }).collect();
-            let dead = deletes.iter().map(|op| op.fields().record_len()).sum();
-            self.append(writing, &deletes.iter().collect::<Vec<_>>())?;
-            self.active().add_dead(dead);
-        }
         // A Delete left behind must not outlive the Set it hides, so then
         // each removal is made durable before the next, oldest first. Without
         // one, the removals may land in any order.
@@ -216,9 +210,11 @@ impl<F: Fs> Store<F> {
 
     /// Writes each live record of the `chosen` segments to a new segment at
     /// `copy_path`, based where the log ends, and its key and lengths to a
-    /// hint at `hint_path`, and fsyncs the copy. One buffered pass per
-    /// segment: reading the dead records in between costs less than a
-    /// positioned read per live one.
+    /// hint at `hint_path`, then a Delete record of each key that must stay
+    /// deleted: it isn't live, and a kept segment older than one of its
+    /// Delete records may hold a Set of it. Then fsyncs the copy. One
+    /// buffered pass per segment: reading the dead records in between costs
+    /// less than a positioned read per live one.
     fn copy_live(
         &self,
         segments: &[Arc<Segment<F::File>>],
@@ -275,6 +271,18 @@ impl<F: Fs> Store<F> {
                 Ok(())
             })?;
         }
+        let mut carried = 0;
+        for key in carry {
+            let op = Op::Delete { key };
+            hint.push(op.fields(), op.key().as_bytes())?;
+            encode_op(
+                &op,
+                Place::Top,
+                base + written + buffer.len() as u64,
+                &mut buffer,
+            );
+            carried += op.fields().record_len();
+        }
         output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
         output.file.sync()?;
@@ -283,7 +291,7 @@ impl<F: Fs> Store<F> {
             hint,
             written,
             moved,
-            carry,
+            carried,
             dropped_delete,
         })
     }
@@ -351,6 +359,7 @@ impl<F: Fs> Store<F> {
     /// Points each key `copy_live` copied at its copy in `output`, as the
     /// output's durable hint lists them, if the key still points at the old
     /// record `moved` holds the offset of. A copy left unpointed is dead.
+    /// The Delete records after the copies change nothing.
     fn repoint(
         &self,
         output: &Segment<F::File>,
@@ -366,6 +375,9 @@ impl<F: Fs> Store<F> {
         let mut old = moved.iter();
         let mut unmatched = false;
         hint::read_entries(hint_file, trailer, |fields, key, offset| {
+            if fields.kind != Kind::Set {
+                return;
+            }
             let Some(&from) = old.next() else {
                 unmatched = true;
                 return;

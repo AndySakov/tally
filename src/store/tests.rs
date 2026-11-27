@@ -1030,6 +1030,11 @@ fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
         segment_records(tmp.path(), 83),
         encoded_at(83, &[delete_record(b"a")])
     );
+    assert_eq!(
+        store.commits.load(Ordering::Relaxed),
+        4,
+        "the Delete is in the copy, not an append of its own"
+    );
     drop(store);
 
     let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
