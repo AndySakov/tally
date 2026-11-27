@@ -330,11 +330,13 @@ pub fn decode_fields(bytes: &[u8; FIELDS_LEN]) -> Result<Fields, DecodeError> {
 pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeError> {
     Ok(match decode_index_op(header, payload)? {
         IndexOp::Set { key } => Record::Set {
-            key,
+            key: Key::try_from(key).expect("decode_header checked key_len"),
             value: Value::try_from(&payload[usize::from(header.fields.key_len)..])
                 .expect("decode_header checked value_len"),
         },
-        IndexOp::Delete { key } => Record::Delete { key },
+        IndexOp::Delete { key } => Record::Delete {
+            key: Key::try_from(key).expect("decode_header checked key_len"),
+        },
         IndexOp::Batch { body_len } => Record::Batch { body_len },
     })
 }
@@ -342,17 +344,17 @@ pub fn decode_payload(header: Header, payload: &[u8]) -> Result<Record, DecodeEr
 /// What a record does to the index, without the value bytes, whose length
 /// its header has.
 #[derive(Debug, PartialEq, Eq)]
-pub enum IndexOp {
-    Set { key: Key },
-    Delete { key: Key },
+pub enum IndexOp<'p> {
+    Set { key: &'p [u8] },
+    Delete { key: &'p [u8] },
     Batch { body_len: u64 },
 }
 
-impl IndexOp {
+impl IndexOp<'_> {
     /// The key's bytes, none for a Batch.
     pub fn key(&self) -> &[u8] {
         match self {
-            IndexOp::Set { key } | IndexOp::Delete { key } => key.as_bytes(),
+            IndexOp::Set { key } | IndexOp::Delete { key } => key,
             IndexOp::Batch { .. } => &[],
         }
     }
@@ -362,7 +364,7 @@ impl IndexOp {
 /// index, without copying the value.
 ///
 /// Panics if `payload.len() != header.payload_len()`, as `decode_payload`.
-pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp, DecodeError> {
+pub fn decode_index_op(header: Header, payload: &[u8]) -> Result<IndexOp<'_>, DecodeError> {
     check_payload(header, payload)?;
     Ok(index_op(header, payload))
 }
@@ -383,14 +385,11 @@ pub fn check_payload(header: Header, payload: &[u8]) -> Result<(), DecodeError> 
 }
 
 /// What the record with this header and checked payload does to the index.
-pub fn index_op(header: Header, payload: &[u8]) -> IndexOp {
-    let key = || {
-        Key::try_from(&payload[..usize::from(header.fields.key_len)])
-            .expect("decode_header checked key_len")
-    };
+pub fn index_op(header: Header, payload: &[u8]) -> IndexOp<'_> {
+    let key = &payload[..usize::from(header.fields.key_len)];
     match header.fields.kind {
-        Kind::Set => IndexOp::Set { key: key() },
-        Kind::Delete => IndexOp::Delete { key: key() },
+        Kind::Set => IndexOp::Set { key },
+        Kind::Delete => IndexOp::Delete { key },
         Kind::Batch => IndexOp::Batch {
             body_len: u64::from_le_bytes(payload.try_into().expect("decode_header checked it")),
         },
@@ -514,7 +513,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             decode_index_op(h, &SET_A_HI[HEADER_LEN..]),
-            Ok(IndexOp::Set { key: key(b"a") })
+            Ok(IndexOp::Set { key: b"a" })
         );
 
         let inner = &BATCH_OF_SET_AND_DELETE[27 + 22..];

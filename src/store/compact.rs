@@ -231,7 +231,7 @@ impl<F: Fs> Store<F> {
                     IndexOp::Set { key } => {
                         if self
                             .index
-                            .get(key.as_bytes())
+                            .get(key)
                             .is_some_and(|entry| entry.offset == read.offset)
                         {
                             moved.push(read.offset);
@@ -239,7 +239,7 @@ impl<F: Fs> Store<F> {
                                 place: Place::Top,
                                 ..read.header.fields()
                             };
-                            hint.push(fields, key.as_bytes())?;
+                            hint.push(fields, key)?;
                             move_header(read.header_bytes, base + written + buffer.len() as u64);
                             buffer.extend_from_slice(read.header_bytes);
                             buffer.extend_from_slice(read.payload);
@@ -251,10 +251,10 @@ impl<F: Fs> Store<F> {
                         }
                     }
                     IndexOp::Delete { key } => {
-                        if !self.index.contains(key.as_bytes())
+                        if !self.index.contains(key)
                             && self.kept_set_of(segments, chosen, input.base, key)?
                         {
-                            carry.insert(Key::try_from(key.as_bytes()).expect("a key"));
+                            carry.insert(Key::try_from(*key).expect("a key"));
                         }
                     }
                     IndexOp::Batch { .. } => {}
@@ -283,13 +283,13 @@ impl<F: Fs> Store<F> {
         segments: &[Arc<Segment<F::File>>],
         chosen: &[u64],
         before: u64,
-        key: &Key,
+        key: &[u8],
     ) -> Result<bool, Error> {
         for segment in segments
             .iter()
             .filter(|s| s.base < before && !chosen.contains(&s.base))
         {
-            if self.sets_of(segment)?.may_hold(key.as_bytes()) {
+            if self.sets_of(segment)?.may_hold(key) {
                 return Ok(true);
             }
         }
@@ -327,7 +327,7 @@ impl<F: Fs> Store<F> {
         }
         each_record(segment, from, |read| {
             if let IndexOp::Set { key } = read.op {
-                keys.add(key.as_bytes());
+                keys.add(key);
             }
             Ok(())
         })?;

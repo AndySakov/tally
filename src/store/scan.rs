@@ -11,7 +11,7 @@ use crate::index::{Entry, Index};
 use crate::record::{
     HEADER_LEN, Header, IndexOp, Place, check_payload, decode_header, index_op, starts_a_record,
 };
-use crate::{CorruptionReason, Error, Key};
+use crate::{CorruptionReason, Error};
 
 /// Reads a record's header into `buf`, copying it straight from the
 /// buffer when the buffer holds it whole.
@@ -115,7 +115,7 @@ pub(super) fn scan_on(
             start,
             len,
             SCAN_BUFFER,
-            &mut |key, entry| apply(index, &key, entry),
+            &mut |key, entry| apply(index, key, entry),
             record,
         );
     }
@@ -137,7 +137,7 @@ pub(super) fn scan_on(
             len,
             SCAN_BUFFER,
             &mut |key, entry| {
-                window.push(key.as_bytes(), entry);
+                window.push(key, entry);
                 if window.len() == WINDOW {
                     sent(mem::take(&mut window));
                 }
@@ -159,7 +159,7 @@ pub(super) fn scan_on(
 pub(super) struct Scanned<'r> {
     pub offset: u64,
     pub header: Header,
-    pub op: &'r IndexOp,
+    pub op: &'r IndexOp<'r>,
     pub header_bytes: &'r mut [u8; HEADER_LEN],
     pub payload: &'r [u8],
 }
@@ -173,7 +173,7 @@ pub(super) fn scan_into(
     start: u64,
     len: u64,
     buffer: usize,
-    sink: &mut impl FnMut(Key, Option<Entry>),
+    sink: &mut impl FnMut(&[u8], Option<Entry>),
     record: &mut impl FnMut(Scanned) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut reader = Reader {
@@ -181,11 +181,11 @@ pub(super) fn scan_into(
         header_bytes: [0u8; HEADER_LEN],
         payload: Vec::new(),
     };
-    let mut batch = Vec::new();
+    let mut batch = Window::default();
     let mut offset = start;
     while offset < len {
-        let (header, op) = reader.next(offset, len, Place::Top)?;
-        reader.show(offset, header, &op, record)?;
+        let header = reader.next(offset, len, Place::Top)?;
+        let op = reader.show(offset, header, record)?;
         let record_len = header.record_len();
         let IndexOp::Batch { body_len } = op else {
             let (key, entry) = change(offset, header, op);
@@ -203,16 +203,18 @@ pub(super) fn scan_into(
         let body_end = body_start + body_len;
         let mut at = body_start;
         while at < body_end {
-            let (header, op) = reader
+            let header = reader
                 .next(at, body_end, Place::Inner)
                 .map_err(|err| err.moved_to(offset))?;
-            reader.show(at, header, &op, record)?;
-            batch.push(change(at, header, op));
+            let op = reader.show(at, header, record)?;
+            let (key, entry) = change(at, header, op);
+            batch.push(key, entry);
             at += header.record_len();
         }
-        for (key, entry) in batch.drain(..) {
+        for (key, entry) in batch.changes() {
             sink(key, entry);
         }
+        batch.clear();
         offset = body_end;
     }
     Ok(())
@@ -220,7 +222,7 @@ pub(super) fn scan_into(
 
 /// The key of the Set or Delete record at `offset`, and its index entry,
 /// `None` for a Delete.
-fn change(offset: u64, header: Header, op: IndexOp) -> (Key, Option<Entry>) {
+fn change(offset: u64, header: Header, op: IndexOp<'_>) -> (&[u8], Option<Entry>) {
     match op {
         IndexOp::Set { key } => (key, Some(Entry::new(offset, header.fields()))),
         IndexOp::Delete { key } => (key, None),
@@ -253,28 +255,33 @@ impl Window {
         self.changes.push((self.keys.len(), entry));
     }
 
-    pub(super) fn apply_to(self, index: &mut Index, threads: usize) {
+    fn changes(&self) -> impl Iterator<Item = (&[u8], Option<Entry>)> {
         let mut start = 0;
-        let changes: Vec<(&[u8], Option<Entry>)> = self
-            .changes
-            .iter()
-            .map(|&(end, entry)| {
-                let key = &self.keys[start..end];
-                start = end;
-                (key, entry)
-            })
-            .collect();
+        self.changes.iter().map(move |&(end, entry)| {
+            let key = &self.keys[start..end];
+            start = end;
+            (key, entry)
+        })
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+        self.changes.clear();
+    }
+
+    pub(super) fn apply_to(self, index: &mut Index, threads: usize) {
+        let changes: Vec<_> = self.changes().collect();
         index.apply_in_order(threads, &changes);
     }
 }
 
-fn apply(index: &mut Index, key: &Key, entry: Option<Entry>) {
+fn apply(index: &mut Index, key: &[u8], entry: Option<Entry>) {
     match entry {
         Some(entry) => {
-            index.insert(key.as_bytes(), entry);
+            index.insert(key, entry);
         }
         None => {
-            index.remove(key.as_bytes());
+            index.remove(key);
         }
     }
 }
@@ -291,7 +298,7 @@ impl<R: Read> Reader<R> {
     /// checks it ends by `end` and sits in `place`. One that runs past the
     /// end of its batch breaks the batch; one past the end of the file was
     /// cut short.
-    fn next(&mut self, offset: u64, end: u64, place: Place) -> Result<(Header, IndexOp), Error> {
+    fn next(&mut self, offset: u64, end: u64, place: Place) -> Result<Header, Error> {
         let cut_short = Error::Corruption {
             offset,
             reason: match place {
@@ -313,23 +320,25 @@ impl<R: Read> Reader<R> {
         self.payload.resize(header.payload_len(), 0u8);
         self.inner.read_exact(&mut self.payload)?;
         check_payload(header, &self.payload).map_err(|err| err.at(offset))?;
-        Ok((header, index_op(header, &self.payload)))
+        Ok(header)
     }
 
-    /// Shows `record` the record `next` just read.
+    /// Shows `record` the record `next` just read, and returns what it
+    /// does to the index.
     fn show(
         &mut self,
         offset: u64,
         header: Header,
-        op: &IndexOp,
         record: &mut impl FnMut(Scanned) -> Result<(), Error>,
-    ) -> Result<(), Error> {
+    ) -> Result<IndexOp<'_>, Error> {
+        let op = index_op(header, &self.payload);
         record(Scanned {
             offset,
             header,
-            op,
+            op: &op,
             header_bytes: &mut self.header_bytes,
             payload: &self.payload,
-        })
+        })?;
+        Ok(op)
     }
 }
