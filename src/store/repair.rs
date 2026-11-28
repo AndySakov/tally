@@ -11,9 +11,10 @@ use super::{
     scan::{Scanned, scan, scan_into},
 };
 use crate::fs::{Fs, LogFile};
+use crate::hint;
 use crate::index::Index;
 use crate::record::IndexOp;
-use crate::segment::{FILE_HEADER_LEN, compact_name, create, hint_name, log_name};
+use crate::segment::{FILE_HEADER_LEN, Segment, compact_name, create, hint_name, log_name};
 use crate::{CorruptionReason, Error};
 
 /// The blocks of a segment's file `repair` reads, and fills with zeros if
@@ -224,10 +225,10 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
     Ok(Repaired {
         offset: base,
         dropped: len,
-        side_file: SideFile {
+        side_file: Some(SideFile {
             path: side_file,
             unreadable,
-        },
+        }),
     })
 }
 
@@ -245,6 +246,15 @@ impl<F: Fs> Store<F> {
         let mut index = Index::new();
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
+            if let Some(lost) = lost_past_hint(fs, dir, segment)? {
+                remove_if_present(fs, &dir.join(hint_name(segment.base)))?;
+                fs.sync_dir(dir)?;
+                return Ok(Some(Repaired {
+                    offset: segment.end(),
+                    dropped: lost,
+                    side_file: None,
+                }));
+            }
             let newest = i + 1 == segments.len();
             let mut reading = Reading::from(segment.base);
             let damage = match scan(
@@ -299,10 +309,35 @@ impl<F: Fs> Store<F> {
         Ok(Some(Repaired {
             offset,
             dropped: len - offset,
-            side_file: SideFile {
+            side_file: Some(SideFile {
                 path: side_file,
                 unreadable,
-            },
+            }),
         }))
     }
+}
+
+/// The bytes past `segment`'s end that its hint lists, if a hint whose
+/// checksum matches lists more than the segment holds: what `open` reports
+/// as `CutShort` at its end.
+fn lost_past_hint<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    segment: &Segment<F::File>,
+) -> Result<Option<u64>, Error> {
+    let file = match fs.open_existing(&dir.join(hint_name(segment.base))) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if !hint::checksum_matches(&file)? {
+        return Ok(None);
+    }
+    let Ok(trailer) = hint::trailer(&file) else {
+        return Ok(None);
+    };
+    Ok(trailer
+        .log_len
+        .checked_sub(segment.len())
+        .filter(|&lost| lost > 0))
 }

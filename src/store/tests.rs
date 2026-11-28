@@ -445,10 +445,10 @@ fn repair_moves_the_corrupt_record_and_everything_after_it_to_a_side_file() {
         Some(Repaired {
             offset: 22,
             dropped: 41,
-            side_file: SideFile {
+            side_file: Some(SideFile {
                 path: side_file(tmp.path(), 22),
                 unreadable: vec![],
-            },
+            }),
         })
     );
     assert_eq!(log_bytes(tmp.path()), SET_A_HI);
@@ -486,10 +486,10 @@ fn repair_rewrites_a_side_file_a_crashed_repair_left() {
             Some(Repaired {
                 offset: 22,
                 dropped: 41,
-                side_file: SideFile {
+                side_file: Some(SideFile {
                     path: side_file(tmp.path(), 22),
                     unreadable: vec![],
-                },
+                }),
             }),
             "side file left with {} bytes",
             left.len()
@@ -1595,10 +1595,10 @@ fn a_damaged_segment_header_is_corruption_that_repair_moves_aside() {
         Some(Repaired {
             offset: 0,
             dropped: 17 + 22,
-            side_file: SideFile {
+            side_file: Some(SideFile {
                 path: side_file.clone(),
                 unreadable: vec![],
-            },
+            }),
         })
     );
     assert_eq!(fs::read(&side_file).unwrap(), bytes);
@@ -2134,23 +2134,32 @@ fn a_damaged_hint_is_removed_and_the_whole_log_read() {
 }
 
 #[test]
-fn a_hint_for_more_log_than_there_is_is_removed() {
+fn a_newest_segment_cut_short_of_its_hint_is_corruption() {
     let tmp = tempfile::tempdir().unwrap();
     compacted_a_and_b(tmp.path());
     let log = log_bytes(tmp.path());
     write_segment(tmp.path(), 43, &log[..22]);
 
-    let store = Store::open(tmp.path()).unwrap();
+    let err = Store::open(tmp.path()).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 65,
+                reason: CorruptionReason::CutShort
+            }
+        ),
+        "{err:?}"
+    );
     assert_eq!(
         file_names(tmp.path()),
         [
+            "tally.00000000000000000043.hint",
             "tally.00000000000000000043.log",
             "tally.lock",
             "tally.manifest"
         ]
     );
-    assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-    assert_eq!(store.get(&key(b"b")).unwrap(), None);
 }
 
 #[test]
@@ -3465,13 +3474,13 @@ fn repair_moves_an_unreadable_sector_aside_as_zeros() {
         Some(Repaired {
             offset: 21,
             dropped: 5020,
-            side_file: SideFile {
+            side_file: Some(SideFile {
                 path: dir.join("tally.log.corrupt-21"),
                 unreadable: vec![Range {
                     start: 0,
                     end: 4079
                 }],
-            },
+            }),
         })
     );
     assert_eq!(
@@ -3495,7 +3504,7 @@ fn repair_over_an_unreadable_sector_rewrites_only_zeros_where_it_failed() {
     assert_eq!(
         Store::repair_in(&fs, dir)
             .unwrap()
-            .map(|r| r.side_file.unreadable),
+            .map(|r| r.side_file.unwrap().unreadable),
         Some(vec![Range {
             start: 0,
             end: 4079
@@ -3555,7 +3564,7 @@ fn repair_moves_an_unreadable_sector_aside_from_the_record_or_batch_it_falls_in(
             (
                 repaired.offset,
                 repaired.dropped,
-                repaired.side_file.unreadable
+                repaired.side_file.unwrap().unreadable
             ),
             (
                 offset,
@@ -3594,7 +3603,7 @@ fn repair_cuts_at_the_record_holding_a_sector_whose_whole_read_fails() {
         (
             repaired.offset,
             repaired.dropped,
-            repaired.side_file.unreadable
+            repaired.side_file.unwrap().unreadable
         ),
         (
             5041,
@@ -3635,7 +3644,7 @@ fn repair_keeps_a_small_record_that_ends_right_before_a_block_whose_whole_read_f
         (
             repaired.offset,
             repaired.dropped,
-            repaired.side_file.unreadable
+            repaired.side_file.unwrap().unreadable
         ),
         (12271, 21, vec![Range { start: 0, end: 21 }])
     );
@@ -3698,5 +3707,79 @@ fn copies_of_carried_deletes_do_not_clean_each_other_again_and_again() {
         [carried_rewrites(30, 200), carried_rewrites(40, 200)],
         [1, 2],
         "after the reopen, which forgets what is carried, and never again"
+    );
+}
+
+#[test]
+fn a_sealed_segment_cut_short_of_its_hint_on_a_record_boundary_is_corruption() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    assert!(
+        fs.read(&dir.join(log_name(42))).is_some(),
+        "a=1, b=2 at 0; c=3 at 42"
+    );
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
+
+    let err = Store::open_in(fs.clone(), dir, segmented(24))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 21,
+                reason: CorruptionReason::CutShort
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        fs.read(&dir.join(hint_name(0))).is_some(),
+        "the evidence stays"
+    );
+}
+
+#[test]
+fn repair_removes_the_hint_of_a_segment_cut_short_of_it_and_keeps_every_other_record() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
+
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 21,
+            dropped: 21,
+            side_file: None
+        })
+    );
+    assert_eq!(fs.read(&dir.join(hint_name(0))), None);
+    assert_eq!(Store::repair_in(&fs, dir).unwrap(), None, "once is enough");
+
+    let store = open_on(&fs, segmented(24));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(get_on(&store, b"b"), None);
+    assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    store.verify().unwrap();
+    drop(store);
+    assert!(
+        fs.read(&dir.join(hint_name(0))).is_some(),
+        "open writes it again"
     );
 }

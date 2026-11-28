@@ -167,6 +167,13 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
                     WINDOW,
                     threads_for(trailer.count, PARALLEL_FROM),
                 ) {
+                    // Its checksum matched: records it lists are gone.
+                    Ok((hinted, _)) if hinted > segment.end() => {
+                        return Err(Error::Corruption {
+                            offset: segment.end(),
+                            reason: CorruptionReason::CutShort,
+                        });
+                    }
                     Ok((hinted, tail)) => (hinted, Some(tail)),
                     Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
                 }
@@ -255,11 +262,6 @@ pub(super) fn read_hint<L: LogFile>(
     window: usize,
     threads: usize,
 ) -> Result<(u64, hint::Tail), hint::Invalid> {
-    if trailer.log_len > segment.len() {
-        return Err(hint::Invalid::new(
-            "the segment is shorter than the hint says",
-        ));
-    }
     let base = segment.base;
     let tail = applying(index, threads, |sent| {
         let mut changes = Window::default();
