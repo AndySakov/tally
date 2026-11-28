@@ -326,8 +326,9 @@ struct State {
     /// Removes that go ahead before every later one fails.
     removes_left: Option<usize>,
     tamper: Option<(PathBuf, Tamper)>,
-    /// Reads of these bytes of the file at this path fail.
-    unreadable: Option<(PathBuf, std::ops::Range<u64>)>,
+    /// Reads of these bytes of the file at this path fail, and whether a
+    /// read that also covers other bytes fails whole.
+    unreadable: Option<(PathBuf, std::ops::Range<u64>, bool)>,
 }
 
 /// Changes the bytes a write at an offset lands.
@@ -416,14 +417,21 @@ impl MemFs {
     /// From now on, reads of `range` of the file at `path` fail, as a bad
     /// sector does; a read that starts before it returns the bytes up to it.
     pub(crate) fn fail_reads(&self, path: &Path, range: std::ops::Range<u64>) {
-        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range));
+        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range, false));
     }
 
-    /// The bad range of inode `ino`, if it has one.
-    fn unreadable(&self, ino: usize) -> Option<std::ops::Range<u64>> {
+    /// As `fail_reads`, but any read that touches `range` fails whole, as
+    /// on a disk that fails a request for one bad sector in it.
+    pub(crate) fn fail_whole_reads(&self, path: &Path, range: std::ops::Range<u64>) {
+        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range, true));
+    }
+
+    /// The bad range of inode `ino`, if it has one, and whether reads that
+    /// touch it fail whole.
+    fn unreadable(&self, ino: usize) -> Option<(std::ops::Range<u64>, bool)> {
         let state = self.0.borrow();
-        let (path, range) = state.unreadable.as_ref()?;
-        (state.disk.files.get(path) == Some(&ino)).then(|| range.clone())
+        let (path, range, whole) = state.unreadable.as_ref()?;
+        (state.disk.files.get(path) == Some(&ino)).then(|| (range.clone(), *whole))
     }
 
     pub(crate) fn fail_dir_syncs(&self, fail: bool) {
@@ -629,7 +637,7 @@ impl LogFile for MemFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        if let Some(bad) = self.fs.unreadable(self.ino)
+        if let Some((bad, _)) = self.fs.unreadable(self.ino)
             && offset < bad.end
             && bad.start < offset + buf.len() as u64
         {
@@ -735,8 +743,13 @@ struct MemReader<'a> {
 impl Read for MemReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut most = buf.len();
-        if let Some(bad) = self.file.fs.unreadable(self.file.ino) {
-            if bad.contains(&self.offset) {
+        if let Some((bad, whole)) = self.file.fs.unreadable(self.file.ino) {
+            let size = self
+                .file
+                .fs
+                .with_inode(self.file.ino, |inode| inode.data.len() as u64);
+            let end = (self.offset + most as u64).min(size);
+            if bad.contains(&self.offset) || whole && self.offset < bad.end && bad.start < end {
                 return Err(io::Error::other("injected read failure"));
             }
             if self.offset < bad.start {

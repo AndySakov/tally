@@ -5,8 +5,10 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::{
-    LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, Store, lock, open::open_segments, remove_if_present,
-    scan::scan,
+    LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, Store, lock,
+    open::open_segments,
+    remove_if_present,
+    scan::{Scanned, scan, scan_into},
 };
 use crate::fs::{Fs, LogFile};
 use crate::index::Index;
@@ -101,6 +103,59 @@ pub(super) fn copy_to_end(mut reader: impl Read, file: &impl LogFile) -> io::Res
     }
 }
 
+/// Where the record or batch a scan reads next starts, from the records it
+/// has shown: an I/O error falls in it.
+struct Reading {
+    at: u64,
+    batch_end: u64,
+}
+
+impl Reading {
+    fn from(at: u64) -> Reading {
+        Reading { at, batch_end: 0 }
+    }
+
+    fn saw(&mut self, scanned: &Scanned) {
+        let end = scanned.offset + scanned.header.record_len();
+        match *scanned.op {
+            IndexOp::Batch { body_len } if body_len > 0 => {
+                self.at = scanned.offset;
+                self.batch_end = end + body_len;
+            }
+            _ if end >= self.batch_end => self.at = end,
+            _ => {}
+        }
+    }
+}
+
+/// Where the damage is in `file` from `start`, where a scan's read failed,
+/// to `len`: read again a block at a time, so that it is the record or
+/// batch a failed block falls in, not the first one a larger read reached.
+/// `None` if it all reads.
+fn damage_after_a_failed_read(
+    file: &impl LogFile,
+    start: u64,
+    len: u64,
+) -> Result<Option<u64>, Error> {
+    let mut reading = Reading::from(start);
+    match scan_into(
+        file,
+        start,
+        len,
+        BLOCK as usize,
+        &mut |_, _| {},
+        &mut |scanned| {
+            reading.saw(&scanned);
+            Ok(())
+        },
+    ) {
+        Ok(()) => Ok(None),
+        Err(Error::Corruption { offset, .. }) => Ok(Some(offset)),
+        Err(Error::Io(_)) => Ok(Some(reading.at)),
+        Err(err) => Err(err),
+    }
+}
+
 /// Where `repair` saves the bytes from log offset `offset`.
 fn corrupt_name(dir: &Path, offset: u64) -> PathBuf {
     dir.join(format!("{LOG_FILE_NAME}.corrupt-{offset}"))
@@ -182,39 +237,28 @@ impl<F: Fs> Store<F> {
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
             let newest = i + 1 == segments.len();
-            // Where the record or batch the scan reads next starts: an I/O
-            // error falls in it.
-            let mut reading = segment.base;
-            let mut batch_end = 0;
-            match scan(
+            let mut reading = Reading::from(segment.base);
+            let damage = match scan(
                 segment,
                 &mut index,
                 segment.base,
                 segment.end(),
                 newest,
                 &mut |scanned| {
-                    let end = scanned.offset + scanned.header.record_len();
-                    match *scanned.op {
-                        IndexOp::Batch { body_len } if body_len > 0 => {
-                            reading = scanned.offset;
-                            batch_end = end + body_len;
-                        }
-                        _ if end >= batch_end => reading = end,
-                        _ => {}
-                    }
+                    reading.saw(&scanned);
                     Ok(())
                 },
             ) {
-                Ok(_) => {}
-                Err(Error::Corruption { offset, .. }) => {
-                    bad = Some((segment, offset));
-                    break;
-                }
+                Ok(_) => None,
+                Err(Error::Corruption { offset, .. }) => Some(offset),
                 Err(Error::Io(_)) => {
-                    bad = Some((segment, reading));
-                    break;
+                    damage_after_a_failed_read(segment, reading.at, segment.end())?
                 }
                 Err(err) => return Err(err),
+            };
+            if let Some(offset) = damage {
+                bad = Some((segment, offset));
+                break;
             }
         }
         let Some((segment, offset)) = bad else {
