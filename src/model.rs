@@ -298,6 +298,199 @@ mod tests {
         }
     }
 
+    /// Each thread has keys and a map of its own. A reopen in a thread
+    /// becomes a compaction, since the threads share the store.
+    fn threads_match(auto: bool, ops: &[Vec<Op>]) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
+        let states: Vec<State> = thread::scope(|scope| {
+            let threads: Vec<_> = ops
+                .iter()
+                .enumerate()
+                .map(|(t, ops)| {
+                    let store = &store;
+                    scope.spawn(move || {
+                        let mut state = State::new();
+                        for op in ops {
+                            let op = if let Op::Reopen = op {
+                                &Op::Compact
+                            } else {
+                                op
+                            };
+                            run(store, t as u8, &mut state, op);
+                        }
+                        state
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        for (t, state) in states.iter().enumerate() {
+            check(&store, t as u8, state);
+        }
+        store.verify().unwrap();
+        drop(store);
+        let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
+        for (t, state) in states.iter().enumerate() {
+            check(&store, t as u8, state);
+        }
+        store.verify().unwrap();
+    }
+
+    /// The four-thread case an earlier model test shrank a failure to.
+    /// Only the values' lengths are kept.
+    #[test]
+    fn threads_match_their_maps_in_the_case_once_shrunk_to() {
+        threads_match(
+            true,
+            &[
+                vec![
+                    Op::Get(2),
+                    Op::Compact,
+                    Op::Delete(0),
+                    Op::Delete(1),
+                    Op::Set(3, vec![7; 41]),
+                    Op::Compact,
+                    Op::Set(0, vec![7; 48]),
+                    Op::Get(0),
+                    Op::Delete(1),
+                    Op::Batch(vec![(1, None)]),
+                ],
+                vec![
+                    Op::Set(3, vec![7; 53]),
+                    Op::Set(3, vec![7; 51]),
+                    Op::Batch(vec![
+                        (3, Some(vec![7; 5])),
+                        (3, None),
+                        (3, Some(vec![7; 2])),
+                    ]),
+                    Op::Get(1),
+                    Op::Delete(2),
+                    Op::Compact,
+                    Op::Get(2),
+                    Op::Get(2),
+                    Op::Batch(vec![(0, Some(vec![7; 13])), (3, None), (1, None)]),
+                    Op::Delete(3),
+                    Op::Set(3, vec![7; 12]),
+                    Op::Delete(1),
+                    Op::Delete(0),
+                    Op::Delete(0),
+                    Op::Set(1, vec![7; 45]),
+                    Op::Compact,
+                    Op::Batch(vec![(2, None), (2, Some(vec![7; 9])), (1, None), (1, None)]),
+                    Op::Delete(1),
+                    Op::Set(1, vec![7; 8]),
+                    Op::Compact,
+                    Op::Batch(vec![(0, None)]),
+                ],
+                vec![
+                    Op::Batch(vec![]),
+                    Op::Compact,
+                    Op::Set(1, vec![7; 51]),
+                    Op::Batch(vec![
+                        (2, Some(vec![7; 3])),
+                        (1, None),
+                        (3, Some(vec![7; 54])),
+                        (3, None),
+                    ]),
+                    Op::Set(0, vec![7; 22]),
+                    Op::Set(2, vec![7; 48]),
+                    Op::Set(0, vec![7; 63]),
+                    Op::Batch(vec![]),
+                    Op::Delete(3),
+                    Op::Get(0),
+                    Op::Set(2, vec![7; 56]),
+                    Op::Get(0),
+                    Op::Set(3, vec![7; 13]),
+                    Op::Delete(0),
+                    Op::Compact,
+                    Op::Get(1),
+                    Op::Batch(vec![
+                        (3, Some(vec![7; 27])),
+                        (0, None),
+                        (0, Some(vec![7; 63])),
+                        (1, Some(vec![7; 28])),
+                        (2, None),
+                    ]),
+                    Op::Set(1, vec![7; 21]),
+                    Op::Set(2, vec![7; 11]),
+                    Op::Batch(vec![
+                        (1, Some(vec![7; 33])),
+                        (2, None),
+                        (2, Some(vec![7; 30])),
+                        (0, Some(vec![7; 34])),
+                    ]),
+                    Op::Set(0, vec![7; 50]),
+                    Op::Set(2, vec![7; 11]),
+                    Op::Get(3),
+                    Op::Set(2, vec![7; 47]),
+                    Op::Batch(vec![
+                        (0, Some(vec![7; 59])),
+                        (0, None),
+                        (3, Some(vec![7; 21])),
+                        (1, None),
+                        (3, None),
+                    ]),
+                    Op::Set(2, vec![7; 10]),
+                    Op::Delete(3),
+                    Op::Delete(0),
+                    Op::Get(0),
+                ],
+                vec![
+                    Op::Delete(3),
+                    Op::Delete(2),
+                    Op::Set(3, vec![7; 56]),
+                    Op::Compact,
+                    Op::Compact,
+                    Op::Compact,
+                    Op::Compact,
+                    Op::Batch(vec![
+                        (2, Some(vec![7; 6])),
+                        (1, Some(vec![7; 30])),
+                        (1, Some(vec![7; 34])),
+                    ]),
+                    Op::Batch(vec![
+                        (3, None),
+                        (0, Some(vec![7; 35])),
+                        (3, None),
+                        (0, None),
+                    ]),
+                    Op::Batch(vec![
+                        (2, Some(vec![7; 63])),
+                        (2, Some(vec![7; 63])),
+                        (2, None),
+                        (2, None),
+                        (0, Some(vec![7; 9])),
+                    ]),
+                    Op::Batch(vec![
+                        (1, Some(vec![7; 42])),
+                        (2, Some(vec![7; 9])),
+                        (1, Some(vec![7; 56])),
+                        (3, None),
+                        (0, Some(vec![7; 26])),
+                    ]),
+                    Op::Batch(vec![
+                        (3, Some(vec![7; 55])),
+                        (0, Some(vec![7; 36])),
+                        (2, Some(vec![7; 61])),
+                    ]),
+                    Op::Get(2),
+                    Op::Get(1),
+                    Op::Delete(1),
+                    Op::Get(2),
+                    Op::Batch(vec![(1, None), (0, None), (0, None), (0, None)]),
+                    Op::Get(2),
+                    Op::Batch(vec![
+                        (3, Some(vec![7; 11])),
+                        (0, Some(vec![7; 53])),
+                        (3, Some(vec![7; 42])),
+                    ]),
+                    Op::Set(2, vec![7; 60]),
+                ],
+            ],
+        );
+    }
+
     const THREADS: u8 = 4;
 
     fn cases() -> u32 {
@@ -320,43 +513,12 @@ mod tests {
             model.finish();
         }
 
-        /// Each thread has keys and a map of its own. A reopen in a thread
-        /// becomes a compaction, since the threads share the store.
         #[test]
         fn threads_on_one_store_match_their_own_maps(
             auto in any::<bool>(),
             ops in prop::collection::vec(prop::collection::vec(op(), 1..30), THREADS as usize),
         ) {
-            let tmp = tempfile::tempdir().unwrap();
-            let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
-            let states: Vec<State> = thread::scope(|scope| {
-                let threads: Vec<_> = ops
-                    .iter()
-                    .enumerate()
-                    .map(|(t, ops)| {
-                        let store = &store;
-                        scope.spawn(move || {
-                            let mut state = State::new();
-                            for op in ops {
-                                let op = if let Op::Reopen = op { &Op::Compact } else { op };
-                                run(store, t as u8, &mut state, op);
-                            }
-                            state
-                        })
-                    })
-                    .collect();
-                threads.into_iter().map(|t| t.join().unwrap()).collect()
-            });
-            for (t, state) in states.iter().enumerate() {
-                check(&store, t as u8, state);
-            }
-            store.verify().unwrap();
-            drop(store);
-            let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
-            for (t, state) in states.iter().enumerate() {
-                check(&store, t as u8, state);
-            }
-            store.verify().unwrap();
+            threads_match(auto, &ops);
         }
     }
 }

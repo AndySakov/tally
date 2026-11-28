@@ -196,6 +196,9 @@ impl<F: Fs> Store<F> {
                 self.poison(unlisted);
             }
             let _ = remove_if_present(&self.fs, &hint_path);
+            if let Err(unread) = self.repoint_by_records(&output, &moved) {
+                self.poison(unread);
+            }
             self.count_dead(writing);
             return Err(err);
         }
@@ -430,6 +433,26 @@ impl<F: Fs> Store<F> {
         })
         .map_err(unreadable)?;
         Ok(())
+    }
+
+    /// Points the index at the copies in `output`, read from its records as
+    /// a reopen without its hint would.
+    fn repoint_by_records(&self, output: &Segment<F::File>, moved: &[u64]) -> Result<(), Error> {
+        let mut old = moved.iter();
+        scan_into(
+            output,
+            output.base,
+            output.end(),
+            COMPACT_BUFFER,
+            &mut |key, entry| {
+                if let Some(entry) = entry
+                    && let Some(&from) = old.next()
+                {
+                    self.index.replace(key, from, entry);
+                }
+            },
+            &mut |_| Ok(()),
+        )
     }
 
     /// Compacts if automatic compaction is on and due, cleaning the
