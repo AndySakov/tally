@@ -101,6 +101,12 @@ pub(crate) fn hint_name(base: u64) -> String {
     format!("{PREFIX}{base:0DIGITS$}.hint")
 }
 
+/// Where the hint of the active segment at `base` is written until the
+/// segment seals and it takes `hint_name`.
+pub(crate) fn active_hint_name(base: u64) -> String {
+    format!("{PREFIX}{base:0DIGITS$}.hint.active")
+}
+
 /// Where compaction writes a segment at `base` before renaming it in.
 pub(crate) fn compact_name(base: u64) -> String {
     format!("{PREFIX}{base:0DIGITS$}.compact")
@@ -118,6 +124,10 @@ pub(crate) fn parse_hint_name(name: &str) -> Option<u64> {
 
 pub(crate) fn parse_compact_name(name: &str) -> Option<u64> {
     parse(name, ".compact")
+}
+
+pub(crate) fn parse_active_hint_name(name: &str) -> Option<u64> {
+    parse(name, ".hint.active")
 }
 
 fn parse(name: &str, suffix: &str) -> Option<u64> {
@@ -350,5 +360,7 @@ mod tests {
             assert_eq!(parse_log_name(name), None, "{name}");
         }
         assert_eq!(parse_hint_name(&log_name(1)), None);
+        assert_eq!(parse_hint_name(&active_hint_name(1)), None);
+        assert_eq!(parse_active_hint_name(&active_hint_name(17)), Some(17));
     }
 }

@@ -15,8 +15,8 @@ v1 is done. tally is an embedded library for one process, shared by its threads:
 - recovery from torn tails on `open`, which saves what it cuts, `repair` for any other damage, and `verify` to check
   every record;
 - compaction that runs on its own and cleans only the segments with the most dead bytes;
-- hint files, written by compaction and by `open` itself, so `open` reads each sealed segment's keys without its
-  values.
+- hint files, written by compaction, by writes as each segment fills, and by `open` for any segment left without
+  one, so `open` reads each sealed segment's keys without its values.
 
 ## Use
 
@@ -88,8 +88,8 @@ shares one fsync across its records, as writes from several threads share one ac
 
 At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random with default
 options: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB segments (9.01 s
-when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s once one `open` has written
-hints for the segments compaction didn't (1.8 s without them).
+when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s with a hint for every sealed
+segment (1.8 s without them).
 
 ## How it's tested
 

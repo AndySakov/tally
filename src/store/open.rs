@@ -1,12 +1,12 @@
 //! What `open` does before the store exists: opening the segments and
 //! building the index from hints and scans (DESIGN.md, Recovery).
 
-use std::io::{self, ErrorKind, Read};
+use std::io::{ErrorKind, Read};
 use std::mem;
 use std::path::{Path, PathBuf};
 
 use super::{
-    LOG_FILE_NAME,
+    LOG_FILE_NAME, hint_not_written, push_entry,
     repair::copy_to_end,
     scan::{WINDOW, Window, applying, scan, threads_for},
 };
@@ -17,7 +17,7 @@ use crate::manifest::{self, NEW_MANIFEST_NAME};
 use crate::record::{HEADER_LEN, Kind};
 use crate::segment::{
     FILE_HEADER_LEN, FileHeader, Segment, check_file_header, hint_name, log_name,
-    parse_compact_name, parse_hint_name, parse_log_name, start_file,
+    parse_active_hint_name, parse_compact_name, parse_hint_name, parse_log_name, start_file,
 };
 use crate::{CorruptionReason, Error, UnsupportedReason};
 
@@ -25,9 +25,10 @@ use crate::{CorruptionReason, Error, UnsupportedReason};
 const SHORTEST_RECORD: u64 = HEADER_LEN as u64 + 1;
 
 /// Opens every segment in `dir`, in log order, after removing hints whose
-/// segment is gone, copies a compaction left unfinished, and a manifest
-/// never renamed in. Refuses a directory another version of tally wrote,
-/// a segment the manifest lists that is gone, and segments that overlap.
+/// segment is gone, copies a compaction left unfinished, a manifest never
+/// renamed in, and the hints of active segments, which have no trailer.
+/// Refuses a directory another version of tally wrote, a segment the
+/// manifest lists that is gone, and segments that overlap.
 /// A newest segment whose header a crash cut short is started again: no
 /// record was written to it before its header was fsynced.
 pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>, Error> {
@@ -52,6 +53,9 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>
         });
     }
     let mut changed = false;
+    for name in names.iter().filter(|n| parse_active_hint_name(n).is_some()) {
+        fs.remove(&dir.join(name))?;
+    }
     for name in &names {
         let orphan = parse_hint_name(name).is_some_and(|base| bases.binary_search(&base).is_err());
         if orphan || parse_compact_name(name).is_some() || name == NEW_MANIFEST_NAME {
@@ -106,14 +110,16 @@ pub(super) struct Opened<L> {
 /// newest segment; in any other, one is `CutShort` corruption. A hint that
 /// can't be used is logged, removed for good, and the whole index built
 /// again without it, since what it put in the index can't be told apart.
+/// Also returns the newest segment's hint so far, for writes to go on with,
+/// if it had none and was read whole.
 pub(super) fn load<F: Fs>(
     fs: &F,
     dir: &Path,
     segments: &mut [Segment<F::File>],
-) -> Result<Index, Error> {
+) -> Result<(Index, ActiveHint<F::File>), Error> {
     loop {
         match try_load(fs, dir, segments)? {
-            Loaded::Index(index) => return Ok(index),
+            Loaded::Index(index, active) => return Ok((index, active.map(|hint| *hint))),
             Loaded::BadHint(base, hint::Invalid(why)) => {
                 log::warn!(
                     "ignored the hint for the segment at {base} ({why}); reading the segment instead"
@@ -125,13 +131,20 @@ pub(super) fn load<F: Fs>(
     }
 }
 
-enum Loaded {
-    Index(Index),
+type ActiveHint<L> = Option<hint::Writer<L>>;
+
+enum Loaded<L: LogFile> {
+    /// With the newest segment's hint, if it is streamed.
+    Index(Index, Option<Box<hint::Writer<L>>>),
     /// The hint of the segment at this base can't be used.
     BadHint(u64, hint::Invalid),
 }
 
-fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Result<Loaded, Error> {
+fn try_load<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    segments: &mut [Segment<F::File>],
+) -> Result<Loaded<F::File>, Error> {
     let mut hints = Vec::with_capacity(segments.len());
     // The largest hint's Set count, not their sum: a key overwritten in
     // every segment is counted in each.
@@ -156,6 +169,7 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
     let capacity = usize::try_from(count.min(total / SHORTEST_RECORD)).unwrap_or(usize::MAX);
     let mut index = Index::with_capacity(capacity);
     let newest = segments.len() - 1;
+    let mut active = None;
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
         let (hinted, tail) = match &hint {
             Some((file, trailer)) => {
@@ -177,8 +191,11 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
         // A sealed segment never changes, so a hint for all of it stays
         // valid. Not fsynced: a hint that didn't land whole fails its
         // checksum, and the next open removes it and reads the segment.
+        // The newest one's goes on with the writes, until it seals.
         let mut writer = None;
-        if i < newest && hinted < len {
+        if i == newest && hint.is_none() {
+            writer = Some(hint::Writer::unfiled());
+        } else if i < newest && hinted < len {
             let opened = match (hint, tail) {
                 (Some((file, _)), Some(tail)) => hint::Writer::extend(file, tail),
                 _ => fs
@@ -198,7 +215,14 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
             i == newest,
             &mut |read| {
                 if let Some(hint) = &mut writer
-                    && let Err(err) = hint.push(read.header.fields(), read.op.key())
+                    && let Err(err) = push_entry(
+                        fs,
+                        dir,
+                        segment.base,
+                        hint,
+                        read.header.fields(),
+                        read.op.key(),
+                    )
                 {
                     hint_not_written(segment.base, &err);
                     writer = None;
@@ -208,9 +232,12 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
         )?;
         if let Some(hint) = writer.take()
             && end == len
-            && let Err(err) = hint.finish(len - segment.base)
         {
-            hint_not_written(segment.base, &err);
+            if i == newest {
+                active = Some(Box::new(hint));
+            } else if let Err(err) = hint.finish(len - segment.base) {
+                hint_not_written(segment.base, &err);
+            }
         }
         if end < len {
             let saved = save_torn(fs, dir, &*segment, end, len)?;
@@ -230,13 +257,7 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
             }
         }
     }
-    Ok(Loaded::Index(index))
-}
-
-fn hint_not_written(base: u64, err: &io::Error) {
-    log::warn!(
-        "could not write the hint for the segment at {base} ({err}); the next open reads it"
-    );
+    Ok(Loaded::Index(index, active))
 }
 
 /// Hints with fewer Set entries than this are read on one thread.

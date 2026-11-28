@@ -15,7 +15,9 @@ use crate::options::{AutoCompact, Options};
 use crate::record::{
     BATCH_PAYLOAD_LEN, HEADER_LEN, Op, Place, Record, encode_batch, encode_op, record_len,
 };
-use crate::segment::{FILE_HEADER_LEN, Segment, compact_name, hint_name, log_name, parse_log_name};
+use crate::segment::{
+    FILE_HEADER_LEN, Segment, active_hint_name, compact_name, hint_name, log_name, parse_log_name,
+};
 use crate::{Batch, CorruptionReason, Error, Key, UnsupportedReason, Value};
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::FileExt;
@@ -730,6 +732,13 @@ fn file_names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Removes every hint in `dir`, as if no write had sealed a segment.
+fn remove_hints(dir: &Path) {
+    for name in file_names(dir).iter().filter(|n| n.ends_with(".hint")) {
+        fs::remove_file(dir.join(name)).unwrap();
+    }
 }
 
 fn set_record(k: &[u8], v: &[u8]) -> Op {
@@ -2225,6 +2234,7 @@ fn open_writes_a_hint_for_each_sealed_segment_it_reads() {
     put(&store, b"c", b"3");
     drop(store);
     assert_eq!(segment_bases(tmp.path()), [0, 69, 89]);
+    remove_hints(tmp.path());
 
     drop(Store::open_with(tmp.path(), segmented(1)).unwrap());
     assert_eq!(
@@ -2347,6 +2357,7 @@ fn a_store_opened_from_the_hints_open_wrote_matches_a_full_read() {
     drop(store);
     let segments = segment_bases(tmp.path()).len();
     assert!(segments > 20, "{segments} segments");
+    remove_hints(tmp.path());
 
     for _ in 0..2 {
         let store = Store::open_with(tmp.path(), segmented(64)).unwrap();
@@ -2379,6 +2390,7 @@ fn a_hint_cut_short_by_a_full_disk_is_replaced_by_the_next_open() {
     store.set(key(b"b"), value(b"2")).unwrap();
     drop(store);
     let hint = Path::new("/db").join(hint_name(0));
+    remove_if_present(&fs, &hint).unwrap();
 
     fs.limit_free_space(Some(10));
     let store = open_on(&fs, segmented(1));
@@ -2456,6 +2468,7 @@ fn open_succeeds_when_it_cannot_write_a_hint() {
     put(&store, b"a", b"1");
     put(&store, b"b", b"2");
     drop(store);
+    remove_hints(tmp.path());
 
     let mode = |mode| fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode));
     mode(0o555).unwrap();
@@ -3178,6 +3191,205 @@ fn a_write_that_fails_is_truncated_away_and_the_store_stays_writable() {
 }
 
 #[test]
+fn a_write_that_fails_never_reaches_the_hint_its_segment_seals_with() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(40));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    fs.limit_free_space(Some(5));
+    store.set(key(b"b"), value(b"2")).unwrap_err();
+    fs.limit_free_space(None);
+    store.set(key(b"c"), value(b"3")).unwrap();
+    store.set(key(b"d"), value(b"4")).unwrap();
+    assert_eq!(
+        fs.read(&Path::new("/db").join(hint_name(0))).unwrap(),
+        hint_bytes(
+            &[
+                &[0x31, 1, 0, 1, 0, 0, 0, b'a'],
+                &[0x31, 1, 0, 1, 0, 0, 0, b'c'],
+            ],
+            2,
+            42,
+            0x1fd8_1702_1f07_f7d9
+        )
+    );
+    drop(store);
+    let store = open_on(&fs, segmented(40));
+    assert_eq!(get_on(&store, b"b"), None);
+    for (k, v) in [(b"a", b"1"), (b"c", b"3"), (b"d", b"4")] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&v[..]));
+    }
+}
+
+/// The bytes `open` reads from each segment in `bases`.
+fn bytes_open_reads(fs: &MemFs, options: Options, bases: &[u64]) -> Vec<u64> {
+    let paths: Vec<PathBuf> = bases
+        .iter()
+        .map(|&base| Path::new("/db").join(log_name(base)))
+        .collect();
+    let before: Vec<u64> = paths.iter().map(|p| fs.bytes_read(p)).collect();
+    drop(open_on(fs, options));
+    paths
+        .iter()
+        .zip(before)
+        .map(|(p, before)| fs.bytes_read(p) - before)
+        .collect()
+}
+
+#[test]
+fn open_reads_only_the_header_of_a_segment_writes_sealed() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(40));
+    for k in [b"a", b"b", b"c", b"d", b"e"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    store
+        .write(batch(&[(b"f", Some(b"6")), (b"a", None)]))
+        .unwrap();
+    drop(store);
+
+    assert_eq!(
+        bytes_open_reads(&fs, segmented(40), &[0, 42, 84]),
+        [17, 17, 17 + 21 + 68]
+    );
+    let store = open_on(&fs, segmented(40));
+    assert_eq!(get_on(&store, b"a"), None);
+    for k in [b"b", b"c", b"d", b"e"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    assert_eq!(get_on(&store, b"f").as_deref(), Some(&b"6"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_seals_the_segment_its_copy_goes_after() {
+    let fs = MemFs::new();
+    let options = Options {
+        auto_compact: AutoCompact::new(50, 0),
+        segment_bytes: 40,
+    };
+    let store = open_on(&fs, options);
+    for (k, v) in [(b"a", b"1"), (b"b", b"1"), (b"a", b"2"), (b"b", b"2")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    // The last set makes 42 of 84 bytes dead, all in the segment at 0, and
+    // the compaction that cleans it puts its copy at 84.
+    let dir = Path::new("/db");
+    let mut bases: Vec<u64> = fs
+        .list(dir)
+        .unwrap()
+        .iter()
+        .filter_map(|n| parse_log_name(n))
+        .collect();
+    bases.sort_unstable();
+    assert_eq!(bases, [42, 84]);
+    assert_eq!(fs.read(&dir.join(active_hint_name(42))), None);
+    assert_eq!(
+        fs.read(&dir.join(hint_name(42))).unwrap(),
+        hint_bytes(
+            &[
+                &[0x31, 1, 0, 1, 0, 0, 0, b'a'],
+                &[0x31, 1, 0, 1, 0, 0, 0, b'b'],
+            ],
+            2,
+            42,
+            0xeef3_3534_f350_8b0f
+        )
+    );
+    drop(store);
+
+    assert_eq!(bytes_open_reads(&fs, options, &[42, 84]), [17, 17]);
+    let store = open_on(&fs, options);
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
+    assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn a_hint_cut_short_by_a_full_disk_is_dropped_and_the_next_segment_gets_one() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(40));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(b"2")).unwrap();
+    // The new segment's header, the manifest listing it, and 10 of the
+    // sealed hint's 45 bytes.
+    fs.limit_free_space(Some(17 + 33 + 10));
+    store.set(key(b"c"), value(b"3")).unwrap_err();
+    fs.limit_free_space(None);
+    let dir = Path::new("/db");
+    assert_eq!(fs.read(&dir.join(hint_name(0))), None);
+    assert_eq!(fs.read(&dir.join(active_hint_name(0))), None);
+    store.set(key(b"c"), value(b"3")).unwrap();
+    store.set(key(b"d"), value(b"4")).unwrap();
+    store.set(key(b"e"), value(b"5")).unwrap();
+    assert_eq!(
+        fs.read(&dir.join(hint_name(42))).unwrap(),
+        hint_bytes(
+            &[
+                &[0x31, 1, 0, 1, 0, 0, 0, b'c'],
+                &[0x31, 1, 0, 1, 0, 0, 0, b'd'],
+            ],
+            2,
+            42,
+            0xe4e8_f4f5_5de6_5024
+        )
+    );
+    drop(store);
+
+    assert_eq!(
+        bytes_open_reads(&fs, segmented(40), &[0, 42, 84]),
+        [17 + 42, 17, 17 + 21]
+    );
+    let store = open_on(&fs, segmented(40));
+    for (k, v) in [
+        (b"a", b"1"),
+        (b"b", b"2"),
+        (b"c", b"3"),
+        (b"d", b"4"),
+        (b"e", b"5"),
+    ] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&v[..]));
+    }
+}
+
+#[test]
+fn the_active_hint_goes_to_a_file_of_its_own_until_its_segment_seals() {
+    let fs = MemFs::new();
+    let options = segmented(2 << 20);
+    let dir = Path::new("/db");
+    let write = |store: &Store<MemFs>, batches: std::ops::Range<u32>| {
+        for b in batches {
+            let mut ops = Batch::new();
+            for i in 0..1000 {
+                ops.set(key(format!("k{:07}", b * 1000 + i).as_bytes()), value(b"v"));
+            }
+            store.write(ops).unwrap();
+        }
+    };
+    let store = open_on(&fs, options);
+    write(&store, 0..70);
+    let active = dir.join(active_hint_name(0));
+    assert_eq!(fs.read(&active).unwrap().len(), 1_048_605);
+    drop(store);
+
+    // A hint without its trailer is never used: open starts it again.
+    let store = open_on(&fs, options);
+    assert_eq!(fs.read(&active).unwrap().len(), 1_048_605);
+    write(&store, 70..76);
+    assert_eq!(fs.read(&active), None);
+    let sealed = fs.read(&dir.join(hint_name(0))).unwrap();
+    assert_eq!(sealed.len(), 5 + 75 * (7 + 1000 * 15) + 24);
+    drop(store);
+
+    assert_eq!(bytes_open_reads(&fs, options, &[0]), [17]);
+    fs.remove(&dir.join(hint_name(0))).unwrap();
+    drop(open_on(&fs, options));
+    assert_eq!(
+        fs.read(&dir.join(hint_name(0))).unwrap(),
+        sealed,
+        "the hint open writes"
+    );
+}
+
+#[test]
 fn a_failed_truncate_after_a_failed_write_poisons_the_store() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1 << 20));
@@ -3412,6 +3624,7 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
         .unwrap();
     put(&store, b"c", b"3");
     assert_eq!(segment_bases(tmp.path()), [0, 21, 89]);
+    remove_hints(tmp.path());
     let file = OpenOptions::new()
         .write(true)
         .open(tmp.path().join(log_name(0)))
@@ -3442,6 +3655,7 @@ fn store_with_an_unreadable_sector() -> MemFs {
     store.set(key(b"b"), value(&[b'2'; 5000])).unwrap();
     store.set(key(b"c"), value(b"3")).unwrap();
     drop(store);
+    remove_if_present(&fs, &Path::new("/db").join(hint_name(21))).unwrap();
     let path = Path::new("/db").join(log_name(21));
     assert_eq!(
         fs.read(&path).unwrap().len(),

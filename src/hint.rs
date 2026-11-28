@@ -66,7 +66,8 @@ impl From<io::Error> for Invalid {
 
 /// Writes a hint file, one entry per record, in log order.
 pub(crate) struct Writer<F: LogFile> {
-    file: F,
+    /// `None` until `give_file`: the entries wait in memory.
+    file: Option<F>,
     buffer: Vec<u8>,
     written: u64,
     checksum: Digest,
@@ -76,11 +77,20 @@ pub(crate) struct Writer<F: LogFile> {
 impl<F: LogFile> Writer<F> {
     /// A hint in the empty `file`.
     pub(crate) fn new(file: F) -> Writer<F> {
+        Writer {
+            file: Some(file),
+            ..Writer::unfiled()
+        }
+    }
+
+    /// A hint with no file yet: its entries wait in memory until it
+    /// `wants_file`, or until it is given one to finish in.
+    pub(crate) fn unfiled() -> Writer<F> {
         let mut buffer = Vec::with_capacity(FLUSH_AT);
         buffer.extend_from_slice(MAGIC);
         buffer.push(VERSION);
         Writer {
-            file,
+            file: None,
             buffer,
             written: 0,
             checksum: Digest::new(CrcAlgorithm::Crc64Nvme),
@@ -88,12 +98,28 @@ impl<F: LogFile> Writer<F> {
         }
     }
 
+    /// Whether it holds enough to write and has no file to write it to.
+    pub(crate) fn wants_file(&self) -> bool {
+        self.file.is_none() && self.buffer.len() >= FLUSH_AT
+    }
+
+    pub(crate) fn has_file(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// The empty file to write the hint to, from the next `push` or
+    /// `finish` on.
+    pub(crate) fn give_file(&mut self, file: F) {
+        debug_assert!(self.file.is_none());
+        self.file = Some(file);
+    }
+
     /// More entries for the hint in `file` that `tail` came from. Cuts off
     /// its trailer first, so it is invalid until `finish`.
     pub(crate) fn extend(file: F, tail: Tail) -> io::Result<Writer<F>> {
         file.set_len(tail.entries_end)?;
         Ok(Writer {
-            file,
+            file: Some(file),
             buffer: Vec::with_capacity(FLUSH_AT),
             written: tail.entries_end,
             checksum: tail.checksum,
@@ -110,26 +136,30 @@ impl<F: LogFile> Writer<F> {
         if fields.kind == Kind::Set {
             self.count += 1;
         }
-        if self.buffer.len() >= FLUSH_AT {
+        if self.buffer.len() >= FLUSH_AT && self.file.is_some() {
             self.flush()?;
         }
         Ok(())
     }
 
     /// Writes the trailer for the first `log_len` bytes of a segment, and
-    /// returns the file.
+    /// returns the file. It must have one.
     pub(crate) fn finish(mut self, log_len: u64) -> io::Result<F> {
         self.buffer.extend_from_slice(&self.count.to_le_bytes());
         self.buffer.extend_from_slice(&log_len.to_le_bytes());
         self.checksum.update(&self.buffer);
         let checksum = self.checksum.finalize();
         self.buffer.extend_from_slice(&checksum.to_le_bytes());
-        self.file.write_all_at(&self.buffer, self.written)?;
-        Ok(self.file)
+        let file = self
+            .file
+            .expect("a hint is given a file before it is finished");
+        file.write_all_at(&self.buffer, self.written)?;
+        Ok(file)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.write_all_at(&self.buffer, self.written)?;
+        let file = self.file.as_ref().expect("only a hint with a file flushes");
+        file.write_all_at(&self.buffer, self.written)?;
         self.checksum.update(&self.buffer);
         self.written += self.buffer.len() as u64;
         self.buffer.clear();

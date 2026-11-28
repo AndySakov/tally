@@ -184,6 +184,14 @@ impl<F: Fs> Store<F> {
         {
             return Err(self.poison(err));
         }
+        // The copy takes the writes from here. An empty segment it replaces,
+        // or one it cleans, goes with its hint.
+        let active = segments.last().expect("there is always a segment");
+        if active.base == base || chosen.contains(&active.base) {
+            self.drop_active_hint(writing, active.base);
+        } else {
+            self.seal(writing, active);
+        }
         self.replace_segments(writing, next);
         // Written only now: nothing orders writes to two files, and a hint
         // must never reach the disk before the copies it lists.
