@@ -154,6 +154,7 @@ impl<F: Fs> Store<F> {
         }
         output.set_len_written(written);
         output.add_dead(carried);
+        output.set_carried(carried);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
@@ -184,6 +185,9 @@ impl<F: Fs> Store<F> {
         for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
+            } else if segment.base > chosen[0] && segment.base != output.base {
+                // What its Deletes hide may be among what goes.
+                segment.set_carried(0);
             }
         }
         // A Delete left behind must not outlive the Set it hides, so then
@@ -412,7 +416,7 @@ impl<F: Fs> Store<F> {
             .map(|s| SegmentSize {
                 base: s.base,
                 len: s.len(),
-                dead: s.dead(),
+                dead: s.reclaimable(),
             })
             .collect();
         let chosen = deadest(&sizes, auto);

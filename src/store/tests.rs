@@ -1045,6 +1045,58 @@ fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
 }
 
 #[test]
+fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    let a = |i: u8| [b'a', b'0' + i];
+    let mut sets = Batch::new();
+    let mut deletes = Batch::new();
+    for i in 0..10 {
+        sets.set(key(&a(i)), value(b"1"));
+        deletes.delete(key(&a(i)));
+    }
+    sets.set(key(b"k"), value(&[b'v'; 1000]));
+    store.write(sets).unwrap();
+    store.write(deletes).unwrap();
+    put(&store, b"c", b"3");
+    assert_eq!(segment_bases(tmp.path()), [0, 1267, 1504]);
+    store.clean(&store.writer(), &[1267]).unwrap();
+    assert_eq!(segment_bases(tmp.path()), [0, 1504, 1525]);
+    drop(store);
+
+    // 457 of 1,498 bytes are dead, 210 of them the copied Deletes.
+    let options = Options {
+        auto_compact: AutoCompact::new(25, 0),
+        segment_bytes: 1,
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    put(&store, b"d", b"4");
+    put(&store, b"e", b"5");
+    assert_eq!(
+        segment_bases(tmp.path()),
+        [0, 1504, 1735, 1945, 1966],
+        "open copies the Deletes once, and the writes after it copy nothing"
+    );
+    for i in 0..10 {
+        assert_eq!(read(&store, &a(i)), None);
+    }
+    assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
+
+    put(&store, b"k", b"new");
+    assert_eq!(
+        segment_bases(tmp.path()),
+        [1504, 1735, 1945, 1966, 1987, 2010],
+        "a=1 at 0 went with the rest of its segment"
+    );
+    let reclaimable: u64 = store.segments().iter().map(|s| s.reclaimable()).sum();
+    assert_eq!(
+        (reclaimable, store.dead()),
+        (210, 210),
+        "the Deletes hide nothing now"
+    );
+}
+
+#[test]
 fn a_copy_of_live_sets_and_a_carried_delete_reopens_from_its_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
