@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use tally::{Batch, Key, Options, Store, Value};
+use tally::{Batch, Key, Store, Value};
 
 const VALUE_LEN: usize = 1024;
 
@@ -199,24 +199,6 @@ fn get(c: &mut Criterion) {
         b.iter(|| {
             i = (i + 7919) % keys.len();
             black_box(store.get(&keys[i]).unwrap())
-        })
-    });
-
-    // The fixture's segment is the active one, read with pread. A write
-    // with smaller segments seals it, and sealed segments are mapped.
-    let sealed = tempfile::tempdir().unwrap();
-    write_fixture(sealed.path(), N, VALUE_LEN);
-    let mut options = Options::default();
-    options.segment_bytes = 1 << 20;
-    Store::open_with(sealed.path(), options)
-        .unwrap()
-        .set(key(N), value(VALUE_LEN))
-        .unwrap();
-    let sealed_store = Store::open_with(sealed.path(), options).unwrap();
-    group.bench_function("hit, 1KiB value, sealed segment", |b| {
-        b.iter(|| {
-            i = (i + 7919) % keys.len();
-            black_box(sealed_store.get(&keys[i]).unwrap())
         })
     });
 
