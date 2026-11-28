@@ -128,6 +128,12 @@ pub struct Inner<F: Fs> {
     /// in the middle of one.
     #[cfg(test)]
     between: std::sync::OnceLock<Between<F>>,
+    /// Compactions that chose segments, and the bytes they copied, for
+    /// measurements.
+    #[cfg(test)]
+    compactions: AtomicU64,
+    #[cfg(test)]
+    copied: AtomicU64,
 }
 
 /// Log offsets from `base` to `end` that a compaction's copies may take.
@@ -489,6 +495,10 @@ impl<F: Fs> Inner<F> {
             stalls: AtomicU64::new(0),
             #[cfg(test)]
             between: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            compactions: AtomicU64::new(0),
+            #[cfg(test)]
+            copied: AtomicU64::new(0),
         };
         let compacting = store.compacting();
         store.count_dead(&store.writer());

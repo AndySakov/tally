@@ -135,6 +135,8 @@ impl<F: Fs> Inner<F> {
             if chosen.is_empty() {
                 return Ok(false);
             }
+            #[cfg(test)]
+            self.compactions.fetch_add(1, Ordering::Relaxed);
             let base = segments.last().expect("there is always a segment").end();
             // Every copy, and every Delete carried, is a record of the same
             // length in a segment being cleaned.
@@ -200,6 +202,8 @@ impl<F: Fs> Inner<F> {
             release();
             return Err(self.poison(err));
         }
+        #[cfg(test)]
+        self.copied.fetch_add(written, Ordering::Relaxed);
         output.set_len_written(written);
         output.add_dead(carried);
         output.set_carried(carried, carried_against);

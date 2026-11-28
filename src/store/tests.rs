@@ -4324,3 +4324,94 @@ fn one_repair_of_a_segment_cut_short_of_its_hint_inside_a_record_lets_open_succe
     assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
     store.verify().unwrap();
 }
+
+/// splitmix64.
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % n
+    }
+}
+
+/// What a run of overwrites left and cost.
+#[derive(Debug)]
+struct Churn {
+    copied: u64,
+    compactions: u64,
+    live: u64,
+    segments: usize,
+}
+
+const CHURN_KEYS: u64 = 100_000;
+
+/// Sets 100,000 keys of 100 bytes, then overwrites `TALLY_CHURN_OPS`
+/// (default 1,000,000) in batches of 1,000 under the default automatic
+/// compaction: `hot_percent` of them go to the first `hot` keys, the rest
+/// to the others. Checks every key reads back its last value.
+fn churn(segment_bytes: u64, hot: u64, hot_percent: u64) -> Churn {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = Options {
+        segment_bytes,
+        ..Options::default()
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    let name = |k: u64| key(format!("key-{k:012}").as_bytes());
+    let ops = std::env::var("TALLY_CHURN_OPS").map_or(1_000_000, |ops| ops.parse().unwrap());
+    let mut rng = Rng(0x7a11);
+    let picks: Vec<u64> = (0..CHURN_KEYS)
+        .chain((0..ops).map(|_| {
+            if rng.below(100) < hot_percent {
+                rng.below(hot)
+            } else {
+                hot + rng.below(CHURN_KEYS - hot)
+            }
+        }))
+        .collect();
+    let mut last = vec![0u64; CHURN_KEYS as usize];
+    for (n, chunk) in picks.chunks(1_000).enumerate() {
+        let mut batch = Batch::new();
+        for (i, &k) in chunk.iter().enumerate() {
+            let at = (n * 1_000 + i) as u64;
+            last[k as usize] = at;
+            batch.set(name(k), value(format!("{at:0100}").as_bytes()));
+        }
+        store.write(batch).unwrap();
+    }
+    for (k, &at) in last.iter().enumerate() {
+        let got = store.get(&name(k as u64)).unwrap().unwrap();
+        assert_eq!(got.as_bytes(), format!("{at:0100}").as_bytes());
+    }
+    let inner = Arc::clone(&store.inner);
+    drop(store);
+    let segments = inner.segments();
+    Churn {
+        copied: inner.copied.load(Ordering::Relaxed),
+        compactions: inner.compactions.load(Ordering::Relaxed),
+        live: segments.iter().map(|s| s.len() - s.dead()).sum(),
+        segments: segments.len(),
+    }
+}
+
+#[test]
+#[ignore = "a measurement: cargo test --release -- --ignored --nocapture what_compaction_copies"]
+fn what_compaction_copies() {
+    for segment_bytes in [2 << 20, 16 << 20] {
+        for (workload, hot, hot_percent) in [("skewed", 1_000, 90), ("uniform", 0, 0)] {
+            let run = churn(segment_bytes, hot, hot_percent);
+            println!(
+                "{workload:>7}, {:>2} MiB segments: {} segments at the end, live / segment_bytes + 1 = {:.2}, \
+                 copied {:.1} MB in {} compactions",
+                segment_bytes >> 20,
+                run.segments,
+                run.live as f64 / segment_bytes as f64 + 1.0,
+                run.copied as f64 / 1e6,
+                run.compactions,
+            );
+        }
+    }
+}
