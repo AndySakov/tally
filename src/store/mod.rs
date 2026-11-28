@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError as TryLock};
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::index::{Entry, Index};
@@ -62,7 +62,6 @@ pub struct Repaired {
 /// which swap in an in-memory disk to simulate power cuts.
 pub struct Store<F: Fs = OsFs> {
     inner: Arc<Inner<F>>,
-    compactor: Option<JoinHandle<()>>,
 }
 
 /// What a `Store` and its compaction thread share.
@@ -87,8 +86,9 @@ pub struct Inner<F: Fs> {
     writing: Mutex<Option<Reserved>>,
     /// Held by a compaction from start to end, and by `verify`.
     compacting: Mutex<()>,
-    /// The compaction thread's signals, if automatic compaction runs on
-    /// one. Without it, the leader whose group made compaction due runs it.
+    /// The compaction thread and its signals, if automatic compaction runs
+    /// on one. Without it, the leader whose group made compaction due runs
+    /// it.
     background: Option<Background>,
     /// Writes waiting for a leader, and the results of those done.
     queue: Mutex<Queue>,
@@ -296,7 +296,6 @@ impl<F: Fs> Store<F> {
     pub(crate) fn open_in(fs: F, dir: &Path, options: Options) -> Result<Self, Error> {
         Ok(Store {
             inner: Arc::new(Inner::open(fs, dir, options, false)?),
-            compactor: None,
         })
     }
 
@@ -308,18 +307,14 @@ impl<F: Fs> Store<F> {
         F::File: Send + Sync,
     {
         let inner = Arc::new(Inner::open(fs, dir, options, true)?);
-        let compactor = match inner.background {
-            Some(_) => {
-                let inner = Arc::clone(&inner);
-                Some(
-                    thread::Builder::new()
-                        .name("tally-compact".into())
-                        .spawn(move || inner.compact_in_background())?,
-                )
-            }
-            None => None,
-        };
-        Ok(Store { inner, compactor })
+        if let Some(background) = &inner.background {
+            let compactor = Arc::clone(&inner);
+            let thread = thread::Builder::new()
+                .name("tally-compact".into())
+                .spawn(move || compactor.compact_in_background())?;
+            background.started(thread);
+        }
+        Ok(Store { inner })
     }
 
     /// Returns the value for `key`, or `None` if it isn't live.
@@ -404,11 +399,7 @@ impl<F: Fs> Store<F> {
 /// adds nothing to durability; it is so the lock is free once the store is.
 impl<F: Fs> Drop for Store<F> {
     fn drop(&mut self) {
-        if let Some(compactor) = self.compactor.take() {
-            self.inner.stop_compactor();
-            // A panic there has poisoned the store and been reported.
-            let _ = compactor.join();
-        }
+        self.inner.stop_compactor();
     }
 }
 

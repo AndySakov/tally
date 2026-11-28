@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Condvar, Mutex, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use super::{Inner, hold};
@@ -18,8 +18,16 @@ pub(super) struct Background {
     signal: Mutex<Signal>,
     /// Signalled when compaction may be due, or the store is closing.
     wake: Condvar,
-    /// Signalled when a compaction ends, or the thread does.
+    /// Signalled when a compaction ends, or the thread panics.
     caught_up: Condvar,
+    /// Taken to join the thread when the store is dropped.
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Background {
+    pub(super) fn started(&self, thread: JoinHandle<()>) {
+        *hold(&self.thread) = Some(thread);
+    }
 }
 
 #[derive(Default)]
@@ -40,9 +48,10 @@ pub(crate) enum Phase {
     Repointed,
 }
 
-/// Wakes writers waiting for compaction when the thread ends, and poisons
-/// the store if it ends in a panic: writers would otherwise wait for a
-/// compaction that never comes.
+/// Poisons the store and wakes writers waiting for compaction if the
+/// thread panics: they would otherwise wait for a compaction that never
+/// comes. It ends otherwise only when the store is dropped, so no write is
+/// waiting.
 struct Exit<'a, F: Fs>(&'a Inner<F>);
 
 impl<F: Fs> Drop for Exit<'_, F> {
@@ -52,8 +61,8 @@ impl<F: Fs> Drop for Exit<'_, F> {
             log::error!(
                 "the compaction thread panicked; writes are off until the store is reopened"
             );
+            self.0.wake_stalled();
         }
-        self.0.wake_stalled();
     }
 }
 
@@ -88,10 +97,17 @@ impl<F: Fs> Inner<F> {
         }
     }
 
+    /// Stops the compaction thread, after the compaction it is running if
+    /// any, and waits for it.
     pub(super) fn stop_compactor(&self) {
-        if let Some(background) = &self.background {
-            hold(&background.signal).stop = true;
-            background.wake.notify_one();
+        let Some(background) = &self.background else {
+            return;
+        };
+        hold(&background.signal).stop = true;
+        background.wake.notify_one();
+        if let Some(thread) = hold(&background.thread).take() {
+            // A panic there has poisoned the store and been reported.
+            let _ = thread.join();
         }
     }
 
@@ -128,15 +144,15 @@ impl<F: Fs> Inner<F> {
         let (Some(background), Some(auto)) = (&self.background, self.auto_compact) else {
             return;
         };
-        let compacting =
+        let can_catch_up =
             || !self.auto_failed.load(Ordering::Relaxed) && !self.poisoned.load(Ordering::Acquire);
         let (dead, len) = self.dead_and_len();
-        if compacting() && auto.slows(dead, len) {
+        if can_catch_up() && auto.slows(dead, len) {
             thread::sleep(SLOWDOWN);
         }
         let stopped = || {
             let (dead, len) = self.dead_and_len();
-            compacting() && auto.stops(dead, len)
+            can_catch_up() && auto.stops(dead, len)
         };
         let mut signal = hold(&background.signal);
         if !stopped() {
