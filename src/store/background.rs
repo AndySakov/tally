@@ -97,15 +97,19 @@ impl<F: Fs> Inner<F> {
 
     /// After a group that wrote something: wakes the compaction thread if
     /// compaction is due, or, without one, compacts on this thread unless a
-    /// compaction is running.
+    /// compaction is running. Not while automatic compaction is off after a
+    /// failure, or the store is poisoned: it would do nothing.
     pub(super) fn after_group(&self) {
+        let Some(auto) = self.auto_compact else {
+            return;
+        };
+        if self.auto_failed.load(Ordering::Relaxed) || self.writable().is_err() {
+            return;
+        }
         let Some(background) = &self.background else {
             if let Some(compacting) = self.try_compacting() {
                 let _ = self.compact_if_due(&compacting);
             }
-            return;
-        };
-        let Some(auto) = self.auto_compact else {
             return;
         };
         let (dead, len) = self.dead_and_len();
