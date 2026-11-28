@@ -146,7 +146,7 @@ Where the list changes:
 - **`open`:** writes the list when the one on disk is missing or lacks a segment it read, after the directory fsync that makes every segment's name durable.
 - **`repair`** never removes a segment: it truncates one, or renames an empty one over it, so the list stays as it is.
 
-A failure to write the list when starting a segment or compacting poisons the store: the segment or copy is durable and in place, and the reopen lists it.
+A failure to write the list when starting a segment or compacting poisons the store: the segment or copy is durable and in place, and the reopen lists it. One case breaks the rule. When a failed directory fsync poisoned the store, a reopen in the same boot fsyncs the directory again on a new descriptor, which Linux may report as a success though the name never reached the disk (see Failed fsync), and lists the segment. A power cut after that leaves a listed segment that is gone: `open` fails with `SegmentMissing` for a new segment that held no record, since none is written to it before it is listed, or for a compaction's copy whose cleaned segments were never removed. Nothing is lost, and removing `tally.manifest` opens the store.
 
 The states a crash can leave, and what `open` does with each:
 
