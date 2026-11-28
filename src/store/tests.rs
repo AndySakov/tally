@@ -4166,7 +4166,7 @@ fn carried_rewrites(dead_percent: u8, n: usize) -> usize {
         auto_compact: AutoCompact::new(dead_percent, 0),
         segment_bytes: 1,
     };
-    let store = Store::open_with(tmp.path(), options).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), options).unwrap();
     let mut seen: std::collections::BTreeSet<u64> = segment_bases(tmp.path()).into_iter().collect();
     let mut rewrites = 0;
     for i in 0..n {
