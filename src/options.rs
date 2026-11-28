@@ -26,8 +26,11 @@ impl Default for Options {
 ///
 /// If compaction falls behind, writes slow down once dead bytes reach
 /// `slow_percent` of the log, and wait for compaction from `stop_percent`,
-/// so the log stays under `100 / (100 - stop_percent)` times its live size:
-/// twice at the default 50%.
+/// so the log stays under `100 / (100 - stop_percent)` times its live size,
+/// twice at the default 50%, or `min_log_bytes`, whichever is larger. Past
+/// that go one group of writes, a running compaction's copies, and the
+/// Delete records compaction carries while a segment it keeps may hold a
+/// Set they hide, which count as live here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompact {
     dead_percent: u8,
@@ -37,22 +40,24 @@ pub struct AutoCompact {
 }
 
 impl AutoCompact {
-    /// `None` unless `dead_percent` is between 1 and 100. Writes slow down
-    /// 5 points above it and stop 10 points above it, at most at 100.
+    /// `None` unless `dead_percent` is between 1 and 99. Writes slow down
+    /// 5 points above it and stop 10 points above it, at most at 99: writes
+    /// stopped at 100% would let the log grow without bound, and stopped
+    /// below the trigger would wait for a compaction that never comes.
     pub fn new(dead_percent: u8, min_log_bytes: u64) -> Option<AutoCompact> {
-        (1..=100).contains(&dead_percent).then(|| AutoCompact {
+        (1..=99).contains(&dead_percent).then(|| AutoCompact {
             dead_percent,
-            slow_percent: dead_percent.saturating_add(5).min(100),
-            stop_percent: dead_percent.saturating_add(10).min(100),
+            slow_percent: (dead_percent + 5).min(99),
+            stop_percent: (dead_percent + 10).min(99),
             min_log_bytes,
         })
     }
 
     /// The same trigger, with writes slowing down at `slow_percent` and
     /// waiting for compaction at `stop_percent`. `None` unless
-    /// `dead_percent <= slow_percent <= stop_percent <= 100`.
+    /// `dead_percent <= slow_percent <= stop_percent <= 99`.
     pub fn with_stalls(self, slow_percent: u8, stop_percent: u8) -> Option<AutoCompact> {
-        (self.dead_percent <= slow_percent && slow_percent <= stop_percent && stop_percent <= 100)
+        (self.dead_percent <= slow_percent && slow_percent <= stop_percent && stop_percent <= 99)
             .then_some(AutoCompact {
                 slow_percent,
                 stop_percent,
@@ -108,11 +113,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dead_percent_must_be_between_1_and_100() {
+    fn dead_percent_must_be_between_1_and_99() {
         assert_eq!(AutoCompact::new(0, 0), None);
         assert_eq!(AutoCompact::new(101, 0), None);
         assert_eq!(AutoCompact::new(1, 7).map(|a| a.dead_percent()), Some(1));
-        assert_eq!(AutoCompact::new(100, 7).map(|a| a.min_log_bytes()), Some(7));
+        assert_eq!(AutoCompact::new(100, 0), None, "writes could never stop");
+        assert_eq!(AutoCompact::new(99, 7).map(|a| a.min_log_bytes()), Some(7));
     }
 
     #[test]
@@ -122,7 +128,7 @@ mod tests {
         assert!(auto.is_due(50, 100));
         assert!(!auto.is_due(50, 99), "below the minimum size");
         assert!(!AutoCompact::new(50, 0).unwrap().is_due(0, 0), "empty log");
-        assert!(AutoCompact::new(100, 0).unwrap().is_due(u64::MAX, u64::MAX));
+        assert!(AutoCompact::new(99, 0).unwrap().is_due(u64::MAX, u64::MAX));
     }
 
     #[test]
@@ -134,8 +140,12 @@ mod tests {
         assert!(!auto.stops(59, 100));
         assert!(auto.stops(60, 100));
         assert!(!auto.stops(60, 99), "below the minimum size");
-        let high = AutoCompact::new(95, 0).unwrap();
-        assert_eq!((high.slow_percent(), high.stop_percent()), (100, 100));
+        let high = AutoCompact::new(90, 0).unwrap();
+        assert_eq!((high.slow_percent(), high.stop_percent()), (95, 99));
+        let higher = AutoCompact::new(95, 0).unwrap();
+        assert_eq!((higher.slow_percent(), higher.stop_percent()), (99, 99));
+        let highest = AutoCompact::new(99, 0).unwrap();
+        assert_eq!((highest.slow_percent(), highest.stop_percent()), (99, 99));
     }
 
     #[test]
@@ -143,7 +153,8 @@ mod tests {
         let auto = AutoCompact::new(40, 0).unwrap();
         assert_eq!(auto.with_stalls(39, 50), None);
         assert_eq!(auto.with_stalls(46, 45), None);
-        assert_eq!(auto.with_stalls(45, 101), None);
+        assert_eq!(auto.with_stalls(45, 100), None, "no bound");
+        assert_eq!(auto.with_stalls(99, 99).map(|a| a.stop_percent()), Some(99));
         let stalls = auto.with_stalls(40, 40).unwrap();
         assert_eq!((stalls.slow_percent(), stalls.stop_percent()), (40, 40));
         assert_eq!(stalls.dead_percent(), 40);

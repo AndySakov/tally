@@ -52,7 +52,9 @@ together share one fsync. If an fsync fails, that write returns the error and ev
 Overwrites and deletes leave dead bytes in the log. By default, once 40% of the log is dead and it is at least
 1 MiB, `open`, and after that a thread of the store's own while writes go on, cleans the segments with the largest
 share of dead bytes until it no longer is. If compaction falls behind, writes slow down at 45% and wait for it at
-50%, so the log stays under twice its live size, besides one group of writes and a running compaction's copies. To
+50%, so the log stays under twice its live size or 1 MiB, whichever is larger. Past that go one group of writes, a
+running compaction's copies, and Delete records compaction must keep while an older segment may hold a value they
+hide. To
 set the thresholds or the segment size, or turn compaction off and call `compact` yourself:
 
 ```rust
