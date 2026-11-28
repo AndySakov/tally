@@ -166,7 +166,7 @@ impl<F: Fs> Store<F> {
         // manifest needs.
         self.seal(writing, sealed);
         self.replace_segments(writing, next);
-        *hold(&self.active_hint) = Some(hint::Writer::unfiled());
+        *hold(&self.active_hint) = Some(hint::Writer::unfiled(self.spill_at));
         Ok(())
     }
 

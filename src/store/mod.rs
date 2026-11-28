@@ -86,6 +86,8 @@ pub struct Store<F: Fs = OsFs> {
     /// The hint of the last segment, while it takes writes, if it has one
     /// (DESIGN.md, Hints written by writes). Only the writer touches it.
     active_hint: Mutex<Option<hint::Writer<F::File>>>,
+    /// The `hint::spill_at` of the thread that opened the store.
+    spill_at: usize,
     /// Writes waiting for a leader, and the results of those done.
     queue: Mutex<Queue>,
     /// Signalled when a group of writes is done.
@@ -297,7 +299,8 @@ impl<F: Fs> Store<F> {
         segments.last().expect("one was just made").file.sync()?;
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
-        let (index, active_hint) = load(&fs, dir, &mut segments)?;
+        let spill_at = hint::spill_at();
+        let (index, active_hint) = load(&fs, dir, &mut segments, spill_at)?;
         if !listed {
             let bases: Vec<u64> = segments.iter().map(|s| s.base).collect();
             manifest::write(&fs, dir, &bases)?;
@@ -313,6 +316,7 @@ impl<F: Fs> Store<F> {
             index,
             writing: Mutex::new(()),
             active_hint: Mutex::new(active_hint),
+            spill_at,
             queue: Mutex::default(),
             committed: Condvar::new(),
             arrived: Condvar::new(),

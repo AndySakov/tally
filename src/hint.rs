@@ -30,6 +30,22 @@ const PREFIX_LEN: u64 = 5;
 const TRAILER_LEN: u64 = 24;
 const FLUSH_AT: usize = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// What `spill_at` returns on this thread, so a test can cut the power
+    /// at the writes of an active hint's file.
+    pub(crate) static SPILL_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(FLUSH_AT) };
+}
+
+/// How many bytes an active segment's hint holds in memory before it goes
+/// to a file, and then holds between writes.
+pub(crate) fn spill_at() -> usize {
+    #[cfg(test)]
+    return SPILL_AT.get();
+    #[cfg(not(test))]
+    FLUSH_AT
+}
+
 /// What a hint file covers, from its trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Trailer {
@@ -69,6 +85,8 @@ pub(crate) struct Writer<F: LogFile> {
     /// `None` until `give_file`: the entries wait in memory.
     file: Option<F>,
     buffer: Vec<u8>,
+    /// How full `buffer` gets before it is written.
+    flush_at: usize,
     written: u64,
     checksum: Digest,
     count: u64,
@@ -79,19 +97,21 @@ impl<F: LogFile> Writer<F> {
     pub(crate) fn new(file: F) -> Writer<F> {
         Writer {
             file: Some(file),
-            ..Writer::unfiled()
+            ..Writer::unfiled(FLUSH_AT)
         }
     }
 
     /// A hint with no file yet: its entries wait in memory until it
-    /// `wants_file`, or until it is given one to finish in.
-    pub(crate) fn unfiled() -> Writer<F> {
-        let mut buffer = Vec::with_capacity(FLUSH_AT);
+    /// `wants_file`, at `flush_at` bytes, or until it is given one to
+    /// finish in.
+    pub(crate) fn unfiled(flush_at: usize) -> Writer<F> {
+        let mut buffer = Vec::with_capacity(flush_at);
         buffer.extend_from_slice(MAGIC);
         buffer.push(VERSION);
         Writer {
             file: None,
             buffer,
+            flush_at,
             written: 0,
             checksum: Digest::new(CrcAlgorithm::Crc64Nvme),
             count: 0,
@@ -100,7 +120,7 @@ impl<F: LogFile> Writer<F> {
 
     /// Whether it holds enough to write and has no file to write it to.
     pub(crate) fn wants_file(&self) -> bool {
-        self.file.is_none() && self.buffer.len() >= FLUSH_AT
+        self.file.is_none() && self.buffer.len() >= self.flush_at
     }
 
     pub(crate) fn has_file(&self) -> bool {
@@ -121,6 +141,7 @@ impl<F: LogFile> Writer<F> {
         Ok(Writer {
             file: Some(file),
             buffer: Vec::with_capacity(FLUSH_AT),
+            flush_at: FLUSH_AT,
             written: tail.entries_end,
             checksum: tail.checksum,
             count: tail.count,
@@ -136,7 +157,7 @@ impl<F: LogFile> Writer<F> {
         if fields.kind == Kind::Set {
             self.count += 1;
         }
-        if self.buffer.len() >= FLUSH_AT && self.file.is_some() {
+        if self.buffer.len() >= self.flush_at && self.file.is_some() {
             self.flush()?;
         }
         Ok(())

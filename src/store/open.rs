@@ -116,9 +116,10 @@ pub(super) fn load<F: Fs>(
     fs: &F,
     dir: &Path,
     segments: &mut [Segment<F::File>],
+    spill_at: usize,
 ) -> Result<(Index, ActiveHint<F::File>), Error> {
     loop {
-        match try_load(fs, dir, segments)? {
+        match try_load(fs, dir, segments, spill_at)? {
             Loaded::Index(index, active) => return Ok((index, active.map(|hint| *hint))),
             Loaded::BadHint(base, hint::Invalid(why)) => {
                 log::warn!(
@@ -144,6 +145,7 @@ fn try_load<F: Fs>(
     fs: &F,
     dir: &Path,
     segments: &mut [Segment<F::File>],
+    spill_at: usize,
 ) -> Result<Loaded<F::File>, Error> {
     let mut hints = Vec::with_capacity(segments.len());
     // The largest hint's Set count, not their sum: a key overwritten in
@@ -194,7 +196,7 @@ fn try_load<F: Fs>(
         // The newest one's goes on with the writes, until it seals.
         let mut writer = None;
         if i == newest && hint.is_none() {
-            writer = Some(hint::Writer::unfiled());
+            writer = Some(hint::Writer::unfiled(spill_at));
         } else if i < newest && hinted < len {
             let opened = match (hint, tail) {
                 (Some((file, _)), Some(tail)) => hint::Writer::extend(file, tail),
