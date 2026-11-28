@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, SideFile, Store, lock,
-    open::open_segments,
+    open::{NotOpened, open_segments},
     remove_if_present,
     scan::{Scanned, scan, scan_into},
 };
@@ -201,10 +201,10 @@ fn move_aside<F: Fs>(
     Ok(unreadable)
 }
 
-/// Repairs a sealed segment at `base` whose file header is damaged or cut
-/// short: none of its records can be trusted at the offsets they claim. The
-/// whole file, header included, goes to the side file, and an empty segment
-/// is renamed into its place.
+/// Repairs a segment at `base` whose file header is damaged, fails to read,
+/// or is cut short in a sealed segment: none of its records can be trusted
+/// at the offsets they claim. The whole file, header included, goes to the
+/// side file, and an empty segment is renamed into its place.
 fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, Error> {
     let path = dir.join(log_name(base));
     let file = fs.open_existing(&path)?;
@@ -237,10 +237,13 @@ impl<F: Fs> Store<F> {
         let _lock = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&_lock)?;
         let segments = match open_segments(fs, dir) {
-            Err(Error::Corruption {
-                offset: base,
-                reason: CorruptionReason::SegmentHeader | CorruptionReason::CutShort,
-            }) => return repair_file_header(fs, dir, base).map(Some),
+            Err(
+                NotOpened::Failed(Error::Corruption {
+                    offset: base,
+                    reason: CorruptionReason::SegmentHeader | CorruptionReason::CutShort,
+                })
+                | NotOpened::UnreadableHeader(base, _),
+            ) => return repair_file_header(fs, dir, base).map(Some),
             opened => opened?.segments,
         };
         let mut index = Index::new();
