@@ -85,12 +85,11 @@ fn read_state(store: &Store<MemFs>) -> State {
         .collect()
 }
 
-/// Runs the workload with power cut before `step`. Returns the disk at the
-/// cut and the states it may hold: every operation finished before the cut,
-/// with the one in progress either applied or not, a group as a whole. One
-/// past the last step is a cut after the workload finished. `None` beyond
-/// that.
-fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
+/// Runs `ops` with power cut before `step`. Returns the disk at the cut and
+/// the states it may hold: every operation finished before the cut, with
+/// the one in progress either applied or not, a group as a whole. One past
+/// the last step is a cut after the workload finished. `None` beyond that.
+fn cut_workload(ops: &[Op], options: Options, step: u64) -> Option<(Disk, Vec<State>)> {
     let fs = MemFs::new();
     fs.cut_before(step);
     let dir = Path::new(DIR);
@@ -99,16 +98,16 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     let mut states = vec![State::new()];
     let mut ends = vec![0];
 
-    let mut store = Store::open_in(fs.clone(), dir, options()).unwrap();
+    let mut store = Store::open_in(fs.clone(), dir, options).unwrap();
     states.push(State::new());
     ends.push(fs.steps());
     let mut state = State::new();
-    for op in workload() {
+    for op in ops {
         if let Op::Reopen = op {
             drop(store);
-            store = Store::open_in(fs.clone(), dir, options()).unwrap();
+            store = Store::open_in(fs.clone(), dir, options).unwrap();
         } else {
-            model::run(&store, 0, &mut state, &op);
+            model::run(&store, 0, &mut state, op);
         }
         states.push(state.clone());
         ends.push(fs.steps());
@@ -126,14 +125,14 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     Some((snapshot, candidates))
 }
 
-/// Opens the store on the disk `cut` leaves of `snapshot` and checks it
-/// recovers to one of `candidates`. With `depth > 0`, first cuts power at
-/// every step of that recovery and checks the same of each result.
-/// Returns how many disks it checked.
+/// Checks the disk `cut` leaves of `snapshot` as [`recover`] does. With
+/// `depth > 0`, first cuts power at every step of that recovery and checks
+/// the same of each result. Returns how many disks it checked.
 fn check_recovery(
     snapshot: &Disk,
     cut: Cut,
     candidates: &[State],
+    options: Options,
     depth: u32,
     context: &str,
 ) -> usize {
@@ -141,21 +140,37 @@ fn check_recovery(
     let mut checked = 1;
     if depth > 0 {
         let fs = MemFs::after(snapshot, cut);
-        drop(Store::open_in(fs.clone(), dir, options()));
+        drop(Store::open_in(fs.clone(), dir, options));
         for step in 1..=fs.steps() {
             let fs = MemFs::after(snapshot, cut);
             fs.cut_before(step);
-            drop(Store::open_in(fs.clone(), dir, options()));
+            drop(Store::open_in(fs.clone(), dir, options));
             let inner = fs.snapshot().unwrap();
             for inner_cut in inner.cuts() {
                 let context = format!("{context}, recovery cut before step {step} {inner_cut:?}");
-                checked += check_recovery(&inner, inner_cut, candidates, depth - 1, &context);
+                checked +=
+                    check_recovery(&inner, inner_cut, candidates, options, depth - 1, &context);
             }
         }
     }
 
+    recover(snapshot, cut, candidates, options, context);
+    checked
+}
+
+/// Opens the store on the disk `cut` leaves of `snapshot`, checks it
+/// recovered to one of `candidates`, and that it takes a write a reopen
+/// keeps. Returns that disk and the state it now holds.
+fn recover(
+    snapshot: &Disk,
+    cut: Cut,
+    candidates: &[State],
+    options: Options,
+    context: &str,
+) -> (MemFs, State) {
+    let dir = Path::new(DIR);
     let fs = MemFs::after(snapshot, cut);
-    let store = Store::open_in(fs.clone(), dir, options())
+    let store = Store::open_in(fs.clone(), dir, options)
         .unwrap_or_else(|err| panic!("{context}: open after the cut failed: {err}"));
     let observed = read_state(&store);
     assert!(
@@ -169,13 +184,13 @@ fn check_recovery(
     drop(store);
     let mut expected = observed;
     expected.insert(7, b"after".to_vec());
-    let reopened = Store::open_in(fs.clone(), dir, options()).unwrap();
+    let reopened = Store::open_in(fs.clone(), dir, options).unwrap();
     assert_eq!(
         read_state(&reopened),
         expected,
         "{context}: write after recovery"
     );
-    checked
+    (fs, expected)
 }
 
 /// Each thread takes the next step to cut at until the workload runs out:
@@ -190,12 +205,14 @@ fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
             scope.spawn(|| {
                 loop {
                     let step = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((snapshot, candidates)) = cut_workload(step) else {
+                    let Some((snapshot, candidates)) = cut_workload(&workload(), options(), step)
+                    else {
                         break;
                     };
                     for cut in snapshot.cuts() {
                         let context = format!("cut before step {step} {cut:?}");
-                        let disks = check_recovery(&snapshot, cut, &candidates, 1, &context);
+                        let disks =
+                            check_recovery(&snapshot, cut, &candidates, options(), 1, &context);
                         checked.fetch_add(disks, Ordering::Relaxed);
                     }
                 }
@@ -205,6 +222,136 @@ fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
     let checked = checked.into_inner();
     assert!(checked > 50, "only {checked} disks checked");
     println!("power cut: {checked} disks checked");
+}
+
+/// Checks the store on `fs` verifies, compacts to `state`, and verifies
+/// with `state` once reopened.
+fn verify_and_compact(fs: &MemFs, state: &State, options: Options, context: &str) {
+    let dir = Path::new(DIR);
+    let store = Store::open_in(fs.clone(), dir, options).unwrap();
+    store
+        .verify()
+        .unwrap_or_else(|err| panic!("{context}: verify after recovery: {err}"));
+    store
+        .compact()
+        .unwrap_or_else(|err| panic!("{context}: compact after recovery: {err}"));
+    assert_eq!(
+        &read_state(&store),
+        state,
+        "{context}: compact after recovery"
+    );
+    drop(store);
+    let store = Store::open_in(fs.clone(), dir, options).unwrap();
+    assert_eq!(
+        &read_state(&store),
+        state,
+        "{context}: reopen after compact"
+    );
+    store
+        .verify()
+        .unwrap_or_else(|err| panic!("{context}: verify after compact: {err}"));
+}
+
+/// A workload of 14 to 23 operations on 2 to 5 keys, the same for the same
+/// seed.
+fn random_workload(seed: u64) -> Vec<Op> {
+    let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let keys = 2 + next() % 4;
+    let key = |n: u64| (n % keys) as u8;
+    let mut ops = Vec::new();
+    for _ in 0..14 + next() % 10 {
+        let len = 1 + (next() % 30) as usize;
+        ops.push(match next() % 11 {
+            0..=3 => Op::Set(key(next()), vec![b'a' + (next() % 26) as u8; len]),
+            4..=6 => Op::Delete(key(next())),
+            7 => Op::Compact,
+            8 => Op::Reopen,
+            9 => Op::Batch(changes(&mut next, keys)),
+            _ => Op::Group(
+                (0..2 + next() % 3)
+                    .map(|_| changes(&mut next, keys))
+                    .collect(),
+            ),
+        });
+    }
+    ops
+}
+
+/// One to three Sets or Deletes on keys below `keys`.
+fn changes(next: &mut impl FnMut() -> u64, keys: u64) -> Vec<(u8, Option<Vec<u8>>)> {
+    (0..1 + next() % 3)
+        .map(|_| {
+            let key = (next() % keys) as u8;
+            let value = next()
+                .is_multiple_of(2)
+                .then(|| vec![b'b'; 1 + (next() % 20) as usize]);
+            (key, value)
+        })
+        .collect()
+}
+
+/// Each seed's random workload, cut before every step under three segment
+/// sizes and compaction triggers. `TALLY_POWER_CUT_SEEDS` sets how many
+/// seeds, from `TALLY_POWER_CUT_SEED`, which a failure names.
+#[test]
+fn random_workloads_lose_no_acknowledged_write_to_a_power_cut() {
+    let env = |name: &str, default: u64| {
+        std::env::var(name).map_or(default, |s| {
+            s.parse()
+                .unwrap_or_else(|_| panic!("{name} must be an integer"))
+        })
+    };
+    let first = env("TALLY_POWER_CUT_SEED", 0);
+    let seeds = env("TALLY_POWER_CUT_SEEDS", 8);
+    let next = AtomicU64::new(first);
+    let checked = AtomicUsize::new(0);
+    let threads = thread::available_parallelism().map_or(1, NonZero::get);
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let seed = next.fetch_add(1, Ordering::Relaxed);
+                    if seed >= first + seeds {
+                        break;
+                    }
+                    let ops = random_workload(seed);
+                    for (segment_bytes, dead_percent) in [(64, 50), (40, 30), (200, 50)] {
+                        let options = Options {
+                            auto_compact: AutoCompact::new(dead_percent, 0),
+                            segment_bytes,
+                        };
+                        let mut step = 1;
+                        while let Some((snapshot, candidates)) = cut_workload(&ops, options, step) {
+                            for cut in snapshot.cuts() {
+                                let context = format!(
+                                    "TALLY_POWER_CUT_SEED={seed} TALLY_POWER_CUT_SEEDS=1, \
+                                     {segment_bytes}-byte segments at {dead_percent}% dead, \
+                                     cut before step {step} {cut:?}\n{ops:?}"
+                                );
+                                let (fs, state) =
+                                    recover(&snapshot, cut, &candidates, options, &context);
+                                verify_and_compact(&fs, &state, options, &context);
+                                checked.fetch_add(1, Ordering::Relaxed);
+                            }
+                            step += 1;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    let checked = checked.into_inner();
+    assert!(
+        checked > 50 * seeds as usize,
+        "only {checked} disks checked"
+    );
+    println!("power cut: {checked} disks checked over {seeds} random workloads");
 }
 
 /// The records of the first segment: a Set of "a", a Delete of "a" with
