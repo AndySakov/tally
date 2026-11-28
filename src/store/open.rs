@@ -137,7 +137,14 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
         let (hinted, tail) = match &hint {
             Some((file, trailer)) => {
-                match read_hint(file, *trailer, segment, &mut index, WINDOW, PARALLEL_FROM) {
+                match read_hint(
+                    file,
+                    *trailer,
+                    segment,
+                    &mut index,
+                    WINDOW,
+                    threads_for(trailer.count, PARALLEL_FROM),
+                ) {
                     Ok((hinted, tail)) => (hinted, Some(tail)),
                     Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
                 }
@@ -214,9 +221,8 @@ fn hint_not_written(base: u64, err: &io::Error) {
 const PARALLEL_FROM: u64 = 100_000;
 
 /// Applies the records `segment`'s hint `file`, whose trailer is
-/// `trailer`, describes to `index`, in order, `window` at a time: on one
-/// thread below `parallel_from` Set entries, from there on up to
-/// `MAX_THREADS` while this one reads on.
+/// `trailer`, describes to `index`, in order, `window` at a time, by
+/// `threads` threads while this one reads on, or by this one alone.
 /// Returns the log offset the hint covers to, and where to extend it from.
 /// On `Err`, what it applied must be thrown away.
 pub(super) fn read_hint<L: LogFile>(
@@ -225,14 +231,13 @@ pub(super) fn read_hint<L: LogFile>(
     segment: &Segment<L>,
     index: &mut Index,
     window: usize,
-    parallel_from: u64,
+    threads: usize,
 ) -> Result<(u64, hint::Tail), hint::Invalid> {
     if trailer.log_len > segment.len() {
         return Err(hint::Invalid::new(
             "the segment is shorter than the hint says",
         ));
     }
-    let threads = threads_for(trailer.count, parallel_from);
     let base = segment.base;
     let tail = applying(index, threads, |sent| {
         let mut changes = Window::default();

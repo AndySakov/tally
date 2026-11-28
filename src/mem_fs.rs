@@ -320,6 +320,7 @@ struct State {
     syncs_left: Option<usize>,
     /// Directory syncs that succeed before every later one fails.
     dir_syncs_left: Option<usize>,
+    dir_syncs: u64,
     fail_truncates: bool,
     /// Removes that go ahead before every later one fails.
     removes_left: Option<usize>,
@@ -352,6 +353,7 @@ impl MemFs {
             free: None,
             syncs_left: None,
             dir_syncs_left: None,
+            dir_syncs: 0,
             fail_truncates: false,
             removes_left: None,
             tamper: None,
@@ -438,6 +440,11 @@ impl MemFs {
 
     pub(crate) fn cut_before(&self, step: u64) {
         self.0.borrow_mut().cut_before = Some(step);
+    }
+
+    /// The directory syncs that have succeeded.
+    pub(crate) fn dir_syncs(&self) -> u64 {
+        self.0.borrow().dir_syncs
     }
 
     pub(crate) fn steps(&self) -> u64 {
@@ -570,8 +577,9 @@ impl Fs for MemFs {
             Some(left) => *left -= 1,
             None => {}
         }
+        state.disk.has_dir(path)?;
+        state.dir_syncs += 1;
         let disk = &mut state.disk;
-        disk.has_dir(path)?;
         let in_dir = |p: &Path| p.parent() == Some(path);
         disk.durable_dirs.retain(|d| !in_dir(d));
         disk.durable_dirs

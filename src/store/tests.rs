@@ -1722,7 +1722,7 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         &segment,
         &mut one,
         WINDOW,
-        u64::MAX,
+        1,
     )
     .unwrap();
     let mut many = Index::new();
@@ -1732,7 +1732,7 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         &segment,
         &mut many,
         100,
-        0,
+        4,
     )
     .unwrap();
 
@@ -1756,7 +1756,7 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
             &segment,
             &mut Index::new(),
             100,
-            0
+            4
         )
         .is_err()
     );
@@ -2659,15 +2659,31 @@ fn compaction_with_no_delete_left_behind_fsyncs_its_removals_once() {
     for k in [b"a", b"b", b"c"] {
         store.set(key(k), value(b"1")).unwrap();
     }
-    // One after the copy's rename, one after removing all three segments.
-    fs.fail_dir_syncs_after(2);
+    let before = fs.dir_syncs();
     store.compact().unwrap();
-    fs.fail_dir_syncs(false);
+    assert_eq!(
+        fs.dir_syncs() - before,
+        2,
+        "one after the copy's rename, one after removing all three segments"
+    );
     drop(store);
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
     }
+}
+
+#[test]
+fn compaction_that_drops_a_delete_fsyncs_after_each_removal() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(b"1")).unwrap();
+    store.delete(key(b"a")).unwrap();
+    store.set(key(b"c"), value(b"1")).unwrap();
+    let before = fs.dir_syncs();
+    store.compact().unwrap();
+    assert_eq!(fs.dir_syncs() - before, 1 + 4);
 }
 
 #[test]
