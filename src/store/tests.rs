@@ -1927,19 +1927,31 @@ fn a_damaged_hint_is_removed_and_the_whole_log_read() {
 }
 
 #[test]
-fn a_hint_for_more_log_than_there_is_is_removed() {
+fn a_newest_segment_cut_short_of_its_hint_is_corruption() {
     let tmp = tempfile::tempdir().unwrap();
     compacted_a_and_b(tmp.path());
     let log = log_bytes(tmp.path());
     write_segment(tmp.path(), 43, &log[..22]);
 
-    let store = Store::open(tmp.path()).unwrap();
+    let err = Store::open(tmp.path()).map(|_| ()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 65,
+                reason: CorruptionReason::CutShort
+            }
+        ),
+        "{err:?}"
+    );
     assert_eq!(
         file_names(tmp.path()),
-        ["tally.00000000000000000043.log", "tally.lock"]
+        [
+            "tally.00000000000000000043.hint",
+            "tally.00000000000000000043.log",
+            "tally.lock"
+        ]
     );
-    assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
-    assert_eq!(store.get(&key(b"b")).unwrap(), None);
 }
 
 #[test]
@@ -3168,5 +3180,42 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
             }
         ),
         "{err:?}"
+    );
+}
+
+#[test]
+fn a_sealed_segment_cut_short_of_its_hint_on_a_record_boundary_is_corruption() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    assert!(
+        fs.read(&dir.join(log_name(42))).is_some(),
+        "a=1, b=2 at 0; c=3 at 42"
+    );
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
+
+    let err = Store::open_in(fs.clone(), dir, segmented(24))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 21,
+                reason: CorruptionReason::CutShort
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        fs.read(&dir.join(hint_name(0))).is_some(),
+        "the evidence stays"
     );
 }

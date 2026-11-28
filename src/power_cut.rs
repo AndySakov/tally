@@ -15,7 +15,7 @@ use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
-use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
+use crate::segment::{FILE_HEADER_LEN, log_name, segment_file};
 use crate::store::LOG_FILE_NAME;
 use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
 
@@ -399,56 +399,5 @@ fn what_open_reads_survives_a_power_cut() {
         let after = MemFs::after(&disk, cut);
         let store = Store::open_in(after.clone(), dir, options()).unwrap();
         assert_eq!(read_state(&store), served, "{cut:?}");
-    }
-}
-
-/// A hint for more log than there is gets removed. If that removal were
-/// not durable, writes that grow the log past the hint's length would make
-/// it look valid again after a power cut.
-#[test]
-fn a_removed_hint_stays_removed_after_a_power_cut() {
-    let dir = Path::new(DIR);
-    let rolls_at_40 = Options {
-        auto_compact: None,
-        segment_bytes: 40,
-    };
-    let fs = MemFs::new();
-    let store = Store::open_in(fs.clone(), dir, rolls_at_40).unwrap();
-    store
-        .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
-        .unwrap();
-    store
-        .set(key(2), Value::try_from(&b"2"[..]).unwrap())
-        .unwrap();
-    store
-        .set(key(4), Value::try_from(&b"4"[..]).unwrap())
-        .unwrap();
-    drop(store);
-    drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());
-    let hint = fs.read(&dir.join(hint_name(0))).unwrap();
-    let log = fs.read(&dir.join(log_name(0))).unwrap();
-    assert_eq!(log.len() as u64, FILE_HEADER_LEN + 23 + 22);
-
-    let fs = MemFs::new();
-    fs.put(
-        &dir.join(log_name(0)),
-        &log[..FILE_HEADER_LEN as usize + 23],
-    );
-    fs.put(&dir.join(hint_name(0)), &hint);
-    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
-    store
-        .set(key(3), Value::try_from(&b"3"[..]).unwrap())
-        .unwrap();
-    drop(store);
-    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), log.len());
-
-    let disk = fs.disk();
-    for cut in disk.cuts() {
-        let store = Store::open_in(MemFs::after(&disk, cut), dir, Options::default()).unwrap();
-        assert_eq!(
-            read_state(&store),
-            State::from([(1, b"hi".to_vec()), (3, b"3".to_vec())]),
-            "{cut:?}"
-        );
     }
 }
