@@ -119,7 +119,7 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
             Ok(file) => match hint::trailer(&file) {
                 Ok(trailer) => {
                     count = count.max(trailer.count.min(trailer.most_sets));
-                    Some(file)
+                    Some((file, trailer))
                 }
                 Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
             },
@@ -136,10 +136,12 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
     let newest = segments.len() - 1;
     for (i, (segment, hint)) in segments.iter_mut().zip(hints).enumerate() {
         let (hinted, tail) = match &hint {
-            Some(file) => match read_hint(file, segment, &mut index, WINDOW, PARALLEL_FROM) {
-                Ok((hinted, tail)) => (hinted, Some(tail)),
-                Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
-            },
+            Some((file, trailer)) => {
+                match read_hint(file, *trailer, segment, &mut index, WINDOW, PARALLEL_FROM) {
+                    Ok((hinted, tail)) => (hinted, Some(tail)),
+                    Err(invalid) => return Ok(Loaded::BadHint(segment.base, invalid)),
+                }
+            }
             None => (segment.base, None),
         };
         let len = segment.end();
@@ -149,7 +151,7 @@ fn try_load<F: Fs>(fs: &F, dir: &Path, segments: &mut [Segment<F::File>]) -> Res
         let mut writer = None;
         if i < newest && hinted < len {
             let opened = match (hint, tail) {
-                (Some(file), Some(tail)) => hint::Writer::extend(file, tail),
+                (Some((file, _)), Some(tail)) => hint::Writer::extend(file, tail),
                 _ => fs
                     .open_or_create(&dir.join(hint_name(segment.base)))
                     .map(hint::Writer::new),
@@ -211,21 +213,24 @@ fn hint_not_written(base: u64, err: &io::Error) {
 /// Hints with fewer Set entries than this are read on one thread.
 const PARALLEL_FROM: u64 = 100_000;
 
-/// Applies the records `segment`'s hint `file` describes to `index`, in
-/// order, `window` at a time: on one thread below `parallel_from` Set
-/// entries, from there on up to `MAX_THREADS` while this one reads on.
+/// Applies the records `segment`'s hint `file`, whose trailer is
+/// `trailer`, describes to `index`, in order, `window` at a time: on one
+/// thread below `parallel_from` Set entries, from there on up to
+/// `MAX_THREADS` while this one reads on.
 /// Returns the log offset the hint covers to, and where to extend it from.
 /// On `Err`, what it applied must be thrown away.
 pub(super) fn read_hint<L: LogFile>(
     file: &impl LogFile,
+    trailer: hint::Trailer,
     segment: &Segment<L>,
     index: &mut Index,
     window: usize,
     parallel_from: u64,
 ) -> Result<(u64, hint::Tail), hint::Invalid> {
-    let trailer = hint::trailer(file)?;
     if trailer.log_len > segment.len() {
-        return Err(hint::Invalid("the segment is shorter than the hint says"));
+        return Err(hint::Invalid::new(
+            "the segment is shorter than the hint says",
+        ));
     }
     let threads = threads_for(trailer.count, parallel_from);
     let base = segment.base;

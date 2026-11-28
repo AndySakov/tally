@@ -1716,9 +1716,25 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         segment_records(tmp.path(), 0).len() as u64,
     );
     let mut one = Index::new();
-    let (len_one, _) = read_hint(&file, &segment, &mut one, WINDOW, u64::MAX).unwrap();
+    let (len_one, _) = read_hint(
+        &file,
+        crate::hint::trailer(&file).unwrap(),
+        &segment,
+        &mut one,
+        WINDOW,
+        u64::MAX,
+    )
+    .unwrap();
     let mut many = Index::new();
-    let (len_many, _) = read_hint(&file, &segment, &mut many, 100, 0).unwrap();
+    let (len_many, _) = read_hint(
+        &file,
+        crate::hint::trailer(&file).unwrap(),
+        &segment,
+        &mut many,
+        100,
+        0,
+    )
+    .unwrap();
 
     assert_eq!((len_one, len_many), (segment.end(), segment.end()));
     assert_eq!(many.len(), 2000);
@@ -1733,7 +1749,17 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
     let damaged_path = tmp.path().join("damaged");
     std::fs::write(&damaged_path, damaged).unwrap();
     let damaged = fs.open_existing(&damaged_path).unwrap();
-    assert!(read_hint(&damaged, &segment, &mut Index::new(), 100, 0).is_err());
+    assert!(
+        read_hint(
+            &damaged,
+            crate::hint::trailer(&damaged).unwrap(),
+            &segment,
+            &mut Index::new(),
+            100,
+            0
+        )
+        .is_err()
+    );
 }
 
 /// 150,000 records, three windows: sets, overwrites, deletes and
@@ -2641,6 +2667,98 @@ fn compaction_with_no_delete_left_behind_fsyncs_its_removals_once() {
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+}
+
+#[test]
+fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c", b"d"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The first entry's value length goes from 1 to 3, which would point
+    // every later key 2 bytes past its copy.
+    fs.tamper(&Path::new("/db").join(hint_name(84)), |offset, bytes| {
+        if offset == 0 {
+            bytes[8] ^= 2;
+        }
+    });
+    let err = store.compact().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 84,
+                reason: CorruptionReason::CompactionHint
+            }
+        ),
+        "{err:?}"
+    );
+    for k in [b"a", b"b", b"c", b"d"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    store.set(key(b"e"), value(b"1")).unwrap();
+    drop(store);
+
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c", b"d", b"e"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The copy's header and the copy; then its hint's fails.
+    fs.fail_syncs_after(2);
+    let err = store.compact().unwrap_err();
+    fs.fail_syncs(false);
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(fs.read(&Path::new("/db").join(hint_name(63))), None);
+    assert_eq!(store.dead(), 63, "the copies, which nothing points at");
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    store.set(key(b"d"), value(b"1")).unwrap();
+    drop(store);
+
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c", b"d"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_whose_second_removal_fails_loses_nothing_to_a_power_cut() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The first segment's absent hint and the segment itself.
+    fs.fail_removes_after(2);
+    let err = store.compact().unwrap_err();
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    assert_eq!(
+        store.segments().iter().map(|s| s.base).collect::<Vec<_>>(),
+        [21, 42, 63]
+    );
+    store.set(key(b"d"), value(b"1")).unwrap();
+    let disk = fs.disk();
+    drop(store);
+
+    for cut in disk.cuts() {
+        let store = open_on(&MemFs::after(&disk, cut), segmented(1));
+        for k in [b"a", b"b", b"c", b"d"] {
+            assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]), "{cut:?}");
+        }
     }
 }
 

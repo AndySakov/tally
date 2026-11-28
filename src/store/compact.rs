@@ -1,7 +1,6 @@
 //! Compaction (DESIGN.md, Compaction).
 
 use std::collections::BTreeSet;
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,7 +17,7 @@ use crate::index::Entry;
 use crate::options::AutoCompact;
 use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
-use crate::{Error, Key};
+use crate::{CorruptionReason, Error, Key};
 
 /// What `copy_live` wrote.
 struct Copied<L: LogFile> {
@@ -337,7 +336,9 @@ impl<F: Fs> Store<F> {
         {
             let hinted = hint::trailer(&file).and_then(|trailer| {
                 if trailer.log_len > segment.len() {
-                    return Err(hint::Invalid("the segment is shorter than the hint says"));
+                    return Err(hint::Invalid::new(
+                        "the segment is shorter than the hint says",
+                    ));
                 }
                 hint::read_entries(&file, trailer, |fields, key, _| {
                     if fields.kind == Kind::Set {
@@ -348,7 +349,13 @@ impl<F: Fs> Store<F> {
             });
             match hinted {
                 Ok(len) => from += len,
-                Err(_) => keys.clear(),
+                Err(hint::Invalid(why)) => {
+                    log::warn!(
+                        "ignored the hint for the segment at {} ({why}); reading the segment instead",
+                        segment.base
+                    );
+                    keys.clear();
+                }
             }
         }
         each_record(segment, from, |read| {
@@ -363,7 +370,8 @@ impl<F: Fs> Store<F> {
     /// Points each key `copy_live` copied at its copy in `output`, as the
     /// output's durable hint lists them, if the key still points at the old
     /// record `moved` holds the offset of. A copy left unpointed is dead.
-    /// The Delete records after the copies change nothing.
+    /// The Delete records after the copies change nothing. The hint is
+    /// checked whole first: a bad entry would point keys at other records.
     fn repoint(
         &self,
         output: &Segment<F::File>,
@@ -371,11 +379,20 @@ impl<F: Fs> Store<F> {
         moved: &[u64],
     ) -> Result<(), Error> {
         let unreadable = |hint::Invalid(why)| {
-            Error::Io(io::Error::other(format!(
-                "rereading a compaction's hint: {why}"
-            )))
+            log::warn!(
+                "rereading the hint of the compaction at {}: {why}",
+                output.base
+            );
+            Error::Corruption {
+                offset: output.base,
+                reason: CorruptionReason::CompactionHint,
+            }
         };
+        hint::check(hint_file).map_err(unreadable)?;
         let trailer = hint::trailer(hint_file).map_err(unreadable)?;
+        if trailer.count != moved.len() as u64 {
+            return Err(unreadable(hint::Invalid::new("not one entry per copy")));
+        }
         let mut old = moved.iter();
         let mut unmatched = false;
         hint::read_entries(hint_file, trailer, |fields, key, offset| {
@@ -393,7 +410,7 @@ impl<F: Fs> Store<F> {
         })
         .map_err(unreadable)?;
         if unmatched || old.next().is_some() {
-            return Err(unreadable(hint::Invalid("not one entry per copy")));
+            return Err(unreadable(hint::Invalid::new("not one entry per copy")));
         }
         Ok(())
     }

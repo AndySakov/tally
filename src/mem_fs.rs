@@ -17,7 +17,10 @@
 //! truncate fail, changing nothing, and `fail_dir_syncs_after(n)` every
 //! directory sync after the next `n`. `fail_syncs` makes every file sync fail the way Linux does: the
 //! pending changes never reach the disk, even after a later sync, while
-//! reads still see them.
+//! reads still see them; `fail_syncs_after(n)` does so after the next `n`.
+//! `fail_removes_after(n)` makes every remove after the next `n` fail,
+//! changing nothing. `tamper`
+//! changes what a write to one path lands, as a bad disk would.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
@@ -313,11 +316,18 @@ struct State {
     snapshot: Option<Disk>,
     /// Bytes writes can still add, or `None` for no limit.
     free: Option<u64>,
-    fail_syncs: bool,
+    /// File syncs that succeed before every later one fails.
+    syncs_left: Option<usize>,
     /// Directory syncs that succeed before every later one fails.
     dir_syncs_left: Option<usize>,
     fail_truncates: bool,
+    /// Removes that go ahead before every later one fails.
+    removes_left: Option<usize>,
+    tamper: Option<(PathBuf, Tamper)>,
 }
+
+/// Changes the bytes a write at an offset lands.
+type Tamper = fn(u64, &mut [u8]);
 
 #[derive(Clone)]
 pub struct MemFs(Rc<RefCell<State>>);
@@ -340,9 +350,11 @@ impl MemFs {
             cut_before: None,
             snapshot: None,
             free: None,
-            fail_syncs: false,
+            syncs_left: None,
             dir_syncs_left: None,
             fail_truncates: false,
+            removes_left: None,
+            tamper: None,
         })))
     }
 
@@ -378,7 +390,21 @@ impl MemFs {
     }
 
     pub(crate) fn fail_syncs(&self, fail: bool) {
-        self.0.borrow_mut().fail_syncs = fail;
+        self.0.borrow_mut().syncs_left = fail.then_some(0);
+    }
+
+    pub(crate) fn fail_syncs_after(&self, n: usize) {
+        self.0.borrow_mut().syncs_left = Some(n);
+    }
+
+    pub(crate) fn fail_removes_after(&self, n: usize) {
+        self.0.borrow_mut().removes_left = Some(n);
+    }
+
+    /// From now on, `tamper` changes the bytes of each write to the file
+    /// at `path`, given the write's offset.
+    pub(crate) fn tamper(&self, path: &Path, tamper: Tamper) {
+        self.0.borrow_mut().tamper = Some((path.to_path_buf(), tamper));
     }
 
     pub(crate) fn fail_dir_syncs(&self, fail: bool) {
@@ -510,6 +536,11 @@ impl Fs for MemFs {
     fn remove(&self, path: &Path) -> io::Result<()> {
         self.step();
         let mut state = self.0.borrow_mut();
+        match &mut state.removes_left {
+            Some(0) => return Err(io::Error::other("injected remove failure")),
+            Some(left) => *left -= 1,
+            None => {}
+        }
         let disk = &mut state.disk;
         disk.files.remove(path).ok_or(ErrorKind::NotFound)?;
         disk.entry_changes
@@ -591,16 +622,22 @@ impl LogFile for MemFile {
     fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
         self.fs.step();
         let fits = self.fs.take_space(buf.len());
+        let mut bytes = buf[..fits].to_vec();
+        {
+            let state = self.fs.0.borrow();
+            if let Some((path, tamper)) = &state.tamper
+                && state.disk.files.get(path) == Some(&self.ino)
+            {
+                tamper(offset, &mut bytes);
+            }
+        }
         self.fs.with_inode(self.ino, |inode| {
             assert_eq!(
                 offset,
                 inode.data.len() as u64,
                 "LogFile writes go only at the end"
             );
-            let change = Change::Write {
-                offset,
-                bytes: buf[..fits].to_vec(),
-            };
+            let change = Change::Write { offset, bytes };
             apply(&mut inode.data, &change);
             inode.pending.push(change);
         });
@@ -629,7 +666,17 @@ impl LogFile for MemFile {
 
     fn sync(&self) -> io::Result<()> {
         self.fs.step();
-        let failed = self.fs.0.borrow().fail_syncs;
+        let failed = {
+            let mut state = self.fs.0.borrow_mut();
+            match &mut state.syncs_left {
+                Some(0) => true,
+                Some(left) => {
+                    *left -= 1;
+                    false
+                }
+                None => false,
+            }
+        };
         self.fs.with_inode(self.ino, |inode| {
             for change in inode.pending.drain(..) {
                 if !failed {
