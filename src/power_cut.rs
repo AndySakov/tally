@@ -15,7 +15,7 @@ use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
-use crate::segment::{FILE_HEADER_LEN, log_name, segment_file};
+use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
 use crate::store::LOG_FILE_NAME;
 use crate::{AutoCompact, Key, Options, Repaired, SideFile, Store, Value};
 
@@ -402,5 +402,51 @@ fn what_open_reads_survives_a_power_cut() {
         let after = MemFs::after(&disk, cut);
         let store = Store::open_in(after.clone(), dir, options()).unwrap();
         assert_eq!(read_state(&store), served, "{cut:?}");
+    }
+}
+
+/// What `repair` does to a segment cut short of its hint is durable when
+/// it returns: after a power cut, `open` reads the segment as it is.
+#[test]
+fn a_hint_repair_removes_stays_removed_after_a_power_cut() {
+    let dir = Path::new(DIR);
+    let rolls_at_40 = Options {
+        auto_compact: None,
+        segment_bytes: 40,
+    };
+    let fs = MemFs::new();
+    let store = Store::open_in(fs.clone(), dir, rolls_at_40).unwrap();
+    for (k, v) in [(1, &b"hi"[..]), (2, b"2"), (4, b"4")] {
+        store.set(key(k), Value::try_from(v).unwrap()).unwrap();
+    }
+    drop(store);
+    drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());
+    let hint = fs.read(&dir.join(hint_name(0))).unwrap();
+    let log = fs.read(&dir.join(log_name(0))).unwrap();
+    assert_eq!(log.len() as u64, FILE_HEADER_LEN + 23 + 22);
+
+    let fs = MemFs::new();
+    fs.put(
+        &dir.join(log_name(0)),
+        &log[..FILE_HEADER_LEN as usize + 23],
+    );
+    fs.put(&dir.join(hint_name(0)), &hint);
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 23,
+            dropped: 22,
+            side_file: None
+        })
+    );
+
+    let disk = fs.disk();
+    for cut in disk.cuts() {
+        let store = Store::open_in(MemFs::after(&disk, cut), dir, Options::default()).unwrap();
+        assert_eq!(
+            read_state(&store),
+            State::from([(1, b"hi".to_vec())]),
+            "{cut:?}"
+        );
     }
 }
