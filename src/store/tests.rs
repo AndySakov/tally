@@ -3326,3 +3326,36 @@ fn repair_cuts_at_the_record_holding_a_sector_whose_whole_read_fails() {
     assert_eq!(get_on(&store, b"c"), None);
     assert_eq!(get_on(&store, b"d"), None);
 }
+
+#[test]
+fn repair_keeps_a_small_record_that_ends_right_before_a_block_whose_whole_read_fails() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1 << 20));
+    store.set(key(b"a"), value(&[b'1'; 12230])).unwrap();
+    store.set(key(b"b"), value(b"2")).unwrap();
+    store.set(key(b"c"), value(b"3")).unwrap();
+    drop(store);
+    let path = dir.join(log_name(0));
+    assert_eq!(
+        fs.read(&path).unwrap().len(),
+        FILE_HEADER_LEN as usize + 12292,
+        "a at 0, b at 12250, c at 12271, at file offset 12288"
+    );
+    fs.fail_whole_reads(&path, 12288..16384);
+
+    let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
+
+    assert_eq!(
+        (
+            repaired.offset,
+            repaired.dropped,
+            repaired.side_file.unreadable
+        ),
+        (12271, 21, vec![Range { start: 0, end: 21 }])
+    );
+    let store = open_on(&fs, segmented(1 << 20));
+    assert_eq!(get_on(&store, b"a"), Some(vec![b'1'; 12230]));
+    assert_eq!(get_on(&store, b"b"), Some(b"2".to_vec()));
+    assert_eq!(get_on(&store, b"c"), None);
+}

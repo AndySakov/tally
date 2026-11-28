@@ -142,26 +142,20 @@ impl Reading {
 }
 
 /// Where the damage is in `file` from `start`, where a scan's read failed,
-/// to `len`: read again a block at a time, so that it is the record or
-/// batch a failed block falls in, not the first one a larger read reached.
-/// `None` if it all reads.
+/// to `len`: read again unbuffered, each header and payload in a read of
+/// its own, so that it is the first record or batch with a byte that fails
+/// to read, not the first one a larger read reached. `None` if it all
+/// reads.
 fn damage_after_a_failed_read(
     file: &impl LogFile,
     start: u64,
     len: u64,
 ) -> Result<Option<u64>, Error> {
     let mut reading = Reading::from(start);
-    match scan_into(
-        file,
-        start,
-        len,
-        BLOCK as usize,
-        &mut |_, _| {},
-        &mut |scanned| {
-            reading.saw(&scanned);
-            Ok(())
-        },
-    ) {
+    match scan_into(file, start, len, 1, &mut |_, _| {}, &mut |scanned| {
+        reading.saw(&scanned);
+        Ok(())
+    }) {
         Ok(()) => Ok(None),
         Err(Error::Corruption { offset, .. }) => Ok(Some(offset)),
         Err(Error::Io(_)) => Ok(Some(reading.at)),
