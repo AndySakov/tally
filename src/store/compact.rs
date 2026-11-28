@@ -43,13 +43,32 @@ struct Copied<L: LogFile> {
     dropped_delete: bool,
 }
 
+/// Why `copy_live` stopped before the end of a segment.
+enum Stop {
+    /// The store is being dropped.
+    Closing,
+    Failed(Error),
+}
+
+impl From<Error> for Stop {
+    fn from(err: Error) -> Stop {
+        Stop::Failed(err)
+    }
+}
+
+impl From<io::Error> for Stop {
+    fn from(err: io::Error) -> Stop {
+        Stop::Failed(err.into())
+    }
+}
+
 /// Calls `each` with every record of `segment` from `start` to its end, a
 /// batch's records as their own, checked as `scan` checks them.
-fn each_record<L: LogFile>(
+fn each_record<L: LogFile, E: From<Error>>(
     segment: &Segment<L>,
     start: u64,
-    mut each: impl FnMut(Scanned) -> Result<(), Error>,
-) -> Result<(), Error> {
+    mut each: impl FnMut(Scanned) -> Result<(), E>,
+) -> Result<(), E> {
     scan_into(
         segment,
         start,
@@ -118,7 +137,8 @@ impl<F: Fs> Inner<F> {
 
     /// Copies the live records of the segments `choose` picks from the
     /// list (their bases, in log order) to a new segment at the end of the
-    /// log, then removes them, and returns whether it picked any. A Delete
+    /// log, then removes them, and returns whether it did. The store being
+    /// dropped stops it while the copy is under its temporary name. A Delete
     /// record is copied too while an older segment that is kept may hold a
     /// Set it hides. Writes go on meanwhile: the first after `choose` starts
     /// a segment past every offset the copies could take, so none of them
@@ -149,11 +169,18 @@ impl<F: Fs> Inner<F> {
             });
             (segments, chosen, base)
         };
-        let release = || *self.writer().reserved = None;
-        #[cfg(test)]
-        self.between(Phase::Reserved);
         let copy_path = self.dir.join(compact_name(base));
         let hint_path = self.dir.join(hint_name(base));
+        let release = || *self.writer().reserved = None;
+        let discard = || {
+            let _ = remove_if_present(&self.fs, &copy_path);
+            let _ = remove_if_present(&self.fs, &hint_path);
+            let mut writing = self.writer();
+            *writing.reserved = None;
+            writing
+        };
+        #[cfg(test)]
+        self.between(Phase::Reserved);
         // The copy is complete and durable before it takes a segment's name,
         // so the newest segment never holds more than one append that a
         // crash could tear. An empty one never does: once a write has
@@ -161,7 +188,9 @@ impl<F: Fs> Inner<F> {
         let copied = self
             .copy_live(&segments, base, &copy_path, &hint_path, &chosen)
             .and_then(|copied| {
-                if copied.written > 0 {
+                if let Some(copied) = &copied
+                    && copied.written > 0
+                {
                     self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
                 }
                 Ok(copied)
@@ -175,27 +204,33 @@ impl<F: Fs> Inner<F> {
             carried_against,
             dropped_delete,
         } = match copied {
-            Ok(copied) => copied,
+            Ok(Some(copied)) if copied.written > 0 => copied,
+            Ok(Some(Copied {
+                output,
+                hint,
+                dropped_delete,
+                ..
+            })) => {
+                drop((output, hint));
+                let writing = discard();
+                if chosen.contains(&self.active().base) {
+                    // Nothing was written after it, and it goes.
+                    self.roll(&writing, base)?;
+                }
+                drop(writing);
+                return self.remove_cleaned(&chosen, None, dropped_delete);
+            }
+            Ok(None) => {
+                drop(discard());
+                return Ok(false);
+            }
             Err(err) => {
-                let _ = remove_if_present(&self.fs, &copy_path);
-                let _ = remove_if_present(&self.fs, &hint_path);
-                release();
+                drop(discard());
                 return Err(err);
             }
         };
-        if written == 0 {
-            drop((output, hint));
-            let _ = remove_if_present(&self.fs, &copy_path);
-            let _ = remove_if_present(&self.fs, &hint_path);
-            let mut writing = self.writer();
-            *writing.reserved = None;
-            if chosen.contains(&self.active().base) {
-                // Nothing was written after it, and it goes.
-                self.roll(&writing, base)?;
-            }
-            drop(writing);
-            return self.remove_cleaned(&chosen, None, dropped_delete);
-        }
+        #[cfg(test)]
+        self.between(Phase::Renamed);
         if let Err(err) = self.fs.sync_dir(&self.dir) {
             release();
             return Err(self.poison(err));
@@ -357,7 +392,8 @@ impl<F: Fs> Inner<F> {
     /// deleted: it isn't live, and a kept segment older than one of its
     /// Delete records may hold a Set of it. Then fsyncs the copy. One
     /// buffered pass per segment: reading the dead records in between costs
-    /// less than a positioned read per live one.
+    /// less than a positioned read per live one. `None` if the store is
+    /// being dropped.
     fn copy_live(
         &self,
         segments: &[Arc<Segment<F::File>>],
@@ -365,7 +401,7 @@ impl<F: Fs> Inner<F> {
         copy_path: &Path,
         hint_path: &Path,
         chosen: &[u64],
-    ) -> Result<Copied<F::File>, Error> {
+    ) -> Result<Option<Copied<F::File>>, Error> {
         let output = create(&self.fs, copy_path, base)?;
         let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
@@ -377,7 +413,12 @@ impl<F: Fs> Inner<F> {
         let mut buffer = Vec::new();
         let mut written = 0u64;
         for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
-            each_record(input, input.base, |read| {
+            let read = each_record(input, input.base, |read| {
+                #[cfg(test)]
+                self.between(Phase::Copying);
+                if self.stopping() {
+                    return Err(Stop::Closing);
+                }
                 match read.op {
                     IndexOp::Set { key } => {
                         if self
@@ -415,7 +456,12 @@ impl<F: Fs> Inner<F> {
                     IndexOp::Batch { .. } => {}
                 }
                 Ok(())
-            })?;
+            });
+            match read {
+                Ok(()) => {}
+                Err(Stop::Closing) => return Ok(None),
+                Err(Stop::Failed(err)) => return Err(err),
+            }
         }
         let mut carried = 0;
         for key in carry {
@@ -432,7 +478,7 @@ impl<F: Fs> Inner<F> {
         output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
         output.file.sync()?;
-        Ok(Copied {
+        Ok(Some(Copied {
             output,
             hint,
             written,
@@ -440,7 +486,7 @@ impl<F: Fs> Inner<F> {
             carried,
             carried_against,
             dropped_delete,
-        })
+        }))
     }
 
     /// The base of the oldest segment older than `before` that is not being
@@ -502,7 +548,7 @@ impl<F: Fs> Inner<F> {
                 }
             }
         }
-        each_record(segment, from, |read| {
+        each_record::<_, Error>(segment, from, |read| {
             if let IndexOp::Set { key } = read.op {
                 keys.add(key);
             }

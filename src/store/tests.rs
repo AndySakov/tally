@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -3502,6 +3502,8 @@ fn a_write_does_not_wait_for_a_running_automatic_compaction() {
         go.send(()).unwrap();
         returned.expect("the write returns while the compaction is held");
     });
+    // A drop would stop it if it were still copying.
+    drop(store.compacting());
     drop(store);
     assert_eq!(
         segment_bases(tmp.path()),
@@ -3614,21 +3616,155 @@ fn a_panic_on_the_compaction_thread_poisons_the_store() {
     store.verify().unwrap();
 }
 
+/// Holds the store's first compaction at `phase`, once `then` has run, until
+/// the store is being dropped; the receiver hears when it gets there. The
+/// count is of the records the copy read.
+fn hold_until_dropped(
+    store: &Store,
+    phase: Phase,
+    then: impl Fn(&Inner<OsFs>) + Send + Sync + 'static,
+) -> (mpsc::Receiver<()>, Arc<AtomicU64>) {
+    let (at_tx, at_rx) = mpsc::channel();
+    let at_tx = Mutex::new(at_tx);
+    let held = AtomicBool::new(false);
+    let read = Arc::new(AtomicU64::new(0));
+    {
+        let read = Arc::clone(&read);
+        store.on_phase(move |inner, now| {
+            if now == Phase::Copying {
+                read.fetch_add(1, Ordering::Relaxed);
+            }
+            if now == phase && !held.swap(true, Ordering::Relaxed) {
+                then(inner);
+                hold(&at_tx).send(()).unwrap();
+                eventually("dropping", || inner.stopping());
+            }
+        });
+    }
+    (at_rx, read)
+}
+
+/// Drops `store` on a thread of its own, so a drop that never returns fails
+/// the test instead of hanging it.
+fn drop_in_time(store: Store) {
+    let (dropped_tx, dropped) = mpsc::channel();
+    thread::spawn(move || {
+        drop(store);
+        dropped_tx.send(()).unwrap();
+    });
+    dropped.recv_timeout(PATIENCE).expect("the drop returns");
+}
+
 #[test]
-fn dropping_the_store_lets_its_compaction_finish_and_frees_the_lock() {
+fn dropping_the_store_during_a_copy_stops_it_and_frees_the_lock() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
-    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    let (at, read) = hold_until_dropped(&store, Phase::Copying, |_| {});
     half_dead(&store);
-    at.recv_timeout(PATIENCE).expect("a compaction starts");
-    thread::scope(|scope| {
-        scope.spawn(move || drop(store));
-        go.send(()).unwrap();
-    });
-    assert_eq!(segment_bases(tmp.path()), [84]);
+    at.recv_timeout(PATIENCE).expect("a compaction copies");
+    drop_in_time(store);
+    assert_eq!(
+        read.load(Ordering::Relaxed),
+        1,
+        "it stopped at the first record read after the drop began, of 4"
+    );
+    assert_eq!(
+        file_names(tmp.path()),
+        [
+            "tally.00000000000000000000.log",
+            "tally.lock",
+            "tally.manifest"
+        ],
+        "no copy at 84, and no hint for one"
+    );
+    assert_eq!(manifest::read(&OsFs, tmp.path()).unwrap(), Some(vec![0]));
+    let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+    assert_eq!(read_all(&store), ["a=3", "b=4"]);
+    store.verify().unwrap();
+}
+
+#[test]
+fn dropping_the_store_during_a_copy_a_write_went_past_leaves_the_gap_of_an_empty_copy() {
+    let tmp = tempfile::tempdir().unwrap();
     let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
-    assert_eq!(read(&store, b"a").as_deref(), Some(&b"3"[..]));
-    assert_eq!(read(&store, b"b").as_deref(), Some(&b"4"[..]));
+    let (at, read) = hold_until_dropped(&store, Phase::Copying, |inner| {
+        inner.set(key(b"c"), value(b"5")).unwrap();
+    });
+    half_dead(&store);
+    at.recv_timeout(PATIENCE).expect("a compaction copies");
+    drop_in_time(store);
+    assert_eq!(read.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        segment_bases(tmp.path()),
+        [0, 168],
+        "nothing at 84: the write went past the 84 bytes reserved there"
+    );
+    assert_eq!(
+        file_names(tmp.path()),
+        [
+            "tally.00000000000000000000.log",
+            "tally.00000000000000000168.log",
+            "tally.lock",
+            "tally.manifest"
+        ]
+    );
+    assert_eq!(
+        manifest::read(&OsFs, tmp.path()).unwrap(),
+        Some(vec![0, 168])
+    );
+    assert_eq!(
+        segment_records(tmp.path(), 168),
+        encoded_at(168, &[set_record(b"c", b"5")])
+    );
+    let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+    assert_eq!(read_all(&store), ["a=3", "b=4", "c=5"]);
+    store.verify().unwrap();
+}
+
+#[test]
+fn dropping_the_store_once_the_copy_has_its_name_lets_the_compaction_finish() {
+    for phase in [Phase::Renamed, Phase::Copied] {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+        let (at, read) = hold_until_dropped(&store, phase, |_| {});
+        half_dead(&store);
+        at.recv_timeout(PATIENCE).expect("a compaction gets there");
+        drop_in_time(store);
+        assert_eq!(read.load(Ordering::Relaxed), 4, "{phase:?}");
+        assert_eq!(
+            file_names(tmp.path()),
+            [
+                "tally.00000000000000000084.hint",
+                "tally.00000000000000000084.log",
+                "tally.lock",
+                "tally.manifest"
+            ],
+            "{phase:?}"
+        );
+        assert_eq!(
+            manifest::read(&OsFs, tmp.path()).unwrap(),
+            Some(vec![84]),
+            "{phase:?}"
+        );
+        assert_eq!(
+            segment_records(tmp.path(), 84),
+            encoded_at(84, &[set_record(b"a", b"3"), set_record(b"b", b"4")]),
+            "{phase:?}"
+        );
+        let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+        assert_eq!(read_all(&store), ["a=3", "b=4"], "{phase:?}");
+        store.verify().unwrap();
+    }
+}
+
+/// Each of the keys a to e the store holds, as `key=value`.
+fn read_all(store: &Store) -> Vec<String> {
+    ["a", "b", "c", "d", "e"]
+        .into_iter()
+        .filter_map(|k| {
+            read(store, k.as_bytes()).map(|v| format!("{k}={}", String::from_utf8(v).unwrap()))
+        })
+        .collect()
 }
 
 /// Calls `write` with the store once, when a compaction reaches `phase`.

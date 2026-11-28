@@ -184,14 +184,14 @@ pub(super) struct Scanned<'r> {
 /// `buffer` bytes. Calls `record` with every record read, and `sink` with
 /// the key and new index entry, `None` for a Delete, of each Set and Delete
 /// to apply, in order: a batch's once all of it has been read.
-pub(super) fn scan_into(
+pub(super) fn scan_into<E: From<Error>>(
     file: &impl LogFile,
     start: u64,
     len: u64,
     buffer: usize,
     sink: &mut impl FnMut(&[u8], Option<Entry>),
-    record: &mut impl FnMut(Scanned) -> Result<(), Error>,
-) -> Result<(), Error> {
+    record: &mut impl FnMut(Scanned) -> Result<(), E>,
+) -> Result<(), E> {
     let mut reader = Reader {
         inner: BufReader::with_capacity(buffer_for(len - start, buffer), file.reader_at(start)),
         header_bytes: [0u8; HEADER_LEN],
@@ -214,7 +214,8 @@ pub(super) fn scan_into(
             return Err(Error::Corruption {
                 offset,
                 reason: CorruptionReason::CutShort,
-            });
+            }
+            .into());
         }
         let body_end = body_start + body_len;
         let mut at = body_start;
@@ -341,12 +342,12 @@ impl<R: Read> Reader<R> {
 
     /// Shows `record` the record `next` just read, and returns what it
     /// does to the index.
-    fn show(
+    fn show<E>(
         &mut self,
         offset: u64,
         header: Header,
-        record: &mut impl FnMut(Scanned) -> Result<(), Error>,
-    ) -> Result<IndexOp<'_>, Error> {
+        record: &mut impl FnMut(Scanned) -> Result<(), E>,
+    ) -> Result<IndexOp<'_>, E> {
         let op = index_op(header, &self.payload);
         record(Scanned {
             offset,
