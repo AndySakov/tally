@@ -6,7 +6,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 
 use super::{
-    LOG_FILE_NAME, hint_not_written, push_entry,
+    LOG_FILE_NAME, hint_not_written, push_entry, remove_if_present,
     repair::copy_to_end,
     scan::{WINDOW, Window, applying, scan, threads_for},
 };
@@ -16,7 +16,7 @@ use crate::index::{Entry, Index};
 use crate::manifest::{self, NEW_MANIFEST_NAME};
 use crate::record::{HEADER_LEN, Kind};
 use crate::segment::{
-    FILE_HEADER_LEN, FileHeader, Segment, check_file_header, hint_name, log_name,
+    FILE_HEADER_LEN, FileHeader, Segment, active_hint_name, check_file_header, hint_name, log_name,
     parse_active_hint_name, parse_compact_name, parse_hint_name, parse_log_name, start_file,
 };
 use crate::{CorruptionReason, Error, UnsupportedReason};
@@ -225,19 +225,27 @@ fn try_load<F: Fs>(
                     )
                 {
                     hint_not_written(segment.base, &err);
+                    if i == newest && hint.has_file() {
+                        let _ = remove_if_present(fs, &dir.join(active_hint_name(segment.base)));
+                    }
                     writer = None;
                 }
                 Ok(())
             },
         )?;
-        if let Some(hint) = writer.take()
-            && end == len
-        {
-            if i == newest {
-                active = Some(Box::new(hint));
-            } else if let Err(err) = hint.finish(len - segment.base) {
-                hint_not_written(segment.base, &err);
+        match writer.take() {
+            Some(hint) if end == len => {
+                if i == newest {
+                    active = Some(Box::new(hint));
+                } else if let Err(err) = hint.finish(len - segment.base) {
+                    hint_not_written(segment.base, &err);
+                }
             }
+            // The rest of the segment is torn: its records are read again.
+            Some(hint) if hint.has_file() => {
+                let _ = remove_if_present(fs, &dir.join(active_hint_name(segment.base)));
+            }
+            _ => {}
         }
         if end < len {
             let saved = save_torn(fs, dir, &*segment, end, len)?;

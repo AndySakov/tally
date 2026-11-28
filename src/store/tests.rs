@@ -3261,6 +3261,59 @@ fn open_reads_only_the_header_of_a_segment_writes_sealed() {
 }
 
 #[test]
+fn open_removes_the_active_hint_it_spilled_for_a_newest_segment_with_a_torn_tail() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1 << 30));
+    write_more_than_a_mib_of_hint(&store);
+    drop(store);
+    let dir = Path::new("/db");
+    let log = dir.join(log_name(0));
+    let torn = [fs.read(&log).unwrap(), vec![0; 5]].concat();
+    fs.put(&log, &torn);
+
+    let store = open_on(&fs, segmented(1 << 30));
+    assert_eq!(
+        fs.read(&dir.join(active_hint_name(0))).map(|b| b.len()),
+        None
+    );
+    assert_eq!(fs.read(&log).unwrap().len(), 17 + 1100 * 1044);
+    for i in [0, 1099] {
+        let k = format!("{i:01024}");
+        assert_eq!(get_on(&store, k.as_bytes()).as_deref(), Some(&b"v"[..]));
+    }
+}
+
+#[test]
+fn open_removes_the_active_hint_it_spilled_when_it_cannot_write_it() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1 << 30));
+    write_more_than_a_mib_of_hint(&store);
+    drop(store);
+    fs.limit_free_space(Some(0));
+
+    let store = open_on(&fs, segmented(1 << 30));
+    assert_eq!(
+        fs.read(&Path::new("/db").join(active_hint_name(0)))
+            .map(|b| b.len()),
+        None
+    );
+    for i in [0, 1099] {
+        let k = format!("{i:01024}");
+        assert_eq!(get_on(&store, k.as_bytes()).as_deref(), Some(&b"v"[..]));
+    }
+}
+
+/// 1,100 Sets of 1 KiB keys: hint entries of 1,031 bytes, more than the
+/// 1 MiB an active hint holds in memory.
+fn write_more_than_a_mib_of_hint(store: &Store<MemFs>) {
+    for i in 0..1100 {
+        store
+            .set(key(format!("{i:01024}").as_bytes()), value(b"v"))
+            .unwrap();
+    }
+}
+
+#[test]
 fn a_compaction_seals_the_segment_its_copy_goes_after() {
     let fs = MemFs::new();
     let options = Options {
