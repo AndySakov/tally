@@ -153,11 +153,14 @@ impl<F: Fs> Inner<F> {
         let hint_path = self.dir.join(hint_name(base));
         // The copy is complete and durable before it takes a segment's name,
         // so the newest segment never holds more than one append that a
-        // crash could tear.
+        // crash could tear. An empty one never does: once a write has
+        // started a segment past it, nothing would remove it.
         let copied = self
             .copy_live(&segments, base, &copy_path, &hint_path, &chosen)
             .and_then(|copied| {
-                self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
+                if copied.written > 0 {
+                    self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
+                }
                 Ok(copied)
             });
         let Copied {
@@ -176,6 +179,19 @@ impl<F: Fs> Inner<F> {
                 return Err(err);
             }
         };
+        if written == 0 {
+            drop((output, hint));
+            let _ = remove_if_present(&self.fs, &copy_path);
+            let _ = remove_if_present(&self.fs, &hint_path);
+            let mut writing = self.writer();
+            *writing.reserved = None;
+            if chosen.contains(&self.active().base) {
+                // Nothing was written after it, and it goes.
+                self.roll(&writing, base)?;
+            }
+            drop(writing);
+            return self.remove_cleaned(&chosen, None, dropped_delete);
+        }
         if let Err(err) = self.fs.sync_dir(&self.dir) {
             release();
             return Err(self.poison(err));
@@ -219,6 +235,17 @@ impl<F: Fs> Inner<F> {
         }
         #[cfg(test)]
         self.between(Phase::Repointed);
+        self.remove_cleaned(&chosen, Some(base), dropped_delete)
+    }
+
+    /// Removes the `chosen` segments, whose live records are all in the
+    /// copy at `copy` if there is one.
+    fn remove_cleaned(
+        &self,
+        chosen: &[u64],
+        copy: Option<u64>,
+        dropped_delete: bool,
+    ) -> Result<bool, Error> {
         let segments = self.segments();
         let mut left_behind = 0usize;
         self.index.for_each(|entry| {
@@ -230,7 +257,7 @@ impl<F: Fs> Inner<F> {
         for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
-            } else if segment.base > chosen[0] && segment.base != output.base {
+            } else if segment.base > chosen[0] && Some(segment.base) != copy {
                 // What its Deletes hide may be among what goes.
                 segment.set_carried(0);
             }

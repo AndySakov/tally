@@ -1101,8 +1101,8 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
     put(&store, b"k", b"new");
     assert_eq!(
         segment_bases(tmp.path()),
-        [1504, 1735, 1945, 1987, 2008, 2031],
-        "a=1 at 0 went with the rest of its segment"
+        [1504, 1735, 1945, 1987, 2008],
+        "a=1 at 0 went with the rest of its segment, and nothing was copied"
     );
     let reclaimable: u64 = store.segments().iter().map(|s| s.reclaimable()).sum();
     assert_eq!(
@@ -1175,11 +1175,10 @@ fn cleaning_a_delete_while_older_kept_segments_lack_its_key_drops_it() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
     store.clean(&store.compacting(), |_| vec![0, 42]).unwrap();
-    assert_eq!(segment_bases(tmp.path()), [21, 62, 83]);
     assert_eq!(
-        segment_records(tmp.path(), 83),
-        b"",
-        "b=2 at 21 is kept but hides nothing of a"
+        segment_bases(tmp.path()),
+        [21, 62],
+        "b=2 at 21 is kept but hides nothing of a, so nothing is copied"
     );
     drop(store);
 
@@ -1274,8 +1273,7 @@ fn automatic_compaction_leaves_segments_without_dead_bytes() {
     // 41 of 62, still due; then 42 leaves 20 of 41, not due. Neither has
     // a live record, and a=1 at 0 is never read.
     store.delete(key(b"b")).unwrap();
-    assert_eq!(segment_bases(tmp.path()), [0, 63, 83]);
-    assert_eq!(segment_records(tmp.path(), 83), b"");
+    assert_eq!(segment_bases(tmp.path()), [0, 63], "nothing to copy");
     assert_eq!(store.dead(), 20);
     drop(store);
     let store = Store::open_in(OsFs, tmp.path(), options).unwrap();
@@ -3568,4 +3566,57 @@ fn a_failed_automatic_compaction_on_its_thread_keeps_the_write_and_stays_off() {
     store.set(key(b"b"), value(b"6")).unwrap();
     assert_eq!(log_bytes(tmp.path()).len(), 127, "nothing compacted");
     assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"6")));
+}
+
+#[test]
+fn a_compaction_with_nothing_to_copy_leaves_no_segment_behind_a_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    put(&store, b"a", b"1");
+    put(&store, b"a", b"2");
+    store.delete(key(b"a")).unwrap();
+    put(&store, b"b", b"1");
+    assert_eq!(segment_bases(tmp.path()), [0, 21, 42, 62]);
+    write_once_at(&store, Phase::Reserved, |inner| {
+        inner.set(key(b"c"), value(b"3")).unwrap();
+    });
+    let compacting = store.compacting();
+    assert!(store.clean(&compacting, |_| vec![0, 21, 42]).unwrap());
+    drop(compacting);
+    assert_eq!(
+        segment_bases(tmp.path()),
+        [62, 145],
+        "the write went past the 62 bytes reserved at 83"
+    );
+    assert_eq!(
+        file_names(tmp.path()),
+        [
+            "tally.00000000000000000062.log",
+            "tally.00000000000000000145.log",
+            "tally.lock"
+        ]
+    );
+    assert_eq!(store.segments().len(), 2);
+    drop(store);
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"a"), None);
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"1"[..]));
+    assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_of_a_wholly_dead_log_leaves_an_empty_segment_to_write_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    put(&store, b"a", b"1");
+    store.delete(key(b"a")).unwrap();
+    store.compact().unwrap();
+    assert_eq!(segment_bases(tmp.path()), [41]);
+    assert_eq!(log_bytes(tmp.path()), b"");
+    put(&store, b"b", b"2");
+    assert_eq!(
+        segment_records(tmp.path(), 41),
+        encoded_at(41, &[set_record(b"b", b"2")])
+    );
 }

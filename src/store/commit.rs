@@ -136,7 +136,7 @@ fn takes_effect<'w>(index: &Index, op: &'w Op, live: &mut HashMap<&'w [u8], bool
 impl<F: Fs> Inner<F> {
     /// Starts a new, empty segment at `base`, at or past the end of the
     /// log, and makes its name durable before anything is written to it.
-    fn roll(&self, writing: &Writing, base: u64) -> Result<(), Error> {
+    pub(super) fn roll(&self, writing: &Writing, base: u64) -> Result<(), Error> {
         let segments = self.segments();
         let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
         if let Err(err) = self.fs.sync_dir(&self.dir) {
