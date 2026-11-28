@@ -2,6 +2,7 @@ use super::*;
 use super::{commit::*, compact::*, open::*, scan::*};
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -444,7 +445,10 @@ fn repair_moves_the_corrupt_record_and_everything_after_it_to_a_side_file() {
         Some(Repaired {
             offset: 22,
             dropped: 41,
-            side_file: side_file(tmp.path(), 22),
+            side_file: SideFile {
+                path: side_file(tmp.path(), 22),
+                unreadable: vec![],
+            },
         })
     );
     assert_eq!(log_bytes(tmp.path()), SET_A_HI);
@@ -482,7 +486,10 @@ fn repair_rewrites_a_side_file_a_crashed_repair_left() {
             Some(Repaired {
                 offset: 22,
                 dropped: 41,
-                side_file: side_file(tmp.path(), 22),
+                side_file: SideFile {
+                    path: side_file(tmp.path(), 22),
+                    unreadable: vec![],
+                },
             }),
             "side file left with {} bytes",
             left.len()
@@ -1588,7 +1595,10 @@ fn a_damaged_segment_header_is_corruption_that_repair_moves_aside() {
         Some(Repaired {
             offset: 0,
             dropped: 17 + 22,
-            side_file: side_file.clone(),
+            side_file: SideFile {
+                path: side_file.clone(),
+                unreadable: vec![],
+            },
         })
     );
     assert_eq!(fs::read(&side_file).unwrap(), bytes);
@@ -3420,6 +3430,219 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
         ),
         "{err:?}"
     );
+}
+
+/// a=1 at 0, b at 21 with a value of 5,000 2s, so its record spans two
+/// 4 KiB blocks, and c=3 at 5041, each in a segment of its own; reads of
+/// the byte at log offset 26, in b's record, fail.
+fn store_with_an_unreadable_sector() -> MemFs {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(&[b'2'; 5000])).unwrap();
+    store.set(key(b"c"), value(b"3")).unwrap();
+    drop(store);
+    let path = Path::new("/db").join(log_name(21));
+    assert_eq!(
+        fs.read(&path).unwrap().len(),
+        FILE_HEADER_LEN as usize + 5020
+    );
+    fs.fail_reads(&path, FILE_HEADER_LEN + 5..FILE_HEADER_LEN + 6);
+    fs
+}
+
+#[test]
+fn repair_moves_an_unreadable_sector_aside_as_zeros() {
+    let fs = store_with_an_unreadable_sector();
+    let dir = Path::new("/db");
+    assert!(matches!(
+        Store::open_in(fs.clone(), dir, segmented(1)),
+        Err(Error::Io(_))
+    ));
+
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 21,
+            dropped: 5020,
+            side_file: SideFile {
+                path: dir.join("tally.log.corrupt-21"),
+                unreadable: vec![Range {
+                    start: 0,
+                    end: 4079
+                }],
+            },
+        })
+    );
+    assert_eq!(
+        fs.read(&dir.join("tally.log.corrupt-21")).unwrap(),
+        [&[0; 4079][..], &[b'2'; 941]].concat()
+    );
+    assert_eq!(Store::repair_in(&fs, dir).unwrap(), None);
+    let store = open_on(&fs, segmented(1));
+    assert_eq!(get_on(&store, b"a"), Some(b"1".to_vec()));
+    assert_eq!(get_on(&store, b"b"), None);
+    assert_eq!(get_on(&store, b"c"), Some(b"3".to_vec()));
+}
+
+#[test]
+fn repair_over_an_unreadable_sector_rewrites_only_zeros_where_it_failed() {
+    let dir = Path::new("/db");
+    let side = dir.join("tally.log.corrupt-21");
+    let crashed = [&[0; 4079][..], &[b'2'; 100]].concat();
+    let fs = store_with_an_unreadable_sector();
+    fs.put(&side, &crashed);
+    assert_eq!(
+        Store::repair_in(&fs, dir)
+            .unwrap()
+            .map(|r| r.side_file.unreadable),
+        Some(vec![Range {
+            start: 0,
+            end: 4079
+        }])
+    );
+    assert_eq!(
+        fs.read(&side).unwrap(),
+        [&[0; 4079][..], &[b'2'; 941]].concat()
+    );
+
+    let saved_before_the_sector_went_bad = [&[0; 5][..], &[b'b'; 1]].concat();
+    let fs = store_with_an_unreadable_sector();
+    fs.put(&side, &saved_before_the_sector_went_bad);
+    assert!(matches!(
+        Store::repair_in(&fs, dir),
+        Err(Error::SideFileExists(path)) if path == side
+    ));
+    assert_eq!(fs.read(&side).unwrap(), saved_before_the_sector_went_bad);
+}
+
+#[test]
+fn verify_reports_an_unreadable_sector_as_an_io_error() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(b"2")).unwrap();
+    store.verify().unwrap();
+    fs.fail_reads(
+        &Path::new("/db").join(log_name(21)),
+        FILE_HEADER_LEN + 5..FILE_HEADER_LEN + 6,
+    );
+    assert!(matches!(store.verify(), Err(Error::Io(_))));
+}
+
+#[test]
+fn repair_moves_an_unreadable_sector_aside_from_the_record_or_batch_it_falls_in() {
+    let dir = Path::new("/db");
+    for (bad, offset) in [(74, 21), (95, 90)] {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1 << 20));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store
+            .write(batch(&[(b"b", Some(b"2")), (b"c", Some(b"3"))]))
+            .unwrap();
+        store.set(key(b"d"), value(b"4")).unwrap();
+        drop(store);
+        let path = dir.join(log_name(0));
+        assert_eq!(
+            fs.read(&path).unwrap().len(),
+            FILE_HEADER_LEN as usize + 111
+        );
+        fs.fail_reads(&path, FILE_HEADER_LEN + bad..FILE_HEADER_LEN + bad + 1);
+
+        let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
+
+        assert_eq!(
+            (
+                repaired.offset,
+                repaired.dropped,
+                repaired.side_file.unreadable
+            ),
+            (
+                offset,
+                111 - offset,
+                vec![Range {
+                    start: 0,
+                    end: 111 - offset
+                }]
+            ),
+            "bad byte at {bad}"
+        );
+    }
+}
+
+#[test]
+fn repair_cuts_at_the_record_holding_a_sector_whose_whole_read_fails() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1 << 20));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(&[b'2'; 5000])).unwrap();
+    store.set(key(b"c"), value(&[b'3'; 5000])).unwrap();
+    store.set(key(b"d"), value(b"4")).unwrap();
+    drop(store);
+    let path = dir.join(log_name(0));
+    assert_eq!(
+        fs.read(&path).unwrap().len(),
+        FILE_HEADER_LEN as usize + 10082,
+        "a at 0, b at 21, c at 5041, d at 10061"
+    );
+    fs.fail_whole_reads(&path, FILE_HEADER_LEN + 10000..FILE_HEADER_LEN + 10001);
+
+    let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
+
+    assert_eq!(
+        (
+            repaired.offset,
+            repaired.dropped,
+            repaired.side_file.unreadable
+        ),
+        (
+            5041,
+            5041,
+            vec![Range {
+                start: 3134,
+                end: 5041
+            }]
+        )
+    );
+    let store = open_on(&fs, segmented(1 << 20));
+    assert_eq!(get_on(&store, b"a"), Some(b"1".to_vec()));
+    assert_eq!(get_on(&store, b"b"), Some(vec![b'2'; 5000]));
+    assert_eq!(get_on(&store, b"c"), None);
+    assert_eq!(get_on(&store, b"d"), None);
+}
+
+#[test]
+fn repair_keeps_a_small_record_that_ends_right_before_a_block_whose_whole_read_fails() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1 << 20));
+    store.set(key(b"a"), value(&[b'1'; 12230])).unwrap();
+    store.set(key(b"b"), value(b"2")).unwrap();
+    store.set(key(b"c"), value(b"3")).unwrap();
+    drop(store);
+    let path = dir.join(log_name(0));
+    assert_eq!(
+        fs.read(&path).unwrap().len(),
+        FILE_HEADER_LEN as usize + 12292,
+        "a at 0, b at 12250, c at 12271, at file offset 12288"
+    );
+    fs.fail_whole_reads(&path, 12288..16384);
+
+    let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
+
+    assert_eq!(
+        (
+            repaired.offset,
+            repaired.dropped,
+            repaired.side_file.unreadable
+        ),
+        (12271, 21, vec![Range { start: 0, end: 21 }])
+    );
+    let store = open_on(&fs, segmented(1 << 20));
+    assert_eq!(get_on(&store, b"a"), Some(vec![b'1'; 12230]));
+    assert_eq!(get_on(&store, b"b"), Some(b"2".to_vec()));
+    assert_eq!(get_on(&store, b"c"), None);
 }
 
 /// How many compactions, over `n` writes, copy nothing but carried Delete

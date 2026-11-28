@@ -114,7 +114,7 @@ Each layer below was checked by breaking the code on purpose and watching it fai
 - **Fuzzing** (`fuzz/`): `decode` on arbitrary bytes at arbitrary offsets, `open` on cut, changed and zeroed logs, `hint` on damaged hint files, and
   `ops` as a coverage-guided model test on the in-memory disk.
 - **Recovery tests**: every recovery rule, the cases that must fail and leave the log byte-for-byte unchanged,
-  and `repair` when the log is intact, torn, corrupt mid-file, already repaired, unsupported or locked.
+  and `repair` when the log is intact, torn, corrupt mid-file, unreadable, already repaired, unsupported or locked.
 
 CI runs lint and tests on Linux and macOS, because fsync and directory sync behave differently on each, and
 fuzzes each target for 60 seconds on every pull request.
@@ -136,7 +136,7 @@ can't be mistaken for a corrupted length mid-file, which would otherwise drop ac
 one record, or one batch record around several, so damage after which no record starts is the last write torn by
 a crash, in whatever order its blocks landed. `open` saves those bytes to a side file, truncates, fsyncs and logs.
 Any other damage fails `open` with its offset, and `Store::repair` moves the bad bytes to a side file before
-truncating. A failed fsync stops all writes until a reopen instead of retrying, because on Linux a retry can
+truncating, with zeros for any block it cannot read. A failed fsync stops all writes until a reopen instead of retrying, because on Linux a retry can
 report success for data that never reached the disk.
 
 The log is a run of segment files, each named for the log offset of its first record and starting with a header
