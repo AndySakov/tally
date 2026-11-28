@@ -440,8 +440,9 @@ impl<F: Fs> Store<F> {
     }
 }
 
-/// Stops the compaction thread, after the compaction it is running if any,
-/// and waits for it. Every write is durable before it returns, so this
+/// Stops the compaction thread and waits for it, after the compaction it is
+/// running stops or, once its copy has a segment's name, finishes (DESIGN.md,
+/// When it runs). Every write is durable before it returns, so this
 /// adds nothing to durability; it is so the lock is free once the store is.
 impl<F: Fs> Drop for Store<F> {
     fn drop(&mut self) {

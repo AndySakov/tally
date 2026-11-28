@@ -1,7 +1,7 @@
 //! The compaction thread, and the stalls that keep writes from outrunning
 //! it (DESIGN.md, When it runs).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +22,8 @@ pub(super) struct Background {
     caught_up: Condvar,
     /// Taken to join the thread when the store is dropped.
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Set when the store is dropped, for a running compaction to stop.
+    stopping: AtomicBool,
     slowed: AtomicU64,
     stopped: AtomicU64,
     stopped_nanos: AtomicU64,
@@ -45,6 +47,11 @@ struct Signal {
 pub(crate) enum Phase {
     /// The offsets of the copies are reserved; nothing is copied yet.
     Reserved,
+    /// At each record read from the segments being cleaned, while the copy
+    /// is under its temporary name.
+    Copying,
+    /// The copy has the segment's name; it is not in the list yet.
+    Renamed,
     /// The copies are durable under the segment's name, and in the list.
     Copied,
     /// The index points at the copies; the cleaned segments are still there.
@@ -102,12 +109,14 @@ impl<F: Fs> Inner<F> {
         }
     }
 
-    /// Stops the compaction thread, after the compaction it is running if
-    /// any, and waits for it.
+    /// Stops the compaction thread and waits for it. A compaction it is
+    /// running stops if its copy has not yet taken a segment's name, and
+    /// finishes otherwise.
     pub(super) fn stop_compactor(&self) {
         let Some(background) = &self.background else {
             return;
         };
+        background.stopping.store(true, Ordering::Relaxed);
         hold(&background.signal).stop = true;
         background.wake.notify_one();
         if let Some(thread) = hold(&background.thread).take() {
@@ -183,6 +192,13 @@ impl<F: Fs> Inner<F> {
             "writes waited {waited:?} for compaction to catch up; the log is now {}% dead",
             u128::from(dead) * 100 / u128::from(len.max(1))
         );
+    }
+
+    /// Whether the store is being dropped.
+    pub(super) fn stopping(&self) -> bool {
+        self.background
+            .as_ref()
+            .is_some_and(|background| background.stopping.load(Ordering::Relaxed))
     }
 
     pub(super) fn stalls(&self) -> Stalls {
