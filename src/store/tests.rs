@@ -3533,7 +3533,15 @@ fn writes_wait_past_the_stop_threshold_until_compaction_catches_up() {
     // 50% dead: under the stop, so it is written, at 168. It makes a=3
     // dead too: 63 of 105, 60%.
     put(&store, b"a", b"5");
-    assert_eq!(store.stalls.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        store.stalls(),
+        Stalls {
+            slowed: 0,
+            stopped: 0,
+            stopped_for: Duration::ZERO
+        }
+    );
+    let began = Instant::now();
     thread::scope(|scope| {
         let (done_tx, done) = mpsc::channel();
         let store = &store;
@@ -3541,17 +3549,31 @@ fn writes_wait_past_the_stop_threshold_until_compaction_catches_up() {
             put(store, b"b", b"6");
             done_tx.send(()).unwrap();
         });
-        eventually("stalled", || store.stalls.load(Ordering::Relaxed) == 1);
+        eventually("stalled", || store.stalls().stopped == 1);
         assert_eq!(
             done.try_recv(),
             Err(mpsc::TryRecvError::Empty),
             "nothing but the held compaction can bring the log under 60%"
         );
+        assert_eq!(
+            store.stalls().stopped_for,
+            Duration::ZERO,
+            "counted once the wait ends"
+        );
         go.send(()).unwrap();
         done.recv_timeout(PATIENCE)
             .expect("the write goes on once compaction catches up");
     });
-    assert_eq!(store.stalls.load(Ordering::Relaxed), 1);
+    let stalls = store.stalls();
+    assert_eq!(
+        (stalls.slowed, stalls.stopped),
+        (1, 1),
+        "b=6 found the log 60% dead: past the slowdown at 55%, then the stop"
+    );
+    assert!(
+        stalls.stopped_for > Duration::ZERO && stalls.stopped_for <= began.elapsed(),
+        "{stalls:?}"
+    );
     drop(store);
     assert_eq!(segment_bases(tmp.path()), [84, 168]);
     assert_eq!(
@@ -3750,7 +3772,48 @@ fn a_leader_past_the_slow_threshold_sleeps_before_writing() {
     let slept = started.elapsed();
     go.send(()).unwrap();
     assert!(slept >= Duration::from_millis(1), "50% dead: {slept:?}");
-    assert_eq!(store.stalls.load(Ordering::Relaxed), 0, "under the stop");
+    assert_eq!(
+        store.stalls(),
+        Stalls {
+            slowed: 1,
+            stopped: 0,
+            stopped_for: Duration::ZERO
+        },
+        "under the stop"
+    );
+}
+
+#[test]
+fn a_store_without_a_compaction_thread_never_stalls() {
+    let no_stalls = Stalls {
+        slowed: 0,
+        stopped: 0,
+        stopped_for: Duration::ZERO,
+    };
+    let fs = MemFs::new();
+    let on_the_leader = open_on(&fs, auto(50, 0));
+    let tmp = tempfile::tempdir().unwrap();
+    let manual = Store::open_with(
+        tmp.path(),
+        Options {
+            auto_compact: None,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"a", b"3"), (b"b", b"4")] {
+        on_the_leader.set(key(k), value(v)).unwrap();
+        on_the_leader.set(key(b"a"), value(b"5")).unwrap();
+        put(&manual, k, v);
+        put(&manual, b"a", b"5");
+    }
+    assert_eq!(on_the_leader.stalls(), no_stalls);
+    assert_eq!(manual.stalls(), no_stalls);
+    assert_eq!(
+        manual.dead_and_len(),
+        (126, 168),
+        "75% dead, far past any stop"
+    );
 }
 
 /// Holds the store's first compaction at `phase` until the returned sender
@@ -3784,7 +3847,7 @@ fn stall_then(
     let (done_tx, done) = mpsc::channel();
     let writer = Arc::clone(store);
     thread::spawn(move || done_tx.send(writer.set(key(b"b"), value(b"6"))).unwrap());
-    eventually("stalled", || store.stalls.load(Ordering::Relaxed) == 1);
+    eventually("stalled", || store.stalls().stopped == 1);
     release();
     done.recv_timeout(PATIENCE)
         .expect("the stalled write returns")

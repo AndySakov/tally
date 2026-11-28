@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError as TryLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::index::{Entry, Index};
@@ -62,6 +63,22 @@ pub struct SideFile {
     /// Where in the file the bytes that failed to read are, in the 4 KiB
     /// blocks of the segment's file. The file holds zeros there.
     pub unreadable: Vec<Range<u64>>,
+}
+
+/// How often writes have stalled for automatic compaction since the store
+/// was opened (DESIGN.md, When it runs). All zero for a store with
+/// automatic compaction off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Stalls {
+    /// Groups of writes slowed down: the log was past
+    /// [`AutoCompact::slow_percent`], so their leader slept 1 ms.
+    pub slowed: u64,
+    /// Groups of writes that waited for compaction because the log was
+    /// past [`AutoCompact::stop_percent`], counted as they start waiting.
+    pub stopped: u64,
+    /// How long those groups waited, counted as each wait ends.
+    pub stopped_for: Duration,
 }
 
 /// An open store: the log's segments plus an in-memory index of every live
@@ -121,9 +138,6 @@ pub struct Inner<F: Fs> {
     /// Appends fsynced, for tests of group commit.
     #[cfg(test)]
     commits: AtomicU64,
-    /// Leaders that waited for compaction to catch up.
-    #[cfg(test)]
-    stalls: AtomicU64,
     /// Called at each phase of a compaction, for tests that write or wait
     /// in the middle of one.
     #[cfg(test)]
@@ -417,6 +431,13 @@ impl<F: Fs> Store<F> {
     pub fn verify(&self) -> Result<(), Error> {
         self.inner.verify()
     }
+
+    /// How often writes have slowed down or waited for automatic compaction
+    /// to catch up since the store was opened. A wait that is still going
+    /// on is in `stopped` but not yet in `stopped_for`.
+    pub fn stalls(&self) -> Stalls {
+        self.inner.stalls()
+    }
 }
 
 /// Stops the compaction thread, after the compaction it is running if any,
@@ -485,8 +506,6 @@ impl<F: Fs> Inner<F> {
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             commits: AtomicU64::new(0),
-            #[cfg(test)]
-            stalls: AtomicU64::new(0),
             #[cfg(test)]
             between: std::sync::OnceLock::new(),
         };
