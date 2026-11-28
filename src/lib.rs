@@ -23,7 +23,7 @@ pub use batch::Batch;
 pub use error::{CorruptionReason, Error, Field, UnsupportedReason};
 pub use kv::{Key, MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 pub use options::{AutoCompact, Options};
-pub use store::{Repaired, SideFile, Store};
+pub use store::{Repaired, SideFile, Stalls, Store};
 
 /// The codec and the model, for the fuzz targets in `fuzz/`. Only built under cargo-fuzz.
 #[cfg(fuzzing)]

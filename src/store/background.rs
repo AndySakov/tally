@@ -1,12 +1,12 @@
 //! The compaction thread, and the stalls that keep writes from outrunning
 //! it (DESIGN.md, When it runs).
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::{Inner, hold};
+use super::{Inner, Stalls, hold};
 use crate::fs::Fs;
 
 /// How long a leader sleeps before writing its group while the log is past
@@ -22,6 +22,9 @@ pub(super) struct Background {
     caught_up: Condvar,
     /// Taken to join the thread when the store is dropped.
     thread: Mutex<Option<JoinHandle<()>>>,
+    slowed: AtomicU64,
+    stopped: AtomicU64,
+    stopped_nanos: AtomicU64,
 }
 
 impl Background {
@@ -150,6 +153,7 @@ impl<F: Fs> Inner<F> {
             || !self.auto_failed.load(Ordering::Relaxed) && !self.poisoned.load(Ordering::Acquire);
         let (dead, len) = self.dead_and_len();
         if can_catch_up() && auto.slows(dead, len) {
+            background.slowed.fetch_add(1, Ordering::Relaxed);
             thread::sleep(SLOWDOWN);
         }
         let stopped = || {
@@ -160,8 +164,8 @@ impl<F: Fs> Inner<F> {
         if !stopped() {
             return;
         }
-        #[cfg(test)]
-        self.stalls.fetch_add(1, Ordering::Relaxed);
+        background.stopped.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         while stopped() {
             signal.due = true;
             background.wake.notify_one();
@@ -169,6 +173,27 @@ impl<F: Fs> Inner<F> {
                 .caught_up
                 .wait(signal)
                 .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(signal);
+        let waited = started.elapsed();
+        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        background.stopped_nanos.fetch_add(nanos, Ordering::Relaxed);
+        let (dead, len) = self.dead_and_len();
+        log::warn!(
+            "writes waited {waited:?} for compaction to catch up; the log is now {}% dead",
+            u128::from(dead) * 100 / u128::from(len.max(1))
+        );
+    }
+
+    pub(super) fn stalls(&self) -> Stalls {
+        let Some(background) = &self.background else {
+            return Stalls::default();
+        };
+        let nanos = background.stopped_nanos.load(Ordering::Relaxed);
+        Stalls {
+            slowed: background.slowed.load(Ordering::Relaxed),
+            stopped: background.stopped.load(Ordering::Relaxed),
+            stopped_for: Duration::from_nanos(nanos),
         }
     }
 
