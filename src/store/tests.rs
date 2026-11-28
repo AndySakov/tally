@@ -3756,6 +3756,71 @@ fn a_compaction_poisoned_by_a_concurrent_roll_removes_nothing() {
     }
 }
 
+/// A write that starts a segment on a full disk fails. Its file must not
+/// outlive it: once a write during a compaction starts a segment past it, a
+/// cut that kept the file would leave a segment cut short before that one.
+#[test]
+fn a_segment_a_full_disk_kept_from_starting_never_reads_as_cut_short() {
+    let run = |step| {
+        let fs = MemFs::new();
+        fs.cut_before(step);
+        let store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        fs.limit_free_space(Some(0));
+        let full = store.set(key(b"d"), value(b"4"));
+        assert!(
+            matches!(&full, Err(Error::Io(io)) if io.kind() == std::io::ErrorKind::StorageFull),
+            "{full:?}"
+        );
+        fs.limit_free_space(None);
+        let failed = fs.steps();
+        store.on_phase(|inner, phase| {
+            if phase == Phase::Reserved {
+                inner.set(key(b"c"), value(b"3")).unwrap();
+            }
+        });
+        store.compact().unwrap();
+        drop(store);
+        (fs, failed)
+    };
+    let (fs, failed) = run(0);
+    for step in failed + 1..=fs.steps() + 1 {
+        let (fs, _) = run(step);
+        let disk = fs.snapshot().unwrap_or_else(|| fs.disk());
+        for cut in disk.cuts() {
+            let store = Store::open_in(MemFs::after(&disk, cut), Path::new("/db"), segmented(1))
+                .unwrap_or_else(|err| panic!("cut before step {step} {cut:?}: {err}"));
+            assert_eq!(get_on(&store, b"a"), None);
+            assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+            assert_eq!(get_on(&store, b"d"), None);
+            store.verify().unwrap();
+        }
+    }
+}
+
+/// A file a failed start of a segment left that cannot be removed would
+/// read as a segment cut short once a later one is listed.
+#[test]
+fn a_segment_start_whose_file_stays_poisons_the_store() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    fs.limit_free_space(Some(0));
+    fs.fail_removes_after(0);
+    assert!(matches!(
+        store.set(key(b"b"), value(b"2")),
+        Err(Error::Io(_))
+    ));
+    fs.limit_free_space(None);
+    assert!(matches!(
+        store.set(key(b"c"), value(b"3")),
+        Err(Error::Poisoned)
+    ));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+}
+
 #[test]
 fn a_leader_past_the_slow_threshold_sleeps_before_writing() {
     let tmp = tempfile::tempdir().unwrap();

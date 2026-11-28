@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{Inner, Writing, hold, holding};
+use super::{Inner, Writing, hold, holding, remove_if_present};
 use crate::fs::{Fs, LogFile};
 use crate::index::{Entry, Index};
 use crate::manifest;
@@ -140,7 +140,20 @@ impl<F: Fs> Inner<F> {
     /// before anything is written to it.
     pub(super) fn roll(&self, writing: &Writing, base: u64) -> Result<(), Error> {
         let segments = self.segments();
-        let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
+        let path = self.dir.join(log_name(base));
+        let segment = match create(&self.fs, &path, base) {
+            Ok(segment) => segment,
+            Err(err) => {
+                // Left with a torn header, the file would read as a segment
+                // cut short once a later one is listed.
+                if let Err(left) =
+                    remove_if_present(&self.fs, &path).and_then(|_| self.fs.sync_dir(&self.dir))
+                {
+                    self.poison(left);
+                }
+                return Err(err.into());
+            }
+        };
         let mut next = segments.to_vec();
         next.push(Arc::new(segment));
         let bases: Vec<u64> = next.iter().map(|s| s.base).collect();
