@@ -200,13 +200,6 @@ impl<F: Fs> Inner<F> {
             release();
             return Err(self.poison(err));
         }
-        // A write that poisoned the store failed a directory fsync, and
-        // Linux need not tell this one, so the copy's name may not be
-        // durable: the manifest must not list it.
-        if let Err(err) = self.writable() {
-            release();
-            return Err(err);
-        }
         output.set_len_written(written);
         output.add_dead(carried);
         output.set_carried(carried, carried_against);
@@ -234,6 +227,11 @@ impl<F: Fs> Inner<F> {
                 .filter(|base| !chosen.contains(base))
                 .collect();
             *writing.reserved = None;
+            // A write that poisoned the store failed a directory fsync, and
+            // Linux need not tell the copy's, so its name may not be
+            // durable: the manifest must not list it. A write poisons the
+            // store under the writer lock, so it has by now.
+            self.writable()?;
             if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
                 return Err(self.poison(err));
             }
@@ -287,7 +285,7 @@ impl<F: Fs> Inner<F> {
             }
         });
         assert_eq!(left_behind, 0, "every live key in them is copied");
-        {
+        let kept = {
             // Out of the list in one step, so a write past `stop_percent`
             // does not wait for their removals.
             let writing = self.writer();
@@ -298,9 +296,6 @@ impl<F: Fs> Inner<F> {
                 .filter(|s| !chosen.contains(&s.base))
                 .cloned()
                 .collect();
-            for segment in &kept {
-                segment.uncarry(chosen);
-            }
             // A segment started since would have listed them again.
             if listed.is_none_or(|listed| !Arc::ptr_eq(&listed, &self.segments())) {
                 let bases: Vec<u64> = kept.iter().map(|s| s.base).collect();
@@ -308,8 +303,9 @@ impl<F: Fs> Inner<F> {
                     return Err(self.poison(err));
                 }
             }
-            self.replace_segments(&writing, kept);
-        }
+            self.replace_segments(&writing, kept.clone());
+            kept
+        };
         self.wake_stalled();
         #[cfg(test)]
         self.between(Phase::Unlisted);
@@ -318,8 +314,14 @@ impl<F: Fs> Inner<F> {
         // one, the removals may land in any order. A write that poisoned the
         // store meanwhile failed a directory fsync, and Linux need not tell
         // a later one on a new descriptor, so none of them is durable.
+        // Under the writer lock: a write that failed a directory fsync
+        // poisons the store before it lets go.
+        let writable = || {
+            let _writing = self.writer();
+            self.writable()
+        };
         for (i, &base) in chosen.iter().enumerate() {
-            self.writable()?;
+            writable()?;
             let removed = remove_if_present(&self.fs, &self.dir.join(hint_name(base)))
                 .and_then(|_| self.fs.remove(&self.dir.join(log_name(base))));
             if let Err(err) = removed {
@@ -340,7 +342,12 @@ impl<F: Fs> Inner<F> {
                 return Err(self.poison(err));
             }
         }
-        self.writable()?;
+        writable()?;
+        // Only now: until every one is gone, a Delete they may hide a Set
+        // in is still needed.
+        for segment in &kept {
+            segment.uncarry(chosen);
+        }
         Ok(true)
     }
 
