@@ -246,14 +246,10 @@ impl<F: Fs> Store<F> {
         let mut index = Index::new();
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
-            if let Some(lost) = lost_past_hint(fs, dir, segment)? {
+            let lost = lost_past_hint(fs, dir, segment)?;
+            if lost.is_some() {
                 remove_if_present(fs, &dir.join(hint_name(segment.base)))?;
                 fs.sync_dir(dir)?;
-                return Ok(Some(Repaired {
-                    offset: segment.end(),
-                    dropped: lost,
-                    side_file: None,
-                }));
             }
             let newest = i + 1 == segments.len();
             let mut reading = Reading::from(segment.base);
@@ -276,11 +272,18 @@ impl<F: Fs> Store<F> {
                 Err(err) => return Err(err),
             };
             if let Some(offset) = damage {
-                bad = Some((segment, offset));
+                bad = Some((segment, offset, lost.unwrap_or(0)));
                 break;
             }
+            if let Some(lost) = lost {
+                return Ok(Some(Repaired {
+                    offset: segment.end(),
+                    dropped: lost,
+                    side_file: None,
+                }));
+            }
         }
-        let Some((segment, offset)) = bad else {
+        let Some((segment, offset, lost)) = bad else {
             return Ok(None);
         };
         let len = segment.end();
@@ -308,7 +311,7 @@ impl<F: Fs> Store<F> {
         segment.sync()?;
         Ok(Some(Repaired {
             offset,
-            dropped: len - offset,
+            dropped: len - offset + lost,
             side_file: Some(SideFile {
                 path: side_file,
                 unreadable,
