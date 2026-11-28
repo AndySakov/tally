@@ -1436,6 +1436,52 @@ fn a_new_segment_is_listed_before_a_write_lands_in_it() {
 }
 
 #[test]
+fn a_new_segment_is_durably_listed_before_its_first_record_is_written() {
+    let dir = Path::new("/db");
+    let run = |cut: Option<u64>| {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        let start = fs.steps();
+        if let Some(step) = cut {
+            fs.cut_before(start + step);
+        }
+        store.set(key(b"b"), value(b"1")).unwrap();
+        (fs.steps() - start, fs.snapshot())
+    };
+    let (steps, _) = run(None);
+    let everything = Cut {
+        keep: usize::MAX,
+        torn: Torn::Nothing,
+        entries: u16::MAX,
+        whole: None,
+    };
+    let durable = Cut {
+        keep: 0,
+        torn: Torn::Nothing,
+        entries: 0,
+        whole: None,
+    };
+    let mut written = 0;
+    for step in 1..=steps {
+        let disk = run(Some(step)).1.unwrap();
+        let now = MemFs::after(&disk, everything);
+        let has_a_record = now
+            .read(&dir.join(log_name(21)))
+            .is_some_and(|bytes| bytes.len() as u64 > FILE_HEADER_LEN);
+        if has_a_record {
+            written += 1;
+            assert_eq!(
+                manifest::read(&MemFs::after(&disk, durable), dir).unwrap(),
+                Some(vec![0, 21]),
+                "cut before step {step}"
+            );
+        }
+    }
+    assert_eq!(written, 1, "only the cut before the record's fsync sees it");
+}
+
+#[test]
 fn a_failed_manifest_write_poisons_the_store_and_a_reopen_keeps_every_write() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
