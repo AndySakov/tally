@@ -3687,7 +3687,7 @@ fn a_key_overwritten_after_its_copy_is_made_keeps_the_new_value() {
 /// need not tell about it, so it must not go on to remove segments.
 #[test]
 fn a_compaction_poisoned_by_a_concurrent_roll_removes_nothing() {
-    for phase in [Phase::Reserved, Phase::Copied] {
+    for phase in [Phase::Reserved, Phase::Copied, Phase::Unlisted] {
         let fs = MemFs::new();
         let store = open_on(&fs, segmented(1));
         store.set(key(b"a"), value(b"1")).unwrap();
