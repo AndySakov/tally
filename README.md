@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 1,210,896 possible disk states.
+cut before every disk operation of a workload, across 2,426,043 possible disk states.
 
 ## Status
 
@@ -146,6 +146,8 @@ with a hint file of its keys, then deletes the cleaned segments oldest first. If
 fsyncs the directory after each removal, so the Delete never outlives the value it hides, and otherwise once after
 all of them. A Delete record is copied forward only while an older, kept segment may still hold a value it hides,
 which a filter of each segment's keys answers. The new segment is durable before the first old one goes, so a crash
-at any point leaves the same live data. The lock lives on a separate `tally.lock`, which no compaction removes.
+at any point leaves the same live data. A manifest lists every segment, replaced by an fsynced rename whenever a
+segment starts or a compaction ends, so a segment that goes missing fails `open` instead of reading as a hole
+compaction left. The lock lives on a separate `tally.lock`, which no compaction removes.
 
 The on-disk format, durability contract, recovery rules and trade-offs are in [DESIGN.md](DESIGN.md).

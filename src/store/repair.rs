@@ -130,7 +130,7 @@ impl<F: Fs> Store<F> {
                 offset: base,
                 reason: CorruptionReason::SegmentHeader | CorruptionReason::CutShort,
             }) => return repair_file_header(fs, dir, base).map(Some),
-            segments => segments?,
+            opened => opened?.segments,
         };
         let mut index = Index::new();
         let mut bad = None;
