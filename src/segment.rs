@@ -137,6 +137,10 @@ pub(crate) struct Segment<L> {
     len: AtomicU64,
     /// Bytes in the file no live key points at.
     dead: AtomicU64,
+    /// Of those, the Delete records a compaction copied here because an
+    /// older segment may hold a Set they hide: cleaning this segment again
+    /// would copy them again, until an older one is cleaned.
+    carried: AtomicU64,
     /// The keys it holds a Set record for, once a compaction has asked.
     /// Only ever built for a sealed segment, which no longer changes.
     pub sets: OnceLock<Filter>,
@@ -149,6 +153,7 @@ impl<L> Segment<L> {
             file,
             len: AtomicU64::new(len),
             dead: AtomicU64::new(0),
+            carried: AtomicU64::new(0),
             sets: OnceLock::new(),
         }
     }
@@ -181,6 +186,16 @@ impl<L> Segment<L> {
 
     pub fn set_dead(&self, bytes: u64) {
         self.dead.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The dead bytes cleaning it would give back.
+    pub fn reclaimable(&self) -> u64 {
+        self.dead()
+            .saturating_sub(self.carried.load(Ordering::Relaxed))
+    }
+
+    pub fn set_carried(&self, bytes: u64) {
+        self.carried.store(bytes, Ordering::Relaxed);
     }
 }
 

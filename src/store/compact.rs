@@ -18,7 +18,7 @@ use crate::index::Entry;
 use crate::options::AutoCompact;
 use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
-use crate::{Error, Key};
+use crate::{CorruptionReason, Error, Key};
 
 /// What `copy_live` wrote.
 struct Copied<L: LogFile> {
@@ -53,6 +53,13 @@ fn each_record<L: LogFile>(
         &mut |_, _| {},
         &mut each,
     )
+}
+
+/// A hint whose checksum matched failing to read back: an io error.
+fn unreadable(hint::Invalid(why): hint::Invalid) -> Error {
+    Error::Io(io::Error::other(format!(
+        "rereading a compaction's hint: {why}"
+    )))
 }
 
 /// How much `compact` buffers before each write.
@@ -154,6 +161,7 @@ impl<F: Fs> Store<F> {
         }
         output.set_len_written(written);
         output.add_dead(carried);
+        output.set_carried(carried);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
@@ -170,6 +178,9 @@ impl<F: Fs> Store<F> {
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
             let _ = remove_if_present(&self.fs, &hint_path);
+            if let Err(unread) = self.repoint_by_records(&output, &moved) {
+                self.poison(unread);
+            }
             self.count_dead(writing);
             return Err(err);
         }
@@ -184,6 +195,9 @@ impl<F: Fs> Store<F> {
         for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
+            } else if segment.base > chosen[0] && segment.base != output.base {
+                // What its Deletes hide may be among what goes.
+                segment.set_carried(0);
             }
         }
         // A Delete left behind must not outlive the Set it hides, so then
@@ -333,7 +347,9 @@ impl<F: Fs> Store<F> {
         {
             let hinted = hint::trailer(&file).and_then(|trailer| {
                 if trailer.log_len > segment.len() {
-                    return Err(hint::Invalid("the segment is shorter than the hint says"));
+                    return Err(hint::Invalid::new(
+                        "the segment is shorter than the hint says",
+                    ));
                 }
                 hint::read_entries(&file, trailer, |fields, key, _| {
                     if fields.kind == Kind::Set {
@@ -344,7 +360,13 @@ impl<F: Fs> Store<F> {
             });
             match hinted {
                 Ok(len) => from += len,
-                Err(_) => keys.clear(),
+                Err(hint::Invalid(why)) => {
+                    log::warn!(
+                        "ignored the hint for the segment at {} ({why}); reading the segment instead",
+                        segment.base
+                    );
+                    keys.clear();
+                }
             }
         }
         each_record(segment, from, |read| {
@@ -359,27 +381,31 @@ impl<F: Fs> Store<F> {
     /// Points each key `copy_live` copied at its copy in `output`, as the
     /// output's durable hint lists them, if the key still points at the old
     /// record `moved` holds the offset of. A copy left unpointed is dead.
-    /// The Delete records after the copies change nothing.
+    /// The Delete records after the copies change nothing. The hint is
+    /// checked whole first: a bad entry would point keys at other records.
     fn repoint(
         &self,
         output: &Segment<F::File>,
         hint_file: &F::File,
         moved: &[u64],
     ) -> Result<(), Error> {
-        let unreadable = |hint::Invalid(why)| {
-            Error::Io(io::Error::other(format!(
-                "rereading a compaction's hint: {why}"
-            )))
+        let corrupt = || Error::Corruption {
+            offset: output.base,
+            reason: CorruptionReason::CompactionHint,
         };
+        if !hint::checksum_matches(hint_file)? {
+            return Err(corrupt());
+        }
         let trailer = hint::trailer(hint_file).map_err(unreadable)?;
+        if trailer.count != moved.len() as u64 {
+            return Err(corrupt());
+        }
         let mut old = moved.iter();
-        let mut unmatched = false;
         hint::read_entries(hint_file, trailer, |fields, key, offset| {
             if fields.kind != Kind::Set {
                 return;
             }
             let Some(&from) = old.next() else {
-                unmatched = true;
                 return;
             };
             let entry = Entry::new(output.base + offset, fields);
@@ -388,10 +414,27 @@ impl<F: Fs> Store<F> {
             }
         })
         .map_err(unreadable)?;
-        if unmatched || old.next().is_some() {
-            return Err(unreadable(hint::Invalid("not one entry per copy")));
-        }
         Ok(())
+    }
+
+    /// Points the index at the copies in `output`, read from its records as
+    /// a reopen without its hint would.
+    fn repoint_by_records(&self, output: &Segment<F::File>, moved: &[u64]) -> Result<(), Error> {
+        let mut old = moved.iter();
+        scan_into(
+            output,
+            output.base,
+            output.end(),
+            COMPACT_BUFFER,
+            &mut |key, entry| {
+                if let Some(entry) = entry
+                    && let Some(&from) = old.next()
+                {
+                    self.index.replace(key, from, entry);
+                }
+            },
+            &mut |_| Ok(()),
+        )
     }
 
     /// Compacts if automatic compaction is on and due, cleaning the
@@ -412,7 +455,7 @@ impl<F: Fs> Store<F> {
             .map(|s| SegmentSize {
                 base: s.base,
                 len: s.len(),
-                dead: s.dead(),
+                dead: s.reclaimable(),
             })
             .collect();
         let chosen = deadest(&sizes, auto);

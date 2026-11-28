@@ -16,6 +16,7 @@
 //! before it. The count and log length trail the entries because files are
 //! only written at the end, and `open` extends a hint by writing over them.
 
+use std::borrow::Cow;
 use std::io::{self, BufReader, Read};
 
 use crc_fast::{CrcAlgorithm, Digest};
@@ -49,11 +50,17 @@ pub(crate) struct Tail {
 
 /// Why a hint file was not used. Any of these means a full scan instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Invalid(pub &'static str);
+pub(crate) struct Invalid(pub Cow<'static, str>);
+
+impl Invalid {
+    pub(crate) const fn new(why: &'static str) -> Invalid {
+        Invalid(Cow::Borrowed(why))
+    }
+}
 
 impl From<io::Error> for Invalid {
-    fn from(_: io::Error) -> Invalid {
-        Invalid("unreadable")
+    fn from(err: io::Error) -> Invalid {
+        Invalid(format!("unreadable: {err}").into())
     }
 }
 
@@ -135,7 +142,7 @@ impl<F: LogFile> Writer<F> {
 pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     let size = file.size()?;
     if size < PREFIX_LEN + TRAILER_LEN {
-        return Err(Invalid("too short"));
+        return Err(Invalid::new("too short"));
     }
     let mut buf = [0u8; 16];
     file.read_exact_at(&mut buf, size - TRAILER_LEN)?;
@@ -144,6 +151,29 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
         log_len: u64::from_le_bytes(buf[8..].try_into().unwrap()),
         most_sets: (size - PREFIX_LEN - TRAILER_LEN) / (FIELDS_LEN as u64 + 1),
     })
+}
+
+/// Whether the checksum matches, read before any entry is used, by a
+/// reader that can't undo what it did with them.
+pub(crate) fn checksum_matches(file: &impl LogFile) -> io::Result<bool> {
+    let size = file.size()?;
+    if size < PREFIX_LEN + TRAILER_LEN {
+        return Ok(false);
+    }
+    let crc_at = size - 8;
+    let mut reader = file.reader_at(0).take(crc_at);
+    let mut buffer = vec![0; buffer_for(crc_at, FLUSH_AT)];
+    let mut checksum = Digest::new(CrcAlgorithm::Crc64Nvme);
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        checksum.update(&buffer[..n]);
+    }
+    let mut stored = [0u8; 8];
+    file.read_exact_at(&mut stored, crc_at)?;
+    Ok(u64::from_le_bytes(stored) == checksum.finalize())
 }
 
 /// Checks each entry's fields and passes them to `entry` with its key and
@@ -169,7 +199,7 @@ pub(crate) fn read_entries(
     let mut prefix = [0u8; PREFIX_LEN as usize];
     reader.read_exact(&mut prefix)?;
     if prefix[..4] != MAGIC[..] || prefix[4] != VERSION {
-        return Err(Invalid("not a tally hint file"));
+        return Err(Invalid::new("not a tally hint file"));
     }
 
     let mut at = PREFIX_LEN;
@@ -179,13 +209,13 @@ pub(crate) fn read_entries(
     let mut key = Vec::new();
     while at < entries_end {
         if entries_end - at < FIELDS_LEN as u64 {
-            return Err(Invalid("torn entry"));
+            return Err(Invalid::new("torn entry"));
         }
         reader.read_exact(&mut header)?;
-        let fields = decode_fields(&header).map_err(|_| Invalid("bad entry"))?;
+        let fields = decode_fields(&header).map_err(|_| Invalid::new("bad entry"))?;
         at += FIELDS_LEN as u64;
         if entries_end - at < u64::from(fields.key_len) {
-            return Err(Invalid("torn entry"));
+            return Err(Invalid::new("torn entry"));
         }
         key.resize(usize::from(fields.key_len), 0);
         reader.read_exact(&mut key)?;
@@ -194,7 +224,7 @@ pub(crate) fn read_entries(
             .checked_add(fields.record_len())
             .is_none_or(|end| end > trailer.log_len)
         {
-            return Err(Invalid("entries run past the log length"));
+            return Err(Invalid::new("entries run past the log length"));
         }
         entry(fields, &key, offset);
         offset += fields.record_len();
@@ -209,10 +239,10 @@ pub(crate) fn read_entries(
     let mut computed = checksum;
     computed.update(&rest[..16]);
     if u64::from_le_bytes(rest[16..].try_into().unwrap()) != computed.finalize() {
-        return Err(Invalid("checksum mismatch"));
+        return Err(Invalid::new("checksum mismatch"));
     }
     if count != trailer.count || offset != trailer.log_len {
-        return Err(Invalid("entries don't match the trailer"));
+        return Err(Invalid::new("entries don't match the trailer"));
     }
     Ok(Tail {
         entries_end,
@@ -369,7 +399,7 @@ mod tests {
         let mut bytes = write(&[set(b"a", 2)], 22);
         bytes[4] = 2;
         reseal(&mut bytes);
-        assert_eq!(read(&bytes), Err(Invalid("not a tally hint file")));
+        assert_eq!(read(&bytes), Err(Invalid::new("not a tally hint file")));
     }
 
     #[test]
@@ -391,7 +421,7 @@ mod tests {
             bytes.extend_from_slice(entry);
             bytes.extend_from_slice(&[0; 24]);
             reseal(&mut bytes);
-            assert_eq!(read(&bytes), Err(Invalid("bad entry")), "{entry:x?}");
+            assert_eq!(read(&bytes), Err(Invalid::new("bad entry")), "{entry:x?}");
         }
     }
 
@@ -417,6 +447,32 @@ mod tests {
     }
 
     #[test]
+    fn the_checksum_matches_a_whole_hint_and_no_one_byte_change() {
+        let fs = MemFs::new();
+        let path = Path::new("/hint");
+        let bytes = write(&[set(b"a", 2), fields(Kind::Delete, b"bc", 0)], 22 + 21);
+        let matches = |bytes: &[u8]| {
+            fs.put(path, bytes);
+            checksum_matches(&fs.open_existing(path).unwrap()).unwrap()
+        };
+        assert!(matches(&bytes));
+        for i in 0..bytes.len() {
+            let mut bad = bytes.clone();
+            bad[i] ^= 0x01;
+            assert!(!matches(&bad), "byte {i}");
+        }
+        assert!(!matches(&bytes[..28]), "shorter than a prefix and trailer");
+    }
+
+    #[test]
+    fn an_unreadable_hint_says_why() {
+        assert_eq!(
+            Invalid::from(io::Error::other("injected")),
+            Invalid("unreadable: injected".into())
+        );
+    }
+
+    #[test]
     fn every_truncation_is_rejected() {
         let bytes = write(&[set(b"a", 2), set(b"bc", 1)], 44);
         for len in 0..bytes.len() {
@@ -428,11 +484,11 @@ mod tests {
     fn entries_must_add_up_to_the_log_length() {
         assert_eq!(
             read(&write(&[set(b"a", 2)], 23)),
-            Err(Invalid("entries don't match the trailer"))
+            Err(Invalid::new("entries don't match the trailer"))
         );
         assert_eq!(
             read(&write(&[set(b"a", 2)], 21)),
-            Err(Invalid("entries run past the log length"))
+            Err(Invalid::new("entries run past the log length"))
         );
     }
 
@@ -453,7 +509,7 @@ mod tests {
         reseal(&mut bytes);
         assert_eq!(
             read(&bytes),
-            Err(Invalid("entries don't match the trailer"))
+            Err(Invalid::new("entries don't match the trailer"))
         );
     }
 }

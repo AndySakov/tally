@@ -40,6 +40,11 @@ pub enum CorruptionReason {
     /// A segment file's header has the wrong checksum or names another
     /// base. Reported at the segment's base.
     SegmentHeader,
+    /// The hint a compaction just wrote reads back with a bad checksum, or
+    /// listing another number of copies than it made. Reported at the
+    /// copy's base. The store keeps the old segments and the copy, with the
+    /// index on the copy as its records say, so there is nothing to repair.
+    CompactionHint,
 }
 
 impl Display for CorruptionReason {
@@ -57,6 +62,9 @@ impl Display for CorruptionReason {
             CorruptionReason::CutShort => write!(f, "segment ends partway through a record"),
             CorruptionReason::SegmentsOverlap => write!(f, "segment starts inside the one before"),
             CorruptionReason::SegmentHeader => write!(f, "segment file header is damaged"),
+            CorruptionReason::CompactionHint => {
+                write!(f, "a compaction's hint does not read back as written")
+            }
         }
     }
 }
