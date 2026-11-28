@@ -254,14 +254,27 @@ impl<F: Fs> Inner<F> {
             }
         });
         assert_eq!(left_behind, 0, "every live key in them is copied");
-        for segment in segments.iter() {
-            if chosen.contains(&segment.base) {
-                segment.set_dead(segment.len());
-            } else if segment.base > chosen[0] && Some(segment.base) != copy {
-                // What its Deletes hide may be among what goes.
-                segment.set_carried(0);
+        {
+            // Out of the list in one step, so a write past `stop_percent`
+            // does not wait for their removals.
+            let writing = self.writer();
+            let kept: Vec<_> = self
+                .segments()
+                .iter()
+                .filter(|s| !chosen.contains(&s.base))
+                .cloned()
+                .collect();
+            for segment in &kept {
+                if segment.base > chosen[0] && Some(segment.base) != copy {
+                    // What its Deletes hide may be among what goes.
+                    segment.set_carried(0);
+                }
             }
+            self.replace_segments(&writing, kept);
         }
+        self.wake_stalled();
+        #[cfg(test)]
+        self.between(Phase::Unlisted);
         // A Delete left behind must not outlive the Set it hides, so then
         // each removal is made durable before the next, oldest first. Without
         // one, the removals may land in any order. A write that poisoned the
@@ -269,17 +282,19 @@ impl<F: Fs> Inner<F> {
         // a later one on a new descriptor, so none of them is durable.
         for (i, &base) in chosen.iter().enumerate() {
             self.writable()?;
-            remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
-            self.fs.remove(&self.dir.join(log_name(base)))?;
-            {
+            let removed = remove_if_present(&self.fs, &self.dir.join(hint_name(base)))
+                .and_then(|_| self.fs.remove(&self.dir.join(log_name(base))));
+            if let Err(err) = removed {
+                // Still there, so listed again, for a later compaction.
                 let writing = self.writer();
-                let kept = self
-                    .segments()
-                    .iter()
-                    .filter(|s| s.base != base)
-                    .cloned()
-                    .collect();
-                self.replace_segments(&writing, kept);
+                let mut next = self.segments().to_vec();
+                for segment in segments.iter().filter(|s| chosen[i..].contains(&s.base)) {
+                    segment.set_dead(segment.len());
+                    next.push(Arc::clone(segment));
+                }
+                next.sort_by_key(|s| s.base);
+                self.replace_segments(&writing, next);
+                return Err(err.into());
             }
             if (dropped_delete || i + 1 == chosen.len())
                 && let Err(err) = self.fs.sync_dir(&self.dir)

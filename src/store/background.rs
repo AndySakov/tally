@@ -46,6 +46,8 @@ pub(crate) enum Phase {
     Copied,
     /// The index points at the copies; the cleaned segments are still there.
     Repointed,
+    /// The cleaned segments are out of the list; their files are still there.
+    Unlisted,
 }
 
 /// Poisons the store and wakes writers waiting for compaction if the

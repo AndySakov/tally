@@ -3620,3 +3620,26 @@ fn a_compaction_of_a_wholly_dead_log_leaves_an_empty_segment_to_write_to() {
         encoded_at(41, &[set_record(b"b", b"2")])
     );
 }
+
+#[test]
+fn the_cleaned_segments_stop_counting_toward_the_stall_before_they_are_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = one_record_per_segment(tmp.path());
+    let seen = Arc::new(Mutex::new(None));
+    {
+        let seen = Arc::clone(&seen);
+        store.on_phase(move |inner, phase| {
+            if phase == Phase::Unlisted {
+                let listed: Vec<u64> = inner.segments().iter().map(|s| s.base).collect();
+                *hold(&seen) = Some((listed, inner.dead_and_len(), segment_bases(&inner.dir)));
+            }
+        });
+    }
+    store.compact().unwrap();
+    assert_eq!(
+        hold(&seen).take(),
+        Some((vec![83], (0, 42), vec![0, 21, 42, 62, 83])),
+        "only the copies of b=2 and c=3, while the four cleaned files still exist"
+    );
+    assert_eq!(segment_bases(tmp.path()), [83]);
+}
