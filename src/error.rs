@@ -45,6 +45,13 @@ pub enum CorruptionReason {
     /// copy's base. The store keeps the old segments and the copy, with the
     /// index on the old ones, so there is nothing to repair.
     CompactionHint,
+    /// A segment the manifest lists is not in the directory: removed, or
+    /// lost to the file system. Its records are gone, and `repair` fails
+    /// with this too. Reported at the segment's base.
+    SegmentMissing,
+    /// `tally.manifest` is cut short, fails its checksum, or lists bases
+    /// out of order. Reported at offset 0.
+    Manifest,
 }
 
 impl Display for CorruptionReason {
@@ -65,6 +72,8 @@ impl Display for CorruptionReason {
             CorruptionReason::CompactionHint => {
                 write!(f, "a compaction's hint does not read back as written")
             }
+            CorruptionReason::SegmentMissing => write!(f, "segment file is missing"),
+            CorruptionReason::Manifest => write!(f, "the manifest is damaged"),
         }
     }
 }
@@ -275,6 +284,14 @@ mod tests {
             (
                 CorruptionReason::SegmentsOverlap,
                 "corrupt record at offset 4096: segment starts inside the one before",
+            ),
+            (
+                CorruptionReason::SegmentMissing,
+                "corrupt record at offset 4096: segment file is missing",
+            ),
+            (
+                CorruptionReason::Manifest,
+                "corrupt record at offset 4096: the manifest is damaged",
             ),
         ];
         for (reason, expected) in cases {
