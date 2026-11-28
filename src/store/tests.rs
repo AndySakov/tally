@@ -1794,6 +1794,11 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         )
         .is_err()
     );
+    std::fs::remove_file(&damaged_path).unwrap();
+    Store::open_with(tmp.path(), segmented(100_000))
+        .unwrap()
+        .verify()
+        .unwrap();
 }
 
 /// 150,000 records, three windows: sets, overwrites, deletes and
@@ -2725,7 +2730,7 @@ fn compaction_that_drops_a_delete_fsyncs_after_each_removal() {
 }
 
 #[test]
-fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
+fn a_compaction_whose_hint_reads_back_damaged_points_keys_at_the_copy_by_its_records() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c", b"d"] {
@@ -2752,6 +2757,7 @@ fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
     for k in [b"a", b"b", b"c", b"d"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
     }
+    store.verify().unwrap();
     store.set(key(b"e"), value(b"1")).unwrap();
     drop(store);
 
@@ -2763,7 +2769,7 @@ fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
 }
 
 #[test]
-fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
+fn a_compaction_whose_hint_counts_other_copies_points_keys_at_the_copy_by_its_records() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c"] {
@@ -2797,9 +2803,32 @@ fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
         .collect();
     assert_eq!(
         dead,
-        [(0, 0), (21, 0), (42, 0), (63, 63)],
-        "every key on its old record"
+        [(0, 21), (21, 21), (42, 21), (63, 0)],
+        "every key on its copy"
     );
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_whose_hint_fails_and_whose_copy_reads_back_damaged_poisons_the_store() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The last copy's value.
+    fs.tamper(&Path::new("/db").join(compact_name(63)), |offset, bytes| {
+        if offset > 0 {
+            *bytes.last_mut().unwrap() ^= 1;
+        }
+    });
+    // The copy's header and the copy; then its hint's fails.
+    fs.fail_syncs_after(2);
+    let err = store.compact().unwrap_err();
+    fs.fail_syncs(false);
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    let err = store.set(key(b"d"), value(b"1")).unwrap_err();
+    assert!(matches!(err, Error::Poisoned), "{err:?}");
 }
 
 #[test]
@@ -2815,10 +2844,15 @@ fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
     fs.fail_syncs(false);
     assert!(matches!(err, Error::Io(_)), "{err:?}");
     assert_eq!(fs.read(&Path::new("/db").join(hint_name(63))), None);
-    assert_eq!(store.dead(), 63, "the copies, which nothing points at");
+    assert_eq!(
+        store.dead(),
+        63,
+        "the old records, now that keys point at the copies"
+    );
     for k in [b"a", b"b", b"c"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
     }
+    store.verify().unwrap();
     store.set(key(b"d"), value(b"1")).unwrap();
     drop(store);
 
