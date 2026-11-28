@@ -100,6 +100,41 @@ pub(super) fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
     chosen
 }
 
+/// The bases, in log order, of the segments `deadest` picks, and of the
+/// sealed segments under an eighth of `segment_bytes`, oldest first, while
+/// the copy of them all would fit in `segment_bytes`: each compaction's
+/// copy is a segment of its own, and they would otherwise pile up. Empty
+/// if `auto` isn't due.
+pub(super) fn to_clean(
+    segments: &[SegmentSize],
+    auto: AutoCompact,
+    segment_bytes: u64,
+) -> Vec<u64> {
+    let mut chosen = deadest(segments, auto);
+    if chosen.is_empty() {
+        return chosen;
+    }
+    let copy = |s: &SegmentSize| s.len - s.dead;
+    let mut copied: u64 = segments
+        .iter()
+        .filter(|s| chosen.contains(&s.base))
+        .map(copy)
+        .sum();
+    let sealed = &segments[..segments.len() - 1];
+    let small: Vec<u64> = sealed
+        .iter()
+        .filter(|s| s.len < segment_bytes / 8 && !chosen.contains(&s.base))
+        .take_while(|s| {
+            copied += copy(s);
+            copied <= segment_bytes
+        })
+        .map(|s| s.base)
+        .collect();
+    chosen.extend(small);
+    chosen.sort_unstable();
+    chosen
+}
+
 impl<F: Fs> Inner<F> {
     pub(crate) fn compact(&self) -> Result<(), Error> {
         let compacting = self.compacting();
@@ -581,10 +616,11 @@ impl<F: Fs> Inner<F> {
 
     /// Compacts if automatic compaction is on and due, cleaning the
     /// segments with the most dead bytes until it no longer would be, and
-    /// returns whether it cleaned any. A failure is logged and turns
-    /// automatic compaction off until the next open; it is returned only
-    /// for `open`, which fails if it poisoned the store. After a write, the
-    /// write has already succeeded.
+    /// small sealed ones with them (`to_clean`), and returns whether it
+    /// cleaned any. A failure is logged and turns automatic compaction off
+    /// until the next open; it is returned only for `open`, which fails if
+    /// it poisoned the store. After a write, the write has already
+    /// succeeded.
     pub(super) fn compact_if_due(&self, compacting: &Compacting) -> Result<bool, Error> {
         let Some(auto) = self.auto_compact else {
             return Ok(false);
@@ -601,7 +637,7 @@ impl<F: Fs> Inner<F> {
                     dead: s.reclaimable(),
                 })
                 .collect();
-            deadest(&sizes, auto)
+            to_clean(&sizes, auto, self.segment_bytes)
         };
         self.clean(compacting, choose).inspect_err(|err| {
             self.auto_failed.store(true, Ordering::Relaxed);

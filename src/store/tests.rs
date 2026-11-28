@@ -1267,6 +1267,78 @@ fn automatic_compaction_cleans_the_deadest_segments_until_it_is_not_due() {
 }
 
 #[test]
+fn automatic_compaction_also_cleans_small_sealed_segments_oldest_first_while_the_copy_fits() {
+    let auto = AutoCompact::new(10, 0).unwrap();
+    // Small is under 100 of 800. Cleaning 0 leaves 10 of 1,189 dead, not
+    // due, and its copy is 100: 400, 850 and 940 add 50, 80 and 99. 450 and
+    // 1,039 are not small, and the active 1,839 is never cleaned.
+    let segments = size(&[
+        (0, 400, 300),
+        (400, 50, 0),
+        (450, 400, 0),
+        (850, 90, 10),
+        (940, 99, 0),
+        (1_039, 800, 0),
+        (1_839, 50, 0),
+    ]);
+    assert_eq!(to_clean(&segments, auto, 800), [0, 400, 850, 940]);
+    // A copy of 600, then 699 and 798: the next small one would take it to
+    // 897, past 800, so neither it nor any younger one goes.
+    let segments = size(&[
+        (0, 1_000, 400),
+        (1_000, 99, 0),
+        (1_099, 99, 0),
+        (1_198, 99, 0),
+        (1_297, 2, 0),
+        (1_299, 10, 0),
+    ]);
+    assert_eq!(to_clean(&segments, auto, 800), [0, 1_000, 1_099]);
+    assert_eq!(
+        to_clean(&size(&[(0, 100, 9), (100, 50, 0), (150, 0, 0)]), auto, 800),
+        [] as [u64; 0],
+        "not due"
+    );
+}
+
+#[test]
+fn a_compaction_takes_small_sealed_segments_into_its_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    for k in [
+        b"a", b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j", b"k",
+    ] {
+        put(&store, k, b"1");
+    }
+    put(&store, b"a", b"2");
+    assert_eq!(segment_bases(tmp.path()).len(), 12);
+    drop(store);
+    // 21 of 252 bytes dead: due at 5%. The segment at 0 is wholly dead and
+    // the 10 after it are 21 bytes each, under 176 / 8. The copy takes 8 of
+    // them, 168 bytes, to 252, and leaves 189, 210 and the active 231.
+    let options = Options {
+        auto_compact: AutoCompact::new(5, 0),
+        segment_bytes: 176,
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    assert_eq!(segment_bases(tmp.path()), [189, 210, 231, 252]);
+    assert_eq!(
+        segment_records(tmp.path(), 252),
+        encoded_at(
+            252,
+            &[b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i"].map(|k| set_record(k, b"1"))
+        )
+    );
+    assert_eq!(store.dead(), 0);
+    drop(store);
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    assert_eq!(read(&store, b"a").as_deref(), Some(&b"2"[..]));
+    for k in [b"b", b"c", b"d", b"e", b"f", b"g", b"h", b"i", b"j", b"k"] {
+        assert_eq!(read(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    store.verify().unwrap();
+}
+
+#[test]
 fn automatic_compaction_leaves_segments_without_dead_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     let options = Options {
