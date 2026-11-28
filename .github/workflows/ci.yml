@@ -40,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test
-      # The milestone 2 done criterion. Linux only: macOS fsync is ~5 ms.
+      # Linux only: macOS fsync is ~5 ms.
       - if: runner.os == 'Linux'
         run: cargo test --test kill
         env:
