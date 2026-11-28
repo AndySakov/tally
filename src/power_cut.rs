@@ -17,7 +17,7 @@ use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
 use crate::store::LOG_FILE_NAME;
-use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
+use crate::{AutoCompact, Key, Options, Repaired, SideFile, Store, Value};
 
 const DIR: &str = "/db";
 
@@ -274,8 +274,10 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
                     Some(Repaired {
                         offset: 22,
                         dropped: moved.len() as u64,
-                        side_file: side_path.clone(),
-                        unreadable: vec![],
+                        side_file: SideFile {
+                            path: side_path.clone(),
+                            unreadable: vec![],
+                        },
                     }),
                     "{context}"
                 );

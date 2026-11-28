@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::{
-    LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, Store, lock,
+    LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, SideFile, Store, lock,
     open::open_segments,
     remove_if_present,
     scan::{Scanned, scan, scan_into},
@@ -230,8 +230,10 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
     Ok(Repaired {
         offset: base,
         dropped: len,
-        side_file,
-        unreadable,
+        side_file: SideFile {
+            path: side_file,
+            unreadable,
+        },
     })
 }
 
@@ -303,8 +305,10 @@ impl<F: Fs> Store<F> {
         Ok(Some(Repaired {
             offset,
             dropped: len - offset,
-            side_file,
-            unreadable,
+            side_file: SideFile {
+                path: side_file,
+                unreadable,
+            },
         }))
     }
 }

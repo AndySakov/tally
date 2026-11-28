@@ -444,8 +444,10 @@ fn repair_moves_the_corrupt_record_and_everything_after_it_to_a_side_file() {
         Some(Repaired {
             offset: 22,
             dropped: 41,
-            side_file: side_file(tmp.path(), 22),
-            unreadable: vec![],
+            side_file: SideFile {
+                path: side_file(tmp.path(), 22),
+                unreadable: vec![],
+            },
         })
     );
     assert_eq!(log_bytes(tmp.path()), SET_A_HI);
@@ -483,8 +485,10 @@ fn repair_rewrites_a_side_file_a_crashed_repair_left() {
             Some(Repaired {
                 offset: 22,
                 dropped: 41,
-                side_file: side_file(tmp.path(), 22),
-                unreadable: vec![],
+                side_file: SideFile {
+                    path: side_file(tmp.path(), 22),
+                    unreadable: vec![],
+                },
             }),
             "side file left with {} bytes",
             left.len()
@@ -1398,8 +1402,10 @@ fn a_damaged_segment_header_is_corruption_that_repair_moves_aside() {
         Some(Repaired {
             offset: 0,
             dropped: 17 + 22,
-            side_file: side_file.clone(),
-            unreadable: vec![],
+            side_file: SideFile {
+                path: side_file.clone(),
+                unreadable: vec![],
+            },
         })
     );
     assert_eq!(fs::read(&side_file).unwrap(), bytes);
@@ -3174,11 +3180,13 @@ fn repair_moves_an_unreadable_sector_aside_as_zeros() {
         Some(Repaired {
             offset: 21,
             dropped: 5020,
-            side_file: dir.join("tally.log.corrupt-21"),
-            unreadable: vec![Range {
-                start: 0,
-                end: 4079
-            }],
+            side_file: SideFile {
+                path: dir.join("tally.log.corrupt-21"),
+                unreadable: vec![Range {
+                    start: 0,
+                    end: 4079
+                }],
+            },
         })
     );
     assert_eq!(
@@ -3200,7 +3208,9 @@ fn repair_over_an_unreadable_sector_rewrites_only_zeros_where_it_failed() {
     let fs = store_with_an_unreadable_sector();
     fs.put(&side, &crashed);
     assert_eq!(
-        Store::repair_in(&fs, dir).unwrap().map(|r| r.unreadable),
+        Store::repair_in(&fs, dir)
+            .unwrap()
+            .map(|r| r.side_file.unreadable),
         Some(vec![Range {
             start: 0,
             end: 4079
@@ -3257,7 +3267,11 @@ fn repair_moves_an_unreadable_sector_aside_from_the_record_or_batch_it_falls_in(
         let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
 
         assert_eq!(
-            (repaired.offset, repaired.dropped, repaired.unreadable),
+            (
+                repaired.offset,
+                repaired.dropped,
+                repaired.side_file.unreadable
+            ),
             (
                 offset,
                 111 - offset,
@@ -3292,7 +3306,11 @@ fn repair_cuts_at_the_record_holding_a_sector_whose_whole_read_fails() {
     let repaired = Store::repair_in(&fs, dir).unwrap().unwrap();
 
     assert_eq!(
-        (repaired.offset, repaired.dropped, repaired.unreadable),
+        (
+            repaired.offset,
+            repaired.dropped,
+            repaired.side_file.unreadable
+        ),
         (
             5041,
             5041,
