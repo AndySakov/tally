@@ -6,8 +6,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(test)]
+use super::Phase;
 use super::{
-    Store, Writing, remove_if_present,
+    Compacting, Inner, Reserved, Segments, remove_if_present,
     scan::{Scanned, scan_into},
     segment_of,
 };
@@ -98,51 +100,70 @@ pub(super) fn deadest(segments: &[SegmentSize], auto: AutoCompact) -> Vec<u64> {
     chosen
 }
 
-impl<F: Fs> Store<F> {
-    /// Rewrites the log with only the latest record of each live key, so
-    /// overwritten values and Delete records stop taking space.
-    ///
-    /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, lists it in the manifest in place of
-    /// the old segments, points the index at the copies, then
-    /// removes the old segments oldest first, fsyncing the directory after
-    /// each if it dropped a Delete record, else once after the last. Until
-    /// then the old segments are untouched, so any failure while copying
-    /// returns the error and leaves the store as it was. Checks every record
-    /// it reads, so a corrupt record stops compaction with its offset rather
-    /// than being copied. Reads go on while it runs; writes wait for it. A
-    /// failed directory fsync or manifest write poisons the store.
-    pub fn compact(&self) -> Result<(), Error> {
-        let writing = self.writer();
+impl<F: Fs> Inner<F> {
+    pub(crate) fn compact(&self) -> Result<(), Error> {
+        let compacting = self.compacting();
         self.writable()?;
-        let all: Vec<u64> = self
-            .segments()
-            .iter()
-            .filter(|s| s.len() > 0)
-            .map(|s| s.base)
-            .collect();
-        self.clean(&writing, &all)
+        let cleaned = self.clean(&compacting, |segments| {
+            segments
+                .iter()
+                .filter(|s| s.len() > 0)
+                .map(|s| s.base)
+                .collect()
+        });
+        drop(compacting);
+        self.wake_stalled();
+        cleaned.map(|_| ())
     }
 
-    /// Copies the live records of the segments based at `chosen` (in log
-    /// order) to a new segment at the end of the log, then removes them. A
-    /// Delete record is copied too while an older segment that is kept may
-    /// hold a Set it hides.
-    pub(super) fn clean(&self, writing: &Writing, chosen: &[u64]) -> Result<(), Error> {
-        if chosen.is_empty() {
-            return Ok(());
-        }
-        let segments = self.segments();
-        let base = segments.last().expect("there is always a segment").end();
+    /// Copies the live records of the segments `choose` picks from the
+    /// list (their bases, in log order) to a new segment at the end of the
+    /// log, then removes them, and returns whether it picked any. A Delete
+    /// record is copied too while an older segment that is kept may hold a
+    /// Set it hides. Writes go on meanwhile: the first after `choose` starts
+    /// a segment past every offset the copies could take, so none of them
+    /// lands in a segment being cleaned, and each is newer than the copies.
+    pub(super) fn clean(
+        &self,
+        _: &Compacting,
+        choose: impl FnOnce(&[Arc<Segment<F::File>>]) -> Vec<u64>,
+    ) -> Result<bool, Error> {
+        let (segments, chosen, base) = {
+            let mut writing = self.writer();
+            let segments = self.segments();
+            let chosen = choose(&segments);
+            if chosen.is_empty() {
+                return Ok(false);
+            }
+            let base = segments.last().expect("there is always a segment").end();
+            // Every copy, and every Delete carried, is a record of the same
+            // length in a segment being cleaned.
+            let most: u64 = segments
+                .iter()
+                .filter(|s| chosen.contains(&s.base))
+                .map(|s| s.len())
+                .sum();
+            *writing.reserved = Some(Reserved {
+                base,
+                end: base + most,
+            });
+            (segments, chosen, base)
+        };
+        let release = || *self.writer().reserved = None;
+        #[cfg(test)]
+        self.between(Phase::Reserved);
         let copy_path = self.dir.join(compact_name(base));
         let hint_path = self.dir.join(hint_name(base));
         // The copy is complete and durable before it takes a segment's name,
         // so the newest segment never holds more than one append that a
-        // crash could tear.
+        // crash could tear. An empty one never does: once a write has
+        // started a segment past it, nothing would remove it.
         let copied = self
-            .copy_live(&segments, &copy_path, &hint_path, chosen)
+            .copy_live(&segments, base, &copy_path, &hint_path, &chosen)
             .and_then(|copied| {
-                self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
+                if copied.written > 0 {
+                    self.fs.rename(&copy_path, &self.dir.join(log_name(base)))?;
+                }
                 Ok(copied)
             });
         let Copied {
@@ -158,41 +179,81 @@ impl<F: Fs> Store<F> {
             Err(err) => {
                 let _ = remove_if_present(&self.fs, &copy_path);
                 let _ = remove_if_present(&self.fs, &hint_path);
+                release();
                 return Err(err);
             }
         };
+        if written == 0 {
+            drop((output, hint));
+            let _ = remove_if_present(&self.fs, &copy_path);
+            let _ = remove_if_present(&self.fs, &hint_path);
+            let mut writing = self.writer();
+            *writing.reserved = None;
+            let active = self.active();
+            if chosen.contains(&active.base) {
+                // Nothing was written after it, and it goes.
+                self.drop_active_hint(&writing, active.base);
+                self.roll(&writing, base)?;
+            }
+            drop(writing);
+            return self.remove_cleaned(&chosen, None, dropped_delete);
+        }
+        if let Err(err) = self.fs.sync_dir(&self.dir) {
+            release();
+            return Err(self.poison(err));
+        }
         output.set_len_written(written);
         output.add_dead(carried);
         output.set_carried(carried, carried_against);
         let output = Arc::new(output);
-        let mut next = segments.to_vec();
-        if next.last().is_some_and(|s| s.base == base) {
-            next.pop();
-        }
-        next.push(Arc::clone(&output));
-        // The copy's name is durable before the manifest lists it, and the
-        // manifest no longer lists the cleaned segments before any goes.
-        let listed: Vec<u64> = next
-            .iter()
-            .map(|s| s.base)
-            .filter(|base| !chosen.contains(base))
-            .collect();
-        if let Err(err) = self
-            .fs
-            .sync_dir(&self.dir)
-            .and_then(|()| manifest::write(&self.fs, &self.dir, &listed))
-        {
-            return Err(self.poison(err));
-        }
-        // The copy takes the writes from here. An empty segment it replaces,
-        // or one it cleans, goes with its hint.
-        let active = segments.last().expect("there is always a segment");
-        if active.base == base || chosen.contains(&active.base) {
-            self.drop_active_hint(writing, active.base);
-        } else {
-            self.seal(writing, active);
-        }
-        self.replace_segments(writing, next);
+        let listed = {
+            let mut writing = self.writer();
+            // Without a write since `choose`, the copy is the last segment
+            // and takes the next ones, in place of the last if that was
+            // empty and so had the same base.
+            let mut next: Vec<_> = self
+                .segments()
+                .iter()
+                .filter(|s| s.base != base)
+                .cloned()
+                .collect();
+            let at = next.partition_point(|s| s.base < base);
+            next.insert(at, Arc::clone(&output));
+            // The copy's name is durable before the manifest lists it, and
+            // the manifest no longer lists the cleaned segments before any
+            // goes. Under the writer lock, so it lists every segment a write
+            // started.
+            let bases: Vec<u64> = next
+                .iter()
+                .map(|s| s.base)
+                .filter(|base| !chosen.contains(base))
+                .collect();
+            *writing.reserved = None;
+            // A write that poisoned the store failed a directory fsync, and
+            // Linux need not tell the copy's, so its name may not be
+            // durable: the manifest must not list it. A write poisons the
+            // store under the writer lock, so it has by now.
+            self.writable()?;
+            if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
+                return Err(self.poison(err));
+            }
+            // A write since `choose` started a segment past the copies, and
+            // its roll sealed the last. Without one, the copy takes the
+            // writes from the last, which seals here, unless it goes: an
+            // empty one the copy replaces, or one it cleans.
+            if at + 1 == next.len() {
+                let active = self.active();
+                if active.base == base || chosen.contains(&active.base) {
+                    self.drop_active_hint(&writing, active.base);
+                } else {
+                    self.seal(&writing, &active);
+                }
+            }
+            self.replace_segments(&writing, next);
+            self.segments()
+        };
+        #[cfg(test)]
+        self.between(Phase::Copied);
         // Written only now: nothing orders writes to two files, and a hint
         // must never reach the disk before the copies it lists.
         let repointed = hint
@@ -201,18 +262,35 @@ impl<F: Fs> Store<F> {
             .map_err(Error::from)
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
-            // The cleaned segments stay in use, so they are listed again.
-            let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
-            if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
-                self.poison(unlisted);
+            {
+                // The cleaned segments stay in use, so they are listed again.
+                let _writing = self.writer();
+                let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
+                if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
+                    self.poison(unlisted);
+                }
             }
             let _ = remove_if_present(&self.fs, &hint_path);
-            if let Err(unread) = self.repoint_by_records(&output, &moved) {
+            if let Err(unread) = self.repoint_by_records(&output, written, &moved) {
                 self.poison(unread);
             }
-            self.count_dead(writing);
+            self.count_dead(&self.writer());
             return Err(err);
         }
+        #[cfg(test)]
+        self.between(Phase::Repointed);
+        self.remove_cleaned(&chosen, Some(listed), dropped_delete)
+    }
+
+    /// Removes the `chosen` segments, whose live records are all in a copy
+    /// if they had any. `listed` is the list as the manifest last had it
+    /// without them, if it has since the compaction began.
+    fn remove_cleaned(
+        &self,
+        chosen: &[u64],
+        listed: Option<Segments<F::File>>,
+        dropped_delete: bool,
+    ) -> Result<bool, Error> {
         let segments = self.segments();
         let mut left_behind = 0usize;
         self.index.for_each(|entry| {
@@ -221,37 +299,74 @@ impl<F: Fs> Store<F> {
             }
         });
         assert_eq!(left_behind, 0, "every live key in them is copied");
-        for segment in segments.iter() {
-            if chosen.contains(&segment.base) {
-                segment.set_dead(segment.len());
-            } else {
-                segment.uncarry(chosen);
-            }
-        }
-        // A Delete left behind must not outlive the Set it hides, so then
-        // each removal is made durable before the next, oldest first. Without
-        // one, the removals may land in any order.
-        for (i, &base) in chosen.iter().enumerate() {
-            remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
-            self.fs.remove(&self.dir.join(log_name(base)))?;
-            let kept = self
+        let kept = {
+            // Out of the list in one step, so a write past `stop_percent`
+            // does not wait for their removals.
+            let writing = self.writer();
+            self.writable()?;
+            let kept: Vec<_> = self
                 .segments()
                 .iter()
-                .filter(|s| s.base != base)
+                .filter(|s| !chosen.contains(&s.base))
                 .cloned()
                 .collect();
-            self.replace_segments(writing, kept);
+            // A segment started since would have listed them again.
+            if listed.is_none_or(|listed| !Arc::ptr_eq(&listed, &self.segments())) {
+                let bases: Vec<u64> = kept.iter().map(|s| s.base).collect();
+                if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
+                    return Err(self.poison(err));
+                }
+            }
+            self.replace_segments(&writing, kept.clone());
+            kept
+        };
+        self.wake_stalled();
+        #[cfg(test)]
+        self.between(Phase::Unlisted);
+        // A Delete left behind must not outlive the Set it hides, so then
+        // each removal is made durable before the next, oldest first. Without
+        // one, the removals may land in any order. A write that poisoned the
+        // store meanwhile failed a directory fsync, and Linux need not tell
+        // a later one on a new descriptor, so none of them is durable.
+        // Under the writer lock: a write that failed a directory fsync
+        // poisons the store before it lets go.
+        let writable = || {
+            let _writing = self.writer();
+            self.writable()
+        };
+        for (i, &base) in chosen.iter().enumerate() {
+            writable()?;
+            let removed = remove_if_present(&self.fs, &self.dir.join(hint_name(base)))
+                .and_then(|_| self.fs.remove(&self.dir.join(log_name(base))));
+            if let Err(err) = removed {
+                // Still there, so listed again, for a later compaction.
+                let writing = self.writer();
+                let mut next = self.segments().to_vec();
+                for segment in segments.iter().filter(|s| chosen[i..].contains(&s.base)) {
+                    segment.set_dead(segment.len());
+                    next.push(Arc::clone(segment));
+                }
+                next.sort_by_key(|s| s.base);
+                self.replace_segments(&writing, next);
+                return Err(err.into());
+            }
             if (dropped_delete || i + 1 == chosen.len())
                 && let Err(err) = self.fs.sync_dir(&self.dir)
             {
                 return Err(self.poison(err));
             }
         }
-        Ok(())
+        writable()?;
+        // Only now: until every one is gone, a Delete they may hide a Set
+        // in is still needed.
+        for segment in &kept {
+            segment.uncarry(chosen);
+        }
+        Ok(true)
     }
 
     /// Writes each live record of the `chosen` segments to a new segment at
-    /// `copy_path`, based where the log ends, and its key and lengths to a
+    /// `copy_path`, based at `base`, and its key and lengths to a
     /// hint at `hint_path`, then a Delete record of each key that must stay
     /// deleted: it isn't live, and a kept segment older than one of its
     /// Delete records may hold a Set of it. Then fsyncs the copy. One
@@ -260,11 +375,11 @@ impl<F: Fs> Store<F> {
     fn copy_live(
         &self,
         segments: &[Arc<Segment<F::File>>],
+        base: u64,
         copy_path: &Path,
         hint_path: &Path,
         chosen: &[u64],
     ) -> Result<Copied<F::File>, Error> {
-        let base = segments.last().expect("there is always a segment").end();
         let output = create(&self.fs, copy_path, base)?;
         let hint_file = self.fs.open_or_create(hint_path)?;
         hint_file.set_len(0)?;
@@ -449,14 +564,19 @@ impl<F: Fs> Store<F> {
         Ok(())
     }
 
-    /// Points the index at the copies in `output`, read from its records as
-    /// a reopen without its hint would.
-    fn repoint_by_records(&self, output: &Segment<F::File>, moved: &[u64]) -> Result<(), Error> {
+    /// Points the index at the copies in `output`, the first `written` bytes
+    /// of it, read from its records as a reopen without its hint would.
+    fn repoint_by_records(
+        &self,
+        output: &Segment<F::File>,
+        written: u64,
+        moved: &[u64],
+    ) -> Result<(), Error> {
         let mut old = moved.iter();
         scan_into(
             output,
             output.base,
-            output.end(),
+            output.base + written,
             COMPACT_BUFFER,
             &mut |key, entry| {
                 if let Some(entry) = entry
@@ -470,28 +590,30 @@ impl<F: Fs> Store<F> {
     }
 
     /// Compacts if automatic compaction is on and due, cleaning the
-    /// segments with the most dead bytes until it no longer would be. A
-    /// failure is logged and turns automatic compaction off until the next
-    /// open; it is returned only for `open`, which fails if it poisoned the
-    /// store. After a write, the write has already succeeded.
-    pub(super) fn compact_if_due(&self, writing: &Writing) -> Result<(), Error> {
+    /// segments with the most dead bytes until it no longer would be, and
+    /// returns whether it cleaned any. A failure is logged and turns
+    /// automatic compaction off until the next open; it is returned only
+    /// for `open`, which fails if it poisoned the store. After a write, the
+    /// write has already succeeded.
+    pub(super) fn compact_if_due(&self, compacting: &Compacting) -> Result<bool, Error> {
         let Some(auto) = self.auto_compact else {
-            return Ok(());
+            return Ok(false);
         };
         if self.auto_failed.load(Ordering::Relaxed) || self.writable().is_err() {
-            return Ok(());
+            return Ok(false);
         }
-        let sizes: Vec<SegmentSize> = self
-            .segments()
-            .iter()
-            .map(|s| SegmentSize {
-                base: s.base,
-                len: s.len(),
-                dead: s.reclaimable(),
-            })
-            .collect();
-        let chosen = deadest(&sizes, auto);
-        self.clean(writing, &chosen).inspect_err(|err| {
+        let choose = |segments: &[Arc<Segment<F::File>>]| {
+            let sizes: Vec<SegmentSize> = segments
+                .iter()
+                .map(|s| SegmentSize {
+                    base: s.base,
+                    len: s.len(),
+                    dead: s.reclaimable(),
+                })
+                .collect();
+            deadest(&sizes, auto)
+        };
+        self.clean(compacting, choose).inspect_err(|err| {
             self.auto_failed.store(true, Ordering::Relaxed);
             log::warn!("automatic compaction failed, off until the next open: {err}");
         })

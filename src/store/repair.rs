@@ -6,14 +6,15 @@ use std::path::{Path, PathBuf};
 
 use super::{
     LOCK_FILE_NAME, LOG_FILE_NAME, Repaired, SideFile, Store, lock,
-    open::open_segments,
+    open::{NotOpened, open_segments},
     remove_if_present,
     scan::{Scanned, scan, scan_into},
 };
 use crate::fs::{Fs, LogFile};
+use crate::hint;
 use crate::index::Index;
 use crate::record::IndexOp;
-use crate::segment::{FILE_HEADER_LEN, compact_name, create, hint_name, log_name};
+use crate::segment::{FILE_HEADER_LEN, Segment, compact_name, create, hint_name, log_name};
 use crate::{CorruptionReason, Error};
 
 /// The blocks of a segment's file `repair` reads, and fills with zeros if
@@ -200,10 +201,10 @@ fn move_aside<F: Fs>(
     Ok(unreadable)
 }
 
-/// Repairs a sealed segment at `base` whose file header is damaged or cut
-/// short: none of its records can be trusted at the offsets they claim. The
-/// whole file, header included, goes to the side file, and an empty segment
-/// is renamed into its place.
+/// Repairs a segment at `base` whose file header is damaged, fails to read,
+/// or is cut short in a sealed segment: none of its records can be trusted
+/// at the offsets they claim. The whole file, header included, goes to the
+/// side file, and an empty segment is renamed into its place.
 fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, Error> {
     let path = dir.join(log_name(base));
     let file = fs.open_existing(&path)?;
@@ -224,10 +225,10 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
     Ok(Repaired {
         offset: base,
         dropped: len,
-        side_file: SideFile {
+        side_file: Some(SideFile {
             path: side_file,
             unreadable,
-        },
+        }),
     })
 }
 
@@ -236,15 +237,23 @@ impl<F: Fs> Store<F> {
         let _lock = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&_lock)?;
         let segments = match open_segments(fs, dir) {
-            Err(Error::Corruption {
-                offset: base,
-                reason: CorruptionReason::SegmentHeader | CorruptionReason::CutShort,
-            }) => return repair_file_header(fs, dir, base).map(Some),
+            Err(
+                NotOpened::Failed(Error::Corruption {
+                    offset: base,
+                    reason: CorruptionReason::SegmentHeader | CorruptionReason::CutShort,
+                })
+                | NotOpened::UnreadableHeader(base, _),
+            ) => return repair_file_header(fs, dir, base).map(Some),
             opened => opened?.segments,
         };
         let mut index = Index::new();
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
+            let lost = lost_past_hint(fs, dir, segment)?;
+            if lost.is_some() {
+                remove_if_present(fs, &dir.join(hint_name(segment.base)))?;
+                fs.sync_dir(dir)?;
+            }
             let newest = i + 1 == segments.len();
             let mut reading = Reading::from(segment.base);
             let damage = match scan(
@@ -266,11 +275,18 @@ impl<F: Fs> Store<F> {
                 Err(err) => return Err(err),
             };
             if let Some(offset) = damage {
-                bad = Some((segment, offset));
+                bad = Some((segment, offset, lost.unwrap_or(0)));
                 break;
             }
+            if let Some(lost) = lost {
+                return Ok(Some(Repaired {
+                    offset: segment.end(),
+                    dropped: lost,
+                    side_file: None,
+                }));
+            }
         }
-        let Some((segment, offset)) = bad else {
+        let Some((segment, offset, lost)) = bad else {
             return Ok(None);
         };
         let len = segment.end();
@@ -298,11 +314,36 @@ impl<F: Fs> Store<F> {
         segment.sync()?;
         Ok(Some(Repaired {
             offset,
-            dropped: len - offset,
-            side_file: SideFile {
+            dropped: len - offset + lost,
+            side_file: Some(SideFile {
                 path: side_file,
                 unreadable,
-            },
+            }),
         }))
     }
+}
+
+/// The bytes past `segment`'s end that its hint lists, if a hint whose
+/// checksum matches lists more than the segment holds: what `open` reports
+/// as `CutShort` at its end.
+fn lost_past_hint<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    segment: &Segment<F::File>,
+) -> Result<Option<u64>, Error> {
+    let file = match fs.open_existing(&dir.join(hint_name(segment.base))) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if !hint::checksum_matches(&file)? {
+        return Ok(None);
+    }
+    let Ok(trailer) = hint::trailer(&file) else {
+        return Ok(None);
+    };
+    Ok(trailer
+        .log_len
+        .checked_sub(segment.len())
+        .filter(|&lost| lost > 0))
 }

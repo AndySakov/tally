@@ -1,9 +1,11 @@
 use std::fs::TryLockError;
 use std::io::{self, ErrorKind};
+#[cfg(any(test, fuzzing))]
+use std::ops::Deref;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError as TryLock};
 use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
@@ -13,14 +15,18 @@ use crate::manifest;
 use crate::options::{AutoCompact, Options};
 use crate::record::{Fields, HEADER_LEN, Record, decode_header, decode_payload};
 use crate::segment::{Segment, active_hint_name, create, log_name};
-use crate::{CorruptionReason, Error, Key, Value};
+use crate::{Batch, CorruptionReason, Error, Key, Value};
 
+mod background;
 mod commit;
 mod compact;
 mod open;
 mod repair;
 mod scan;
 
+use background::Background;
+#[cfg(test)]
+pub(crate) use background::Phase;
 use commit::Queue;
 #[cfg(any(test, fuzzing))]
 pub(crate) use commit::Write;
@@ -31,18 +37,21 @@ use scan::scan;
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 
-/// What `Store::repair` moved out of the log.
+/// What `Store::repair` took out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Repaired {
     /// Offset of the first bad record, where its segment now ends, or the
-    /// base of a segment whose file header was bad, which is now empty.
+    /// base of a segment whose file header was bad, which is now empty, or
+    /// the end of a segment cut short of what its hint lists.
     pub offset: u64,
-    /// Bytes moved out of the log: everything from `offset` to the end of
-    /// its segment, or the whole file of a segment whose header was bad.
+    /// Bytes taken out of the log: everything from `offset` to the end of
+    /// its segment, or the whole file of a segment whose header was bad,
+    /// plus what the hint lists past where a segment cut short now ends.
     pub dropped: u64,
-    /// Where those bytes were saved.
-    pub side_file: SideFile,
+    /// Where those bytes were saved, or `None` when they were all already
+    /// gone: a segment cut short of its hint on a record boundary.
+    pub side_file: Option<SideFile>,
 }
 
 /// The file `Store::repair` saved the bytes it moved to.
@@ -62,11 +71,18 @@ pub struct SideFile {
 /// Every method takes `&self`, and a `Store` on the real file system is
 /// `Send` and `Sync`: share one between threads with an `Arc`. Reads run in
 /// parallel with each other and with writes. Writes from several threads
-/// share fsyncs (DESIGN.md, Group commit).
+/// share fsyncs (DESIGN.md, Group commit). With automatic compaction on, a
+/// thread of the store's own compacts while writes go on; dropping the
+/// store waits for a compaction it is running to finish.
 ///
 /// `F` is the file system. It is always [`OsFs`] outside tally's own tests,
 /// which swap in an in-memory disk to simulate power cuts.
 pub struct Store<F: Fs = OsFs> {
+    inner: Arc<Inner<F>>,
+}
+
+/// What a `Store` and its compaction thread share.
+pub struct Inner<F: Fs> {
     fs: F,
     dir: PathBuf,
     /// Holds the exclusive lock for as long as the store is open.
@@ -81,13 +97,22 @@ pub struct Store<F: Fs = OsFs> {
     auto_failed: AtomicBool,
     index: Index,
     /// Held by whoever appends to the log or changes its segments: the
-    /// leader of a group of writes, a compaction, or `verify`.
-    writing: Mutex<()>,
+    /// leader of a group of writes, a compaction for each change it makes
+    /// to the list, or `verify`. Holds the offsets a running compaction has
+    /// reserved for its copies.
+    writing: Mutex<Option<Reserved>>,
     /// The hint of the last segment, while it takes writes, if it has one
-    /// (DESIGN.md, Hints written by writes). Only the writer touches it.
+    /// (DESIGN.md, Hints written by writes). Only the holder of `writing`
+    /// touches it.
     active_hint: Mutex<Option<hint::Writer<F::File>>>,
     /// The `hint::spill_at` of the thread that opened the store.
     spill_at: usize,
+    /// Held by a compaction from start to end, and by `verify`.
+    compacting: Mutex<()>,
+    /// The compaction thread and its signals, if automatic compaction runs
+    /// on one. Without it, the leader whose group made compaction due runs
+    /// it.
+    background: Option<Background>,
     /// Writes waiting for a leader, and the results of those done.
     queue: Mutex<Queue>,
     /// Signalled when a group of writes is done.
@@ -103,19 +128,53 @@ pub struct Store<F: Fs = OsFs> {
     /// Appends fsynced, for tests of group commit.
     #[cfg(test)]
     commits: AtomicU64,
+    /// Leaders that waited for compaction to catch up.
+    #[cfg(test)]
+    stalls: AtomicU64,
+    /// Called at each phase of a compaction, for tests that write or wait
+    /// in the middle of one.
+    #[cfg(test)]
+    between: std::sync::OnceLock<Between<F>>,
+}
+
+/// Log offsets from `base` to `end` that a compaction's copies may take.
+/// The first write after them starts a segment at `end`, so every write
+/// that lands during the compaction is newer than every copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reserved {
+    base: u64,
+    end: u64,
 }
 
 type Segments<L> = Arc<Vec<Arc<Segment<L>>>>;
+
+#[cfg(test)]
+type Between<F> = Box<dyn Fn(&Inner<F>, Phase) + Send + Sync>;
 
 /// Holds `Store::writing`, and is the evidence that the caller does. A
 /// thread that panics holding it may have left the log half changed, so
 /// the store is poisoned.
 struct Writing<'a> {
-    _guard: MutexGuard<'a, ()>,
+    reserved: MutexGuard<'a, Option<Reserved>>,
     poisoned: &'a AtomicBool,
 }
 
 impl Drop for Writing<'_> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Holds `Store::compacting`, and poisons the store if its thread panics,
+/// as `Writing` does.
+struct Compacting<'a> {
+    _guard: MutexGuard<'a, ()>,
+    poisoned: &'a AtomicBool,
+}
+
+impl Drop for Compacting<'_> {
     fn drop(&mut self) {
         if thread::panicking() {
             self.poisoned.store(true, Ordering::Release);
@@ -128,6 +187,15 @@ impl Drop for Writing<'_> {
 /// covers it.
 fn hold<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `hold`, unless another thread holds `mutex`.
+fn try_hold<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+    match mutex.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(TryLock::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        Err(TryLock::WouldBlock) => None,
+    }
 }
 
 impl Store {
@@ -157,12 +225,14 @@ impl Store {
     /// `open`, with `options` in place of the defaults.
     ///
     /// With `auto_compact` set, compacts before returning if the log is due
-    /// (see [`AutoCompact`]). A failed automatic compaction logs a warning
-    /// and turns automatic compaction off until the next open, and `open`
-    /// still succeeds, unless the failure poisoned the store (a failed
-    /// directory fsync): then `open` returns it.
+    /// (see [`AutoCompact`]), then starts a thread that compacts whenever
+    /// writes make it due again. A failed automatic compaction logs a
+    /// warning and turns automatic compaction off until the next open, and
+    /// `open` and every write still succeed, unless the failure poisoned the
+    /// store (a failed directory fsync): then `open` returns it, and later
+    /// writes fail with `Poisoned`. So does a panic on that thread.
     pub fn open_with(dir: impl AsRef<Path>, options: Options) -> Result<Store, Error> {
-        Self::open_in(OsFs, dir.as_ref(), options)
+        Self::open_in_background(OsFs, dir.as_ref(), options)
     }
 
     /// Makes a log that `open` refuses openable again, without opening it.
@@ -173,11 +243,13 @@ impl Store {
     /// the side file and the directory, then truncates the segment at the
     /// record and fsyncs it. A segment whose file header is damaged, or cut
     /// short in a sealed segment, goes to the side file whole and is
-    /// replaced by an empty one. Unsupported records are an error, not
-    /// something to repair: a newer tally can read them. So are a missing
-    /// segment and a damaged manifest: put the file back, or remove
-    /// `tally.manifest` to open without it. Fails with `Locked` while a
-    /// `Store` is open.
+    /// replaced by an empty one. A segment shorter than its hint says has
+    /// lost records no side file can save: the hint is removed, and a
+    /// record the cut tore is repaired as a corrupt one. Unsupported records are an
+    /// error, not something to repair: a newer tally can read them. So are
+    /// a missing segment and a damaged manifest: put the file back, or
+    /// remove `tally.manifest` to open without it. Fails with `Locked`
+    /// while a `Store` is open.
     ///
     /// If the side file already exists and is the start of what would be
     /// moved, a crashed earlier run left it, and it is rewritten. Otherwise
@@ -277,7 +349,134 @@ fn remove_if_present(fs: &impl Fs, path: &Path) -> io::Result<bool> {
 }
 
 impl<F: Fs> Store<F> {
+    /// Opens the store with automatic compaction run by the leader whose
+    /// group of writes made it due, after that group's results go out, as
+    /// the in-memory disk needs: it can't be shared with a thread, and the
+    /// power-cut tests need every step in the same order on every run.
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn open_in(fs: F, dir: &Path, options: Options) -> Result<Self, Error> {
+        Ok(Store {
+            inner: Arc::new(Inner::open(fs, dir, options, false)?),
+        })
+    }
+
+    /// Opens the store with automatic compaction, if on, run by a thread of
+    /// its own.
+    pub(crate) fn open_in_background(fs: F, dir: &Path, options: Options) -> Result<Self, Error>
+    where
+        F: Send + Sync + 'static,
+        F::File: Send + Sync,
+    {
+        let inner = Arc::new(Inner::open(fs, dir, options, true)?);
+        if let Some(background) = &inner.background {
+            let compactor = Arc::clone(&inner);
+            let thread = thread::Builder::new()
+                .name("tally-compact".into())
+                .spawn(move || compactor.compact_in_background())?;
+            background.started(thread);
+        }
+        Ok(Store { inner })
+    }
+
+    /// Returns the value for `key`, or `None` if it isn't live.
+    ///
+    /// Reads the record in one positioned read and verifies both checksums
+    /// and that the stored key equals `key`. Any failure is a corruption
+    /// error at the record's offset, never `None`. Takes no lock while it
+    /// reads, so it runs alongside writes and compaction.
+    pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
+        self.inner.get(key)
+    }
+
+    /// Appends a Set record, fsyncs, then points the index at it.
+    ///
+    /// Writes from several threads share an fsync (DESIGN.md, Group
+    /// commit): a write waits for the group it lands in, and a failure
+    /// fails every write in that group with the same error. A write that
+    /// fails partway is truncated away. A failed fsync, or a failed truncate
+    /// of a failed write, poisons the store: every later write fails with
+    /// `Poisoned` until it is reopened, and reads still work.
+    ///
+    /// A write never waits for an automatic compaction, unless compaction
+    /// has fallen behind: a write slows down once the log's dead bytes
+    /// reach [`AutoCompact::slow_percent`], and waits for compaction from
+    /// [`AutoCompact::stop_percent`].
+    pub fn set(&self, key: Key, value: Value) -> Result<(), Error> {
+        self.inner.set(key, value)
+    }
+
+    /// Applies every operation in `batch` with one append and one fsync,
+    /// all or nothing: after a crash, `open` finds the whole batch or none
+    /// of it (DESIGN.md, Batches). Operations apply in order, so a delete
+    /// sees the batch's own earlier sets. A delete of a key that isn't live
+    /// at that point writes nothing, as `delete` does, and a batch that
+    /// writes nothing is a no-op. Failed writes, and compaction, are as in
+    /// `set`.
+    pub fn write(&self, batch: Batch) -> Result<(), Error> {
+        self.inner.write(batch)
+    }
+
+    /// Appends a Delete record, fsyncs, then removes the key from the index.
+    ///
+    /// Deleting a key that isn't live is a no-op: nothing is written and it
+    /// returns `Ok`. Failed writes, and compaction, are as in `set`.
+    pub fn delete(&self, key: Key) -> Result<(), Error> {
+        self.inner.delete(key)
+    }
+
+    /// Rewrites the log with only the latest record of each live key, so
+    /// overwritten values and Delete records stop taking space.
+    ///
+    /// Cleans every segment (DESIGN.md, Compaction): copies the live records
+    /// into a new segment with a hint, lists it in the manifest in place of
+    /// the old segments, points the index at the copies, then
+    /// removes the old segments oldest first, fsyncing the directory after
+    /// each if it dropped a Delete record, else once after the last. Until
+    /// then the old segments are untouched, so any failure while copying
+    /// returns the error and leaves the store as it was. Checks every record
+    /// it reads, so a corrupt record stops compaction with its offset rather
+    /// than being copied. Reads and writes go on while it runs; it waits
+    /// for an automatic compaction running on the store's thread. A failed
+    /// directory fsync or manifest write poisons the store.
+    pub fn compact(&self) -> Result<(), Error> {
+        self.inner.compact()
+    }
+
+    /// Reads every record in the log, checking both checksums of each, and
+    /// checks that they describe exactly the index in memory. `open` skips
+    /// the checksums of records a hint covers (DESIGN.md, Hint file); this
+    /// is the full check, on demand. Reads the whole log and holds two
+    /// sorted lists of 16 bytes per live key while it compares them. Writes
+    /// and compaction wait for it.
+    ///
+    /// Fails with the first bad record's error, or `IndexMismatch` at the
+    /// first offset where the log and the index disagree.
+    pub fn verify(&self) -> Result<(), Error> {
+        self.inner.verify()
+    }
+}
+
+/// Stops the compaction thread, after the compaction it is running if any,
+/// and waits for it. Every write is durable before it returns, so this
+/// adds nothing to durability; it is so the lock is free once the store is.
+impl<F: Fs> Drop for Store<F> {
+    fn drop(&mut self) {
+        self.inner.stop_compactor();
+    }
+}
+
+/// Tests and the model reach the store's insides.
+#[cfg(any(test, fuzzing))]
+impl<F: Fs> Deref for Store<F> {
+    type Target = Inner<F>;
+
+    fn deref(&self) -> &Inner<F> {
+        &self.inner
+    }
+}
+
+impl<F: Fs> Inner<F> {
+    fn open(fs: F, dir: &Path, options: Options, background: bool) -> Result<Self, Error> {
         match fs.create_dir(dir) {
             Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
@@ -305,7 +504,7 @@ impl<F: Fs> Store<F> {
             let bases: Vec<u64> = segments.iter().map(|s| s.base).collect();
             manifest::write(&fs, dir, &bases)?;
         }
-        let store = Store {
+        let store = Inner {
             fs,
             dir: dir.to_path_buf(),
             _lock: lock_file,
@@ -314,9 +513,11 @@ impl<F: Fs> Store<F> {
             auto_compact: options.auto_compact,
             auto_failed: AtomicBool::new(false),
             index,
-            writing: Mutex::new(()),
+            writing: Mutex::new(None),
             active_hint: Mutex::new(active_hint),
             spill_at,
+            compacting: Mutex::new(()),
+            background: (background && options.auto_compact.is_some()).then(Background::default),
             queue: Mutex::default(),
             committed: Condvar::new(),
             arrived: Condvar::new(),
@@ -324,16 +525,19 @@ impl<F: Fs> Store<F> {
             poisoned: AtomicBool::new(false),
             #[cfg(test)]
             commits: AtomicU64::new(0),
+            #[cfg(test)]
+            stalls: AtomicU64::new(0),
+            #[cfg(test)]
+            between: std::sync::OnceLock::new(),
         };
+        let compacting = store.compacting();
+        store.count_dead(&store.writer());
+        if let Err(err) = store.compact_if_due(&compacting)
+            && store.writable().is_err()
         {
-            let writing = store.writer();
-            store.count_dead(&writing);
-            if let Err(err) = store.compact_if_due(&writing)
-                && store.writable().is_err()
-            {
-                return Err(err);
-            }
+            return Err(err);
         }
+        drop(compacting);
         Ok(store)
     }
 
@@ -373,9 +577,31 @@ impl<F: Fs> Store<F> {
 
     fn writer(&self) -> Writing<'_> {
         Writing {
-            _guard: hold(&self.writing),
+            reserved: hold(&self.writing),
             poisoned: &self.poisoned,
         }
+    }
+
+    fn compacting(&self) -> Compacting<'_> {
+        Compacting {
+            _guard: hold(&self.compacting),
+            poisoned: &self.poisoned,
+        }
+    }
+
+    /// `compacting`, unless a compaction is running.
+    fn try_compacting(&self) -> Option<Compacting<'_>> {
+        Some(Compacting {
+            _guard: try_hold(&self.compacting)?,
+            poisoned: &self.poisoned,
+        })
+    }
+
+    /// The dead bytes compaction could give back, and the log's length.
+    fn dead_and_len(&self) -> (u64, u64) {
+        self.segments().iter().fold((0, 0), |(dead, len), s| {
+            (dead + s.reclaimable(), len + s.len())
+        })
     }
 
     fn writable(&self) -> Result<(), Error> {
@@ -394,13 +620,7 @@ impl<F: Fs> Store<F> {
         err
     }
 
-    /// Returns the value for `key`, or `None` if it isn't live.
-    ///
-    /// Reads the record in one positioned read and verifies both checksums
-    /// and that the stored key equals `key`. Any failure is a corruption
-    /// error at the record's offset, never `None`. Takes no lock while it
-    /// reads, so it runs alongside writes and compaction.
-    pub fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
+    pub(crate) fn get(&self, key: &Key) -> Result<Option<Value>, Error> {
         let Some((entry, segment)) = self
             .index
             .get(key.as_bytes())
@@ -440,16 +660,8 @@ impl<F: Fs> Store<F> {
         }
     }
 
-    /// Reads every record in the log, checking both checksums of each, and
-    /// checks that they describe exactly the index in memory. `open` skips
-    /// the checksums of records a hint covers (DESIGN.md, Hint file); this
-    /// is the full check, on demand. Reads the whole log and holds two
-    /// sorted lists of 16 bytes per live key while it compares them. Writes
-    /// wait for it.
-    ///
-    /// Fails with the first bad record's error, or `IndexMismatch` at the
-    /// first offset where the log and the index disagree.
-    pub fn verify(&self) -> Result<(), Error> {
+    pub(crate) fn verify(&self) -> Result<(), Error> {
+        let _compacting = self.compacting();
         let _writing = self.writer();
         let mismatch = |offset| Error::Corruption {
             offset,

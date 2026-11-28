@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 2,426,043 possible disk states.
+cut before every disk operation of a workload, across 37,907,954 possible disk states.
 
 ## Status
 
@@ -14,7 +14,8 @@ v1 is done. tally is an embedded library for one process, shared by its threads:
 - reads that take no lock while they read, alongside writes and compaction;
 - recovery from torn tails on `open`, which saves what it cuts, `repair` for any other damage, and `verify` to check
   every record;
-- compaction that runs on its own and cleans only the segments with the most dead bytes;
+- compaction on a thread of the store's own, alongside writes, that cleans only the segments with the most dead bytes,
+  and stalls writes if it falls behind;
 - hint files, written by compaction, by writes as each segment fills, and by `open` for any segment left without
   one, so `open` reads each sealed segment's keys without its values.
 
@@ -48,15 +49,20 @@ Every method takes `&self`. To use a store from several threads, put it in an `A
 together share one fsync. If an fsync fails, that write returns the error and every later write returns
 `Error::Poisoned` until the store is reopened; reads keep working.
 
-Overwrites and deletes leave dead bytes in the log. By default, `open` and every write compact once half of the
-log is dead and it is at least 1 MiB, cleaning the segments with the largest share of dead bytes until it no
-longer is. To set the trigger or the segment size, or turn compaction off and call `compact` yourself:
+Overwrites and deletes leave dead bytes in the log. By default, once 40% of the log is dead and it is at least
+1 MiB, `open`, and after that a thread of the store's own while writes go on, cleans the segments with the largest
+share of dead bytes until it no longer is. If compaction falls behind, writes slow down at 45% and wait for it at
+50%, so the log stays under twice its live size or 1 MiB, whichever is larger. Past that go one group of writes, a
+running compaction's copies, and Delete records compaction must keep while an older segment may hold a value they
+hide. To
+set the thresholds or the segment size, or turn compaction off and call `compact` yourself:
 
 ```rust
 use tally::{AutoCompact, Options, Store};
 
 let mut options = Options::default();
-options.auto_compact = AutoCompact::new(30, 64 << 20); // 30% dead, 64 MiB floor
+options.auto_compact = AutoCompact::new(30, 64 << 20); // 30% dead, 64 MiB floor; writes slow at 35%, stop at 40%
+options.auto_compact = options.auto_compact.and_then(|a| a.with_stalls(40, 60)); // or slow at 40%, stop at 60%
 // options.auto_compact = None; // only on store.compact()
 options.segment_bytes = 64 << 20; // default 256 MiB
 let store = Store::open_with("data", options)?;
@@ -86,10 +92,12 @@ Criterion on an M1 Pro running macOS, where `sync_all` is `F_FULLFSYNC` and flus
 A write costs what its fsync costs: `set` is within the run-to-run noise of the bare baseline, and a batch
 shares one fsync across its records, as writes from several threads share one across the group.
 
-At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random with default
-options: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB segments (9.01 s
-when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s with a hint for every sealed
-segment (1.8 s without them).
+At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random, with compaction at
+50% on the write path: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB
+segments (9.01 s when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s with a hint for
+every sealed segment (1.8 s without them). At a tenth of that, with 25 MiB segments, on a machine shared with other
+work, compaction on the store's thread took the slowest batch from 390 to 616 ms down to 120 to 165 ms, and the p99
+from 382 to 486 ms down to 111 to 158 ms.
 
 ## How it's tested
 

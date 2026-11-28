@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::fs::{Fs, LogFile};
 use crate::segment::parse_log_name;
-use crate::store::Write;
+use crate::store::{Inner, Write};
 use crate::{AutoCompact, Batch, Key, Options, Store, Value};
 
 /// Keys a thread's operations reach. Few, so overwrites, deletes of live
@@ -96,7 +96,7 @@ pub fn live_len(state: &State) -> u64 {
 /// Runs `op` against `store` as thread `t` and applies it to `state`,
 /// checking that a `Get` reads what `state` holds. Returns the bytes of log
 /// it wrote. The caller does `Reopen`.
-pub fn run<F: Fs>(store: &Store<F>, t: u8, state: &mut State, op: &Op) -> u64 {
+pub fn run<F: Fs>(store: &Inner<F>, t: u8, state: &mut State, op: &Op) -> u64 {
     match op {
         Op::Set(k, v) => {
             store.set(key(t, *k), value(v)).unwrap();
@@ -139,7 +139,7 @@ pub fn run<F: Fs>(store: &Store<F>, t: u8, state: &mut State, op: &Op) -> u64 {
 }
 
 /// Checks every key of thread `t` reads what `state` holds.
-pub fn check<F: Fs>(store: &Store<F>, t: u8, state: &State) {
+pub fn check<F: Fs>(store: &Inner<F>, t: u8, state: &State) {
     let mut state = state.clone();
     for k in 0..KEY_SPACE {
         run(store, t, &mut state, &Op::Get(k));
@@ -299,10 +299,11 @@ mod tests {
     }
 
     /// Each thread has keys and a map of its own. A reopen in a thread
-    /// becomes a compaction, since the threads share the store.
+    /// becomes a compaction, since the threads share the store, and
+    /// automatic compaction runs on the store's thread.
     fn threads_match(auto: bool, ops: &[Vec<Op>]) {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
+        let store = Store::open_in_background(OsFs, tmp.path(), options(auto)).unwrap();
         let states: Vec<State> = thread::scope(|scope| {
             let threads: Vec<_> = ops
                 .iter()
@@ -330,7 +331,7 @@ mod tests {
         }
         store.verify().unwrap();
         drop(store);
-        let store = Store::open_in(OsFs, tmp.path(), options(auto)).unwrap();
+        let store = Store::open_in_background(OsFs, tmp.path(), options(auto)).unwrap();
         for (t, state) in states.iter().enumerate() {
             check(&store, t as u8, state);
         }
