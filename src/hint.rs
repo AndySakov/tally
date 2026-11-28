@@ -30,6 +30,22 @@ const PREFIX_LEN: u64 = 5;
 const TRAILER_LEN: u64 = 24;
 const FLUSH_AT: usize = 1 << 20;
 
+#[cfg(test)]
+thread_local! {
+    /// What `spill_at` returns on this thread, so a test can cut the power
+    /// at the writes of an active hint's file.
+    pub(crate) static SPILL_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(FLUSH_AT) };
+}
+
+/// How many bytes an active segment's hint holds in memory before it goes
+/// to a file, and then holds between writes.
+pub(crate) fn spill_at() -> usize {
+    #[cfg(test)]
+    return SPILL_AT.get();
+    #[cfg(not(test))]
+    FLUSH_AT
+}
+
 /// What a hint file covers, from its trailer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Trailer {
@@ -66,8 +82,11 @@ impl From<io::Error> for Invalid {
 
 /// Writes a hint file, one entry per record, in log order.
 pub(crate) struct Writer<F: LogFile> {
-    file: F,
+    /// `None` until `give_file`: the entries wait in memory.
+    file: Option<F>,
     buffer: Vec<u8>,
+    /// How full `buffer` gets before it is written.
+    flush_at: usize,
     written: u64,
     checksum: Digest,
     count: u64,
@@ -76,16 +95,43 @@ pub(crate) struct Writer<F: LogFile> {
 impl<F: LogFile> Writer<F> {
     /// A hint in the empty `file`.
     pub(crate) fn new(file: F) -> Writer<F> {
-        let mut buffer = Vec::with_capacity(FLUSH_AT);
+        Writer {
+            file: Some(file),
+            ..Writer::unfiled(FLUSH_AT)
+        }
+    }
+
+    /// A hint with no file yet: its entries wait in memory until it
+    /// `wants_file`, at `flush_at` bytes, or until it is given one to
+    /// finish in.
+    pub(crate) fn unfiled(flush_at: usize) -> Writer<F> {
+        let mut buffer = Vec::with_capacity(flush_at);
         buffer.extend_from_slice(MAGIC);
         buffer.push(VERSION);
         Writer {
-            file,
+            file: None,
             buffer,
+            flush_at,
             written: 0,
             checksum: Digest::new(CrcAlgorithm::Crc64Nvme),
             count: 0,
         }
+    }
+
+    /// Whether it holds enough to write and has no file to write it to.
+    pub(crate) fn wants_file(&self) -> bool {
+        self.file.is_none() && self.buffer.len() >= self.flush_at
+    }
+
+    pub(crate) fn has_file(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// The empty file to write the hint to, from the next `push` or
+    /// `finish` on.
+    pub(crate) fn give_file(&mut self, file: F) {
+        debug_assert!(self.file.is_none());
+        self.file = Some(file);
     }
 
     /// More entries for the hint in `file` that `tail` came from. Cuts off
@@ -93,8 +139,9 @@ impl<F: LogFile> Writer<F> {
     pub(crate) fn extend(file: F, tail: Tail) -> io::Result<Writer<F>> {
         file.set_len(tail.entries_end)?;
         Ok(Writer {
-            file,
+            file: Some(file),
             buffer: Vec::with_capacity(FLUSH_AT),
+            flush_at: FLUSH_AT,
             written: tail.entries_end,
             checksum: tail.checksum,
             count: tail.count,
@@ -110,26 +157,30 @@ impl<F: LogFile> Writer<F> {
         if fields.kind == Kind::Set {
             self.count += 1;
         }
-        if self.buffer.len() >= FLUSH_AT {
+        if self.buffer.len() >= self.flush_at && self.file.is_some() {
             self.flush()?;
         }
         Ok(())
     }
 
     /// Writes the trailer for the first `log_len` bytes of a segment, and
-    /// returns the file.
+    /// returns the file. It must have one.
     pub(crate) fn finish(mut self, log_len: u64) -> io::Result<F> {
         self.buffer.extend_from_slice(&self.count.to_le_bytes());
         self.buffer.extend_from_slice(&log_len.to_le_bytes());
         self.checksum.update(&self.buffer);
         let checksum = self.checksum.finalize();
         self.buffer.extend_from_slice(&checksum.to_le_bytes());
-        self.file.write_all_at(&self.buffer, self.written)?;
-        Ok(self.file)
+        let file = self
+            .file
+            .expect("a hint is given a file before it is finished");
+        file.write_all_at(&self.buffer, self.written)?;
+        Ok(file)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.file.write_all_at(&self.buffer, self.written)?;
+        let file = self.file.as_ref().expect("only a hint with a file flushes");
+        file.write_all_at(&self.buffer, self.written)?;
         self.checksum.update(&self.buffer);
         self.written += self.buffer.len() as u64;
         self.buffer.clear();

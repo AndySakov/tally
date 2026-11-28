@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 10,039,303 possible disk states.
+cut before every disk operation of a workload, across 37,907,954 possible disk states.
 
 ## Status
 
@@ -16,8 +16,8 @@ v1 is done. tally is an embedded library for one process, shared by its threads:
   every record;
 - compaction on a thread of the store's own, alongside writes, that cleans only the segments with the most dead bytes,
   and stalls writes if it falls behind;
-- hint files, written by compaction and by `open` itself, so `open` reads each sealed segment's keys without its
-  values.
+- hint files, written by compaction, by writes as each segment fills, and by `open` for any segment left without
+  one, so `open` reads each sealed segment's keys without its values.
 
 ## Use
 
@@ -94,10 +94,10 @@ shares one fsync across its records, as writes from several threads share one ac
 
 At 10M keys of 100 B, written in batches of 10,000 and then overwritten 20M times at random, with compaction at
 50% on the write path: the slowest batch took 0.88 s, since each automatic compaction cleans a few 256 MiB
-segments (9.01 s when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s once one `open`
-has written hints for the segments compaction didn't (1.8 s without them). At a tenth of that, with 25 MiB
-segments, on a machine shared with other work, compaction on the store's thread took the slowest batch from 390 to
-616 ms down to 120 to 165 ms, and the p99 from 382 to 486 ms down to 111 to 158 ms.
+segments (9.01 s when it rewrote the whole log), and `open` of the 2.6 GB that leaves takes 0.9 s with a hint for
+every sealed segment (1.8 s without them). At a tenth of that, with 25 MiB segments, on a machine shared with other
+work, compaction on the store's thread took the slowest batch from 390 to 616 ms down to 120 to 165 ms, and the p99
+from 382 to 486 ms down to 111 to 158 ms.
 
 ## How it's tested
 

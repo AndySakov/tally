@@ -189,8 +189,10 @@ impl<F: Fs> Inner<F> {
             let _ = remove_if_present(&self.fs, &hint_path);
             let mut writing = self.writer();
             *writing.reserved = None;
-            if chosen.contains(&self.active().base) {
+            let active = self.active();
+            if chosen.contains(&active.base) {
                 // Nothing was written after it, and it goes.
+                self.drop_active_hint(&writing, active.base);
                 self.roll(&writing, base)?;
             }
             drop(writing);
@@ -234,6 +236,18 @@ impl<F: Fs> Inner<F> {
             self.writable()?;
             if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
                 return Err(self.poison(err));
+            }
+            // A write since `choose` started a segment past the copies, and
+            // its roll sealed the last. Without one, the copy takes the
+            // writes from the last, which seals here, unless it goes: an
+            // empty one the copy replaces, or one it cleans.
+            if at + 1 == next.len() {
+                let active = self.active();
+                if active.base == base || chosen.contains(&active.base) {
+                    self.drop_active_hint(&writing, active.base);
+                } else {
+                    self.seal(&writing, &active);
+                }
             }
             self.replace_segments(&writing, next);
             self.segments()

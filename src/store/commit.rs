@@ -6,12 +6,18 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{Inner, Writing, hold, holding};
+use super::{
+    Inner, Writing, active_hint_file, hint_not_written, hold, holding, push_entry,
+    remove_if_present,
+};
 use crate::fs::{Fs, LogFile};
+use crate::hint;
 use crate::index::{Entry, Index};
 use crate::manifest;
-use crate::record::{BATCH_PAYLOAD_LEN, Op, Place, encode_batch, encode_op, record_len};
-use crate::segment::{Segment, create, log_name};
+use crate::record::{
+    BATCH_PAYLOAD_LEN, Fields, Kind, Op, Place, encode_batch, encode_op, record_len,
+};
+use crate::segment::{Segment, active_hint_name, create, hint_name, log_name};
 use crate::{Batch, Error, Key, Value};
 
 /// A write a caller asked for: one operation, or a batch.
@@ -140,6 +146,7 @@ impl<F: Fs> Inner<F> {
     /// before anything is written to it.
     pub(super) fn roll(&self, writing: &Writing, base: u64) -> Result<(), Error> {
         let segments = self.segments();
+        let sealed = segments.last().expect("there is always a segment");
         let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
         let mut next = segments.to_vec();
         next.push(Arc::new(segment));
@@ -154,8 +161,85 @@ impl<F: Fs> Inner<F> {
         {
             return Err(self.poison(err));
         }
+        // Last: a hint is best effort, and must not take the space the
+        // manifest needs.
+        self.seal(writing, sealed);
         self.replace_segments(writing, next);
+        *hold(&self.active_hint) = Some(hint::Writer::unfiled(self.spill_at));
         Ok(())
+    }
+
+    /// What happens to `sealed`, the active segment until now, when it takes
+    /// no more writes, because a write starts the next segment or a
+    /// compaction's copy goes after it: its hint gets its trailer and its
+    /// own name. Every record the hint lists was fsynced
+    /// before its entry was added. Not fsynced: a hint that doesn't land
+    /// whole fails its checks, and `open` reads the segment instead. A
+    /// failure is logged and leaves no hint.
+    pub(super) fn seal(&self, _: &Writing, sealed: &Segment<F::File>) {
+        let Some(mut writer) = hold(&self.active_hint).take() else {
+            return;
+        };
+        let active = self.dir.join(active_hint_name(sealed.base));
+        let finish = || {
+            if !writer.has_file() {
+                writer.give_file(active_hint_file(&self.fs, &self.dir, sealed.base)?);
+            }
+            writer.finish(sealed.len())?;
+            self.fs
+                .rename(&active, &self.dir.join(hint_name(sealed.base)))
+        };
+        if let Err(err) = finish() {
+            hint_not_written(sealed.base, &err);
+            let _ = remove_if_present(&self.fs, &active);
+        }
+    }
+
+    /// Throws away the active segment's hint, for a compaction that removes
+    /// the segment.
+    pub(super) fn drop_active_hint(&self, _: &Writing, base: u64) {
+        if let Some(writer) = hold(&self.active_hint).take()
+            && writer.has_file()
+        {
+            let _ = remove_if_present(&self.fs, &self.dir.join(active_hint_name(base)));
+        }
+    }
+
+    /// Adds an entry to the active segment's hint for each record of a
+    /// group now durable in `active`: a Batch record first if `framed`,
+    /// and then the records of `ops`, inside it if so.
+    fn hint_group(&self, _: &Writing, active: &Segment<F::File>, ops: &[&Op], framed: bool) {
+        let mut hint = hold(&self.active_hint);
+        let Some(writer) = hint.as_mut() else {
+            return;
+        };
+        let mut push =
+            |fields, key: &[u8]| push_entry(&self.fs, &self.dir, active.base, writer, fields, key);
+        let (place, mut pushed) = if framed {
+            let batch = Fields {
+                kind: Kind::Batch,
+                place: Place::Top,
+                key_len: 0,
+                value_len: BATCH_PAYLOAD_LEN,
+            };
+            (Place::Inner, push(batch, &[]))
+        } else {
+            (Place::Top, Ok(()))
+        };
+        for op in ops {
+            pushed = pushed.and_then(|()| {
+                let fields = Fields {
+                    place,
+                    ..op.fields()
+                };
+                push(fields, op.key().as_bytes())
+            });
+        }
+        if let Err(err) = pushed {
+            hint_not_written(active.base, &err);
+            *hint = None;
+            let _ = remove_if_present(&self.fs, &self.dir.join(active_hint_name(active.base)));
+        }
     }
 
     /// Appends the records of `ops` in one write and fsyncs it, and
@@ -217,6 +301,7 @@ impl<F: Fs> Inner<F> {
         self.commits.fetch_add(1, Ordering::Relaxed);
         active.set_len_written(active.len() + buffer.len() as u64);
         active.add_dead(frame_len);
+        self.hint_group(writing, &active, ops, framed);
         Ok(offsets)
     }
 

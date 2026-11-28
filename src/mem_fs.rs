@@ -25,7 +25,8 @@
 //! the one after the next `n`. `fail_removes_after(n)` makes every remove
 //! after the next `n` fail, changing nothing. `tamper` changes what a
 //! write to one path lands, as a bad disk would. `dir_syncs` counts the
-//! directory syncs that succeeded.
+//! directory syncs that succeeded, and `bytes_read` the bytes read from a
+//! file.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run
@@ -336,6 +337,8 @@ struct State {
     /// Reads of these bytes of this inode fail, and whether a read that
     /// also covers other bytes fails whole.
     unreadable: Option<(usize, std::ops::Range<u64>, bool)>,
+    /// Bytes read from each inode.
+    read: BTreeMap<usize, u64>,
 }
 
 /// Changes the bytes a write at an offset lands.
@@ -371,6 +374,7 @@ impl MemFs {
             removes_left: None,
             tamper: None,
             unreadable: None,
+            read: BTreeMap::new(),
         })))
     }
 
@@ -500,6 +504,17 @@ impl MemFs {
     /// The directory syncs that have succeeded.
     pub(crate) fn dir_syncs(&self) -> u64 {
         self.0.borrow().dir_syncs
+    }
+
+    /// The bytes read so far from the file at `path`.
+    pub(crate) fn bytes_read(&self, path: &Path) -> u64 {
+        let state = self.0.borrow();
+        let ino = state.disk.files[path];
+        state.read.get(&ino).copied().unwrap_or(0)
+    }
+
+    fn count_read(&self, ino: usize, bytes: usize) {
+        *self.0.borrow_mut().read.entry(ino).or_default() += bytes as u64;
     }
 
     pub(crate) fn steps(&self) -> u64 {
@@ -683,8 +698,10 @@ impl LogFile for MemFile {
                 .get(start..start + buf.len())
                 .ok_or(ErrorKind::UnexpectedEof)?;
             buf.copy_from_slice(src);
-            Ok(())
-        })
+            Ok::<_, io::Error>(())
+        })?;
+        self.fs.count_read(self.ino, buf.len());
+        Ok(())
     }
 
     fn reader_at(&self, offset: u64) -> impl Read + '_ {
@@ -801,6 +818,7 @@ impl Read for MemReader<'_> {
             buf[..n].copy_from_slice(&src[..n]);
             n
         });
+        self.file.fs.count_read(self.file.ino, n);
         self.offset += n as u64;
         Ok(n)
     }
@@ -877,6 +895,18 @@ mod tests {
             "injected directory fsync failure"
         );
         assert!(fs.disk().durable_files.is_empty());
+    }
+
+    #[test]
+    fn reads_are_counted_per_file() {
+        let fs = MemFs::new();
+        fs.put(Path::new("/a"), b"hello");
+        fs.put(Path::new("/b"), b"x");
+        let a = fs.open_existing(Path::new("/a")).unwrap();
+        a.read_exact_at(&mut [0; 2], 1).unwrap();
+        a.reader_at(3).read_to_end(&mut Vec::new()).unwrap();
+        assert_eq!(fs.bytes_read(Path::new("/a")), 4);
+        assert_eq!(fs.bytes_read(Path::new("/b")), 0);
     }
 
     #[test]

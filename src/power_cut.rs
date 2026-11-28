@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::fs::{Fs, LogFile};
+use crate::hint;
 use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
@@ -82,6 +83,23 @@ fn during_compaction() -> Vec<(Phase, Vec<model::Change>)> {
         ),
         (Phase::Copied, vec![(1, None), (0, Some(b"0".to_vec()))]),
         (Phase::Repointed, vec![(3, Some(b"three".to_vec()))]),
+    ]
+}
+
+/// Short, since every write of a spilled hint multiplies the disks a cut
+/// can leave: two segments sealed by writes, a reopen that starts the
+/// newest one's hint, and a write that seals it.
+fn spill_workload() -> Vec<Op> {
+    use Op::*;
+    vec![
+        Set(1, b"one".to_vec()),
+        Set(2, b"two".to_vec()),
+        Set(3, b"three".to_vec()),
+        Set(4, b"four".to_vec()),
+        Delete(2),
+        Set(5, b"five".to_vec()),
+        Reopen,
+        Set(6, b"six".to_vec()),
     ]
 }
 
@@ -244,20 +262,38 @@ fn recover(
     (fs, expected)
 }
 
-/// Each thread takes the next step to cut at until the workload runs out:
-/// every step reruns the workload on a disk of its own.
 #[test]
 fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
+    let checked = cut_at_every_step(&workload(), &during_compaction(), hint::spill_at());
+    assert!(checked > 50, "only {checked} disks checked");
+    println!("power cut: {checked} disks checked");
+}
+
+/// With an active segment's hint in a file of its own from its first entry
+/// (the 5-byte prefix and a 9-byte entry), written at every second entry
+/// after, and the rest written when the segment seals.
+#[test]
+fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step_of_a_spilled_hint() {
+    let checked = cut_at_every_step(&spill_workload(), &[], 14);
+    assert!(checked > 50, "only {checked} disks checked");
+    println!("power cut, spilled hints: {checked} disks checked");
+}
+
+/// Each thread takes the next step to cut at until the workload runs out:
+/// every step reruns `ops` and `during` on a disk of its own, with stores
+/// that hold `spill_at` bytes of an active hint in memory. Returns how many
+/// disks it checked.
+fn cut_at_every_step(ops: &[Op], during: &[(Phase, Vec<model::Change>)], spill_at: usize) -> usize {
     let next = AtomicU64::new(1);
     let checked = AtomicUsize::new(0);
     let threads = thread::available_parallelism().map_or(1, NonZero::get);
     thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
+                hint::SPILL_AT.set(spill_at);
                 loop {
                     let step = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((snapshot, candidates)) =
-                        cut_workload(&workload(), &during_compaction(), options(), step)
+                    let Some((snapshot, candidates)) = cut_workload(ops, during, options(), step)
                     else {
                         break;
                     };
@@ -271,9 +307,7 @@ fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
             });
         }
     });
-    let checked = checked.into_inner();
-    assert!(checked > 50, "only {checked} disks checked");
-    println!("power cut: {checked} disks checked");
+    checked.into_inner()
 }
 
 /// Checks the store on `fs` verifies, compacts to `state`, and verifies

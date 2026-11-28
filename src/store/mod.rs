@@ -9,11 +9,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockErr
 use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
+use crate::hint;
 use crate::index::{Entry, Index};
 use crate::manifest;
 use crate::options::{AutoCompact, Options};
-use crate::record::{HEADER_LEN, Record, decode_header, decode_payload};
-use crate::segment::{Segment, create, log_name};
+use crate::record::{Fields, HEADER_LEN, Record, decode_header, decode_payload};
+use crate::segment::{Segment, active_hint_name, create, log_name};
 use crate::{Batch, CorruptionReason, Error, Key, Value};
 
 mod background;
@@ -100,6 +101,12 @@ pub struct Inner<F: Fs> {
     /// to the list, or `verify`. Holds the offsets a running compaction has
     /// reserved for its copies.
     writing: Mutex<Option<Reserved>>,
+    /// The hint of the last segment, while it takes writes, if it has one
+    /// (DESIGN.md, Hints written by writes). Only the holder of `writing`
+    /// touches it.
+    active_hint: Mutex<Option<hint::Writer<F::File>>>,
+    /// The `hint::spill_at` of the thread that opened the store.
+    spill_at: usize,
     /// Held by a compaction from start to end, and by `verify`.
     compacting: Mutex<()>,
     /// The compaction thread and its signals, if automatic compaction runs
@@ -302,6 +309,36 @@ fn load_record(file: &impl LogFile, offset: u64) -> Result<Record, Error> {
     decode_payload(header, &payload).map_err(|err| err.at(offset))
 }
 
+/// Adds the entry for a record to `writer`, the hint of the segment at
+/// `base`, and gives it a file under the active hint's name once it holds
+/// enough to write.
+fn push_entry<F: Fs>(
+    fs: &F,
+    dir: &Path,
+    base: u64,
+    writer: &mut hint::Writer<F::File>,
+    fields: Fields,
+    key: &[u8],
+) -> io::Result<()> {
+    writer.push(fields, key)?;
+    if writer.wants_file() {
+        writer.give_file(active_hint_file(fs, dir, base)?);
+    }
+    Ok(())
+}
+
+fn active_hint_file<F: Fs>(fs: &F, dir: &Path, base: u64) -> io::Result<F::File> {
+    let file = fs.open_or_create(&dir.join(active_hint_name(base)))?;
+    file.set_len(0)?;
+    Ok(file)
+}
+
+fn hint_not_written(base: u64, err: &io::Error) {
+    log::warn!(
+        "could not write the hint for the segment at {base} ({err}); the next open reads it"
+    );
+}
+
 /// Removes `path`. Returns whether it was there.
 fn remove_if_present(fs: &impl Fs, path: &Path) -> io::Result<bool> {
     match fs.remove(path) {
@@ -461,7 +498,8 @@ impl<F: Fs> Inner<F> {
         segments.last().expect("one was just made").file.sync()?;
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
-        let index = load(&fs, dir, &mut segments)?;
+        let spill_at = hint::spill_at();
+        let (index, active_hint) = load(&fs, dir, &mut segments, spill_at)?;
         if !listed {
             let bases: Vec<u64> = segments.iter().map(|s| s.base).collect();
             manifest::write(&fs, dir, &bases)?;
@@ -476,6 +514,8 @@ impl<F: Fs> Inner<F> {
             auto_failed: AtomicBool::new(false),
             index,
             writing: Mutex::new(None),
+            active_hint: Mutex::new(active_hint),
+            spill_at,
             compacting: Mutex::new(()),
             background: (background && options.auto_compact.is_some()).then(Background::default),
             queue: Mutex::default(),
