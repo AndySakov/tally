@@ -15,6 +15,7 @@ use crate::filter::Filter;
 use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::Entry;
+use crate::manifest;
 use crate::options::AutoCompact;
 use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
@@ -33,6 +34,8 @@ struct Copied<L: LogFile> {
     /// The bytes of the Delete records written after the copies, which are
     /// dead.
     carried: u64,
+    /// The bases of the kept segments those Delete records may hide Sets in.
+    carried_against: BTreeSet<u64>,
     /// Whether it left behind a Delete record of a key that isn't live, which
     /// may hide a Set in an older segment being cleaned.
     dropped_delete: bool,
@@ -100,14 +103,15 @@ impl<F: Fs> Store<F> {
     /// overwritten values and Delete records stop taking space.
     ///
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, points the index at the copies, then
+    /// into a new segment with a hint, lists it in the manifest in place of
+    /// the old segments, points the index at the copies, then
     /// removes the old segments oldest first, fsyncing the directory after
     /// each if it dropped a Delete record, else once after the last. Until
     /// then the old segments are untouched, so any failure while copying
     /// returns the error and leaves the store as it was. Checks every record
     /// it reads, so a corrupt record stops compaction with its offset rather
     /// than being copied. Reads go on while it runs; writes wait for it. A
-    /// failed directory fsync poisons the store.
+    /// failed directory fsync or manifest write poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         let writing = self.writer();
         self.writable()?;
@@ -147,6 +151,7 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         } = match copied {
             Ok(copied) => copied,
@@ -156,18 +161,29 @@ impl<F: Fs> Store<F> {
                 return Err(err);
             }
         };
-        if let Err(err) = self.fs.sync_dir(&self.dir) {
-            return Err(self.poison(err));
-        }
         output.set_len_written(written);
         output.add_dead(carried);
-        output.set_carried(carried);
+        output.set_carried(carried, carried_against);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
             next.pop();
         }
         next.push(Arc::clone(&output));
+        // The copy's name is durable before the manifest lists it, and the
+        // manifest no longer lists the cleaned segments before any goes.
+        let listed: Vec<u64> = next
+            .iter()
+            .map(|s| s.base)
+            .filter(|base| !chosen.contains(base))
+            .collect();
+        if let Err(err) = self
+            .fs
+            .sync_dir(&self.dir)
+            .and_then(|()| manifest::write(&self.fs, &self.dir, &listed))
+        {
+            return Err(self.poison(err));
+        }
         self.replace_segments(writing, next);
         // Written only now: nothing orders writes to two files, and a hint
         // must never reach the disk before the copies it lists.
@@ -177,7 +193,15 @@ impl<F: Fs> Store<F> {
             .map_err(Error::from)
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
+            // The cleaned segments stay in use, so they are listed again.
+            let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
+            if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
+                self.poison(unlisted);
+            }
             let _ = remove_if_present(&self.fs, &hint_path);
+            if let Err(unread) = self.repoint_by_records(&output, &moved) {
+                self.poison(unread);
+            }
             self.count_dead(writing);
             return Err(err);
         }
@@ -192,9 +216,8 @@ impl<F: Fs> Store<F> {
         for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
-            } else if segment.base > chosen[0] && segment.base != output.base {
-                // What its Deletes hide may be among what goes.
-                segment.set_carried(0);
+            } else {
+                segment.uncarry(chosen);
             }
         }
         // A Delete left behind must not outlive the Set it hides, so then
@@ -240,6 +263,7 @@ impl<F: Fs> Store<F> {
         let mut hint = hint::Writer::new(hint_file);
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = BTreeSet::new();
+        let mut carried_against = BTreeSet::new();
         let mut dropped_delete = false;
         let mut buffer = Vec::new();
         let mut written = 0u64;
@@ -270,10 +294,12 @@ impl<F: Fs> Store<F> {
                     }
                     IndexOp::Delete { key } => {
                         if !self.index.contains(key) {
-                            if self.kept_set_of(segments, chosen, input.base, key)? {
-                                carry.insert(Key::try_from(*key).expect("a key"));
-                            } else {
-                                dropped_delete = true;
+                            match self.kept_set_of(segments, chosen, input.base, key)? {
+                                Some(against) => {
+                                    carry.insert(Key::try_from(*key).expect("a key"));
+                                    carried_against.insert(against);
+                                }
+                                None => dropped_delete = true,
                             }
                         }
                     }
@@ -303,30 +329,31 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         })
     }
 
-    /// Whether a segment older than `before` that is not being cleaned may
-    /// hold a Set record of `key`, which a Delete record of it at `before`
-    /// would hide. Each such segment is sealed: the newest segment is never
-    /// older than one being cleaned.
+    /// The base of the oldest segment older than `before` that is not being
+    /// cleaned and may hold a Set record of `key`, which a Delete record of
+    /// it at `before` would hide. Each such segment is sealed: the newest
+    /// segment is never older than one being cleaned.
     fn kept_set_of(
         &self,
         segments: &[Arc<Segment<F::File>>],
         chosen: &[u64],
         before: u64,
         key: &[u8],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<u64>, Error> {
         for segment in segments
             .iter()
             .filter(|s| s.base < before && !chosen.contains(&s.base))
         {
             if self.sets_of(segment)?.may_hold(key) {
-                return Ok(true);
+                return Ok(Some(segment.base));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// The filter of the keys sealed `segment` holds a Set record for,
@@ -412,6 +439,26 @@ impl<F: Fs> Store<F> {
         })
         .map_err(unreadable)?;
         Ok(())
+    }
+
+    /// Points the index at the copies in `output`, read from its records as
+    /// a reopen without its hint would.
+    fn repoint_by_records(&self, output: &Segment<F::File>, moved: &[u64]) -> Result<(), Error> {
+        let mut old = moved.iter();
+        scan_into(
+            output,
+            output.base,
+            output.end(),
+            COMPACT_BUFFER,
+            &mut |key, entry| {
+                if let Some(entry) = entry
+                    && let Some(&from) = old.next()
+                {
+                    self.index.replace(key, from, entry);
+                }
+            },
+            &mut |_| Ok(()),
+        )
     }
 
     /// Compacts if automatic compaction is on and due, cleaning the

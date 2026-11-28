@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use super::{Store, Writing, hold, segment_of};
 use crate::fs::{Fs, LogFile};
 use crate::index::{Entry, Index};
+use crate::manifest;
 use crate::record::{BATCH_PAYLOAD_LEN, Op, Place, encode_batch, encode_op, record_len};
 use crate::segment::{Segment, create, log_name};
 use crate::{Batch, Error, Key, Value};
@@ -135,18 +136,25 @@ fn takes_effect<'w>(index: &Index, op: &'w Op, live: &mut HashMap<&'w [u8], bool
 
 impl<F: Fs> Store<F> {
     /// Starts a new, empty segment at the end of the log, and makes its
-    /// name durable before anything is written to it.
+    /// name durable, then the manifest listing it, before anything is
+    /// written to it.
     fn roll(&self, writing: &Writing) -> Result<(), Error> {
         let segments = self.segments();
         let base = segments.last().expect("there is always a segment").end();
         let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
-        if let Err(err) = self.fs.sync_dir(&self.dir) {
-            // A retry would fsync a new descriptor, which Linux need not
-            // tell about this failure.
-            return Err(self.poison(err));
-        }
         let mut next = segments.to_vec();
         next.push(Arc::new(segment));
+        let bases: Vec<u64> = next.iter().map(|s| s.base).collect();
+        // A retry would fsync a new descriptor, which Linux need not tell
+        // about a failure, and the manifest must not list the segment
+        // before its name is durable.
+        if let Err(err) = self
+            .fs
+            .sync_dir(&self.dir)
+            .and_then(|()| manifest::write(&self.fs, &self.dir, &bases))
+        {
+            return Err(self.poison(err));
+        }
         self.replace_segments(writing, next);
         Ok(())
     }

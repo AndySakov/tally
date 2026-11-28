@@ -7,6 +7,7 @@ pub mod fs;
 mod hint;
 mod index;
 mod kv;
+mod manifest;
 #[cfg(any(test, fuzzing))]
 mod mem_fs;
 #[cfg(any(test, fuzzing))]

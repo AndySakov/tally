@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::fs::{Fs, OsFs};
 use crate::index::{Entry, Index};
+use crate::manifest;
 use crate::options::{AutoCompact, Options};
 use crate::record::{
     BATCH_PAYLOAD_LEN, HEADER_LEN, Op, Place, Record, encode_batch, encode_op, record_len,
@@ -839,6 +840,7 @@ fn compact_leaves_the_log_its_hint_and_the_lock_file() {
             "tally.00000000000000000022.hint",
             "tally.00000000000000000022.log",
             "tally.lock",
+            "tally.manifest",
         ]
     );
 }
@@ -1324,6 +1326,197 @@ fn segments_that_overlap_are_refused() {
     ));
 }
 
+fn assert_segment_missing<F: Fs>(opened: Result<Store<F>, Error>, base: u64) {
+    let err = opened.err().expect("open fails");
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset,
+                reason: CorruptionReason::SegmentMissing
+            } if offset == base
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_sealed_segment_that_went_missing_fails_open_and_repair() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    fs::remove_file(tmp.path().join(log_name(21))).unwrap();
+    let names = file_names(tmp.path());
+    assert_segment_missing(Store::open_with(tmp.path(), segmented(1)), 21);
+    assert!(matches!(
+        Store::repair(tmp.path()),
+        Err(Error::Corruption {
+            offset: 21,
+            reason: CorruptionReason::SegmentMissing
+        })
+    ));
+    assert_eq!(file_names(tmp.path()), names, "nothing changed");
+
+    fs::remove_file(tmp.path().join("tally.manifest")).unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"b"), None, "b=2 went with its segment");
+    assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+}
+
+#[test]
+fn a_newest_segment_that_went_missing_fails_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    fs::remove_file(tmp.path().join(log_name(62))).unwrap();
+    assert_segment_missing(Store::open_with(tmp.path(), segmented(1)), 62);
+}
+
+#[test]
+fn a_store_without_a_manifest_opens_and_gets_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = one_record_per_segment(tmp.path());
+    store.clean(&store.writer(), &[0, 42]).unwrap();
+    assert_eq!(segment_bases(tmp.path()), [21, 62, 83]);
+    drop(store);
+    fs::remove_file(tmp.path().join("tally.manifest")).unwrap();
+
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"a"), None);
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(read(&store, b"c").as_deref(), Some(&b"3"[..]));
+    assert_eq!(
+        manifest::read(&OsFs, tmp.path()).unwrap(),
+        Some(vec![21, 62, 83])
+    );
+}
+
+#[test]
+fn segments_the_manifest_does_not_list_are_read_and_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    let listed = fs::read(tmp.path().join("tally.manifest")).unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    put(&store, b"d", b"4");
+    drop(store);
+    fs::write(tmp.path().join("tally.manifest"), listed).unwrap();
+
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"d").as_deref(), Some(&b"4"[..]));
+    assert_eq!(
+        manifest::read(&OsFs, tmp.path()).unwrap(),
+        Some(vec![0, 21, 42, 62, 83])
+    );
+}
+
+#[test]
+fn a_damaged_manifest_fails_open_and_changes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    let path = tmp.path().join("tally.manifest");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[13] ^= 0x01;
+    fs::write(&path, &bytes).unwrap();
+    assert!(matches!(
+        Store::open_with(tmp.path(), segmented(1)),
+        Err(Error::Corruption {
+            offset: 0,
+            reason: CorruptionReason::Manifest
+        })
+    ));
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn a_new_segment_is_listed_before_a_write_lands_in_it() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    assert_eq!(manifest::read(&fs, dir).unwrap(), Some(vec![0]));
+    let before = fs.dir_syncs();
+    store.set(key(b"b"), value(b"1")).unwrap();
+    assert_eq!(
+        fs.dir_syncs() - before,
+        2,
+        "one for the segment's name, one for the manifest"
+    );
+    assert_eq!(manifest::read(&fs, dir).unwrap(), Some(vec![0, 21]));
+}
+
+#[test]
+fn a_new_segment_is_durably_listed_before_its_first_record_is_written() {
+    let dir = Path::new("/db");
+    let run = |cut: Option<u64>| {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        let start = fs.steps();
+        if let Some(step) = cut {
+            fs.cut_before(start + step);
+        }
+        store.set(key(b"b"), value(b"1")).unwrap();
+        (fs.steps() - start, fs.snapshot())
+    };
+    let (steps, _) = run(None);
+    let everything = Cut {
+        keep: usize::MAX,
+        torn: Torn::Nothing,
+        entries: u16::MAX,
+        whole: None,
+    };
+    let durable = Cut {
+        keep: 0,
+        torn: Torn::Nothing,
+        entries: 0,
+        whole: None,
+    };
+    let mut written = 0;
+    for step in 1..=steps {
+        let disk = run(Some(step)).1.unwrap();
+        let now = MemFs::after(&disk, everything);
+        let has_a_record = now
+            .read(&dir.join(log_name(21)))
+            .is_some_and(|bytes| bytes.len() as u64 > FILE_HEADER_LEN);
+        if has_a_record {
+            written += 1;
+            assert_eq!(
+                manifest::read(&MemFs::after(&disk, durable), dir).unwrap(),
+                Some(vec![0, 21]),
+                "cut before step {step}"
+            );
+        }
+    }
+    assert_eq!(written, 1, "only the cut before the record's fsync sees it");
+}
+
+#[test]
+fn a_failed_manifest_write_poisons_the_store_and_a_reopen_keeps_every_write() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    // The new segment's name; then the manifest's.
+    fs.fail_dir_syncs_after(1);
+    let err = store.set(key(b"b"), value(b"1")).unwrap_err();
+    assert!(
+        matches!(&err, Error::Io(io) if io.to_string() == "injected directory fsync failure"),
+        "{err:?}"
+    );
+    fs.fail_dir_syncs(false);
+    assert!(matches!(
+        store.set(key(b"c"), value(b"1")),
+        Err(Error::Poisoned)
+    ));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+    drop(store);
+
+    let store = open_on(&fs, segmented(1));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(get_on(&store, b"b"), None);
+    assert_eq!(
+        manifest::read(&fs, Path::new("/db")).unwrap(),
+        Some(vec![0, 21])
+    );
+}
+
 #[test]
 fn a_hint_whose_segment_is_gone_is_removed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1804,6 +1997,11 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
         )
         .is_err()
     );
+    std::fs::remove_file(&damaged_path).unwrap();
+    Store::open_with(tmp.path(), segmented(100_000))
+        .unwrap()
+        .verify()
+        .unwrap();
 }
 
 /// 150,000 records, three windows: sets, overwrites, deletes and
@@ -1925,7 +2123,11 @@ fn a_damaged_hint_is_removed_and_the_whole_log_read() {
     let store = Store::open(tmp.path()).unwrap();
     assert_eq!(
         file_names(tmp.path()),
-        ["tally.00000000000000000043.log", "tally.lock"]
+        [
+            "tally.00000000000000000043.log",
+            "tally.lock",
+            "tally.manifest"
+        ]
     );
     assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
     assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"2")));
@@ -1941,7 +2143,11 @@ fn a_hint_for_more_log_than_there_is_is_removed() {
     let store = Store::open(tmp.path()).unwrap();
     assert_eq!(
         file_names(tmp.path()),
-        ["tally.00000000000000000043.log", "tally.lock"]
+        [
+            "tally.00000000000000000043.log",
+            "tally.lock",
+            "tally.manifest"
+        ]
     );
     assert_eq!(store.get(&key(b"a")).unwrap(), Some(value(b"hi")));
     assert_eq!(store.get(&key(b"b")).unwrap(), None);
@@ -2030,6 +2236,7 @@ fn open_writes_a_hint_for_each_sealed_segment_it_reads() {
             "tally.00000000000000000069.log",
             "tally.00000000000000000089.log",
             "tally.lock",
+            "tally.manifest",
         ],
         "the active segment gets none"
     );
@@ -2361,7 +2568,10 @@ fn a_compaction_that_fails_after_writing_copies_leaves_no_trace() {
             if offset == c
     ));
     let end = c + 21;
-    assert_eq!(file_names(tmp.path()), [log_name(0).as_str(), "tally.lock"]);
+    assert_eq!(
+        file_names(tmp.path()),
+        [log_name(0).as_str(), "tally.lock", "tally.manifest"]
+    );
     assert_eq!(read(&store, b"a"), Some(big.clone()));
     assert_eq!(read(&store, b"b"), Some(big));
     put(&store, b"d", b"4");
@@ -2707,8 +2917,8 @@ fn compaction_with_no_delete_left_behind_fsyncs_its_removals_once() {
     store.compact().unwrap();
     assert_eq!(
         fs.dir_syncs() - before,
-        2,
-        "one after the copy's rename, one after removing all three segments"
+        3,
+        "one after the copy's rename, one after the manifest, one after removing all three segments"
     );
     drop(store);
     let store = open_on(&fs, segmented(1));
@@ -2729,13 +2939,13 @@ fn compaction_that_drops_a_delete_fsyncs_after_each_removal() {
     store.compact().unwrap();
     assert_eq!(
         fs.dir_syncs() - before,
-        1 + 4,
-        "one after the copy's rename, then one after each of the four removals"
+        2 + 4,
+        "one after the copy's rename and one after the manifest, then one after each of the four removals"
     );
 }
 
 #[test]
-fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
+fn a_compaction_whose_hint_reads_back_damaged_points_keys_at_the_copy_by_its_records() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c", b"d"] {
@@ -2762,6 +2972,7 @@ fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
     for k in [b"a", b"b", b"c", b"d"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
     }
+    store.verify().unwrap();
     store.set(key(b"e"), value(b"1")).unwrap();
     drop(store);
 
@@ -2773,7 +2984,7 @@ fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
 }
 
 #[test]
-fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
+fn a_compaction_whose_hint_counts_other_copies_points_keys_at_the_copy_by_its_records() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
     for k in [b"a", b"b", b"c"] {
@@ -2807,8 +3018,77 @@ fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
         .collect();
     assert_eq!(
         dead,
-        [(0, 0), (21, 0), (42, 0), (63, 63)],
-        "every key on its old record"
+        [(0, 21), (21, 21), (42, 21), (63, 0)],
+        "every key on its copy"
+    );
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_compaction_whose_hint_fails_and_whose_copy_reads_back_damaged_poisons_the_store() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The last copy's value.
+    fs.tamper(&Path::new("/db").join(compact_name(63)), |offset, bytes| {
+        if offset > 0 {
+            *bytes.last_mut().unwrap() ^= 1;
+        }
+    });
+    // The copy's header, the copy and the manifest; then its hint's fails.
+    fs.fail_one_sync_after(3);
+    let err = store.compact().unwrap_err();
+    fs.fail_syncs(false);
+    assert!(matches!(err, Error::Io(_)), "{err:?}");
+    let err = store.set(key(b"d"), value(b"1")).unwrap_err();
+    assert!(matches!(err, Error::Poisoned), "{err:?}");
+}
+
+#[test]
+fn a_compaction_whose_hint_fails_lists_the_segments_it_keeps() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    fs.fail_one_sync_after(3);
+    store.compact().unwrap_err();
+    assert_eq!(manifest::read(&fs, dir).unwrap(), Some(vec![0, 21, 42, 63]));
+    store.set(key(b"d"), value(b"1")).unwrap();
+    drop(store);
+
+    fs.remove(&dir.join(log_name(21))).unwrap();
+    assert_segment_missing(Store::open_in(fs.clone(), dir, segmented(1)), 21);
+}
+
+#[test]
+fn a_compaction_that_cannot_list_the_segments_it_keeps_poisons_the_store() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The copy's header, the copy and the manifest; then the hint's and
+    // the manifest's again fail.
+    fs.fail_syncs_after(3);
+    store.compact().unwrap_err();
+    fs.fail_syncs(false);
+    assert!(matches!(
+        store.set(key(b"d"), value(b"1")),
+        Err(Error::Poisoned)
+    ));
+    drop(store);
+
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    assert_eq!(
+        manifest::read(&fs, Path::new("/db")).unwrap(),
+        Some(vec![0, 21, 42, 63])
     );
 }
 
@@ -2819,16 +3099,21 @@ fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
     for k in [b"a", b"b", b"c"] {
         store.set(key(k), value(b"1")).unwrap();
     }
-    // The copy's header and the copy; then its hint's fails.
-    fs.fail_syncs_after(2);
+    // The copy's header, the copy and the manifest; then its hint's fails.
+    fs.fail_one_sync_after(3);
     let err = store.compact().unwrap_err();
     fs.fail_syncs(false);
     assert!(matches!(err, Error::Io(_)), "{err:?}");
     assert_eq!(fs.read(&Path::new("/db").join(hint_name(63))), None);
-    assert_eq!(store.dead(), 63, "the copies, which nothing points at");
+    assert_eq!(
+        store.dead(),
+        63,
+        "the old records, now that keys point at the copies"
+    );
     for k in [b"a", b"b", b"c"] {
         assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
     }
+    store.verify().unwrap();
     store.set(key(b"d"), value(b"1")).unwrap();
     drop(store);
 
@@ -3358,4 +3643,60 @@ fn repair_keeps_a_small_record_that_ends_right_before_a_block_whose_whole_read_f
     assert_eq!(get_on(&store, b"a"), Some(vec![b'1'; 12230]));
     assert_eq!(get_on(&store, b"b"), Some(b"2".to_vec()));
     assert_eq!(get_on(&store, b"c"), None);
+}
+
+/// How many compactions, over `n` writes, copy nothing but carried Delete
+/// records, once two copies carry Deletes that hide Sets in a segment
+/// no compaction cleans.
+fn carried_rewrites(dead_percent: u8, n: usize) -> usize {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    let a = |i: u8| [b'a', b'0' + i];
+    let (mut sets, mut first, mut second) = (Batch::new(), Batch::new(), Batch::new());
+    for i in 0..10 {
+        sets.set(key(&a(i)), value(b"1"));
+        if i < 5 {
+            first.delete(key(&a(i)));
+        } else {
+            second.delete(key(&a(i)));
+        }
+    }
+    sets.set(key(b"k"), value(&[b'v'; 1000]));
+    store.write(sets).unwrap();
+    store.write(first).unwrap();
+    store.write(second).unwrap();
+    put(&store, b"c", b"3");
+    let bases = segment_bases(tmp.path());
+    store.clean(&store.writer(), &[bases[1]]).unwrap();
+    store.clean(&store.writer(), &[bases[2]]).unwrap();
+    drop(store);
+    let options = Options {
+        auto_compact: AutoCompact::new(dead_percent, 0),
+        segment_bytes: 1,
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    let mut seen: std::collections::BTreeSet<u64> = segment_bases(tmp.path()).into_iter().collect();
+    let mut rewrites = 0;
+    for i in 0..n {
+        put(&store, b"z", format!("{i}").as_bytes());
+        for s in store.segments().iter() {
+            if seen.insert(s.base) && s.len() > 0 && s.dead() == s.len() && s.reclaimable() == 0 {
+                rewrites += 1;
+            }
+        }
+    }
+    for i in 0..10 {
+        assert_eq!(read(&store, &a(i)), None);
+    }
+    assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
+    rewrites
+}
+
+#[test]
+fn copies_of_carried_deletes_do_not_clean_each_other_again_and_again() {
+    assert_eq!(
+        [carried_rewrites(30, 200), carried_rewrites(40, 200)],
+        [1, 2],
+        "after the reopen, which forgets what is carried, and never again"
+    );
 }
