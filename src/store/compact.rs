@@ -33,6 +33,8 @@ struct Copied<L: LogFile> {
     /// The bytes of the Delete records written after the copies, which are
     /// dead.
     carried: u64,
+    /// The bases of the kept segments those Delete records may hide Sets in.
+    carried_against: BTreeSet<u64>,
     /// Whether it left behind a Delete record of a key that isn't live, which
     /// may hide a Set in an older segment being cleaned.
     dropped_delete: bool,
@@ -147,6 +149,7 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         } = match copied {
             Ok(copied) => copied,
@@ -161,7 +164,7 @@ impl<F: Fs> Store<F> {
         }
         output.set_len_written(written);
         output.add_dead(carried);
-        output.set_carried(carried);
+        output.set_carried(carried, carried_against);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
@@ -195,9 +198,8 @@ impl<F: Fs> Store<F> {
         for segment in segments.iter() {
             if chosen.contains(&segment.base) {
                 segment.set_dead(segment.len());
-            } else if segment.base > chosen[0] && segment.base != output.base {
-                // What its Deletes hide may be among what goes.
-                segment.set_carried(0);
+            } else {
+                segment.uncarry(chosen);
             }
         }
         // A Delete left behind must not outlive the Set it hides, so then
@@ -243,6 +245,7 @@ impl<F: Fs> Store<F> {
         let mut hint = hint::Writer::new(hint_file);
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = BTreeSet::new();
+        let mut carried_against = BTreeSet::new();
         let mut dropped_delete = false;
         let mut buffer = Vec::new();
         let mut written = 0u64;
@@ -273,10 +276,12 @@ impl<F: Fs> Store<F> {
                     }
                     IndexOp::Delete { key } => {
                         if !self.index.contains(key) {
-                            if self.kept_set_of(segments, chosen, input.base, key)? {
-                                carry.insert(Key::try_from(*key).expect("a key"));
-                            } else {
-                                dropped_delete = true;
+                            match self.kept_set_of(segments, chosen, input.base, key)? {
+                                Some(against) => {
+                                    carry.insert(Key::try_from(*key).expect("a key"));
+                                    carried_against.insert(against);
+                                }
+                                None => dropped_delete = true,
                             }
                         }
                     }
@@ -306,30 +311,31 @@ impl<F: Fs> Store<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         })
     }
 
-    /// Whether a segment older than `before` that is not being cleaned may
-    /// hold a Set record of `key`, which a Delete record of it at `before`
-    /// would hide. Each such segment is sealed: the newest segment is never
-    /// older than one being cleaned.
+    /// The base of the oldest segment older than `before` that is not being
+    /// cleaned and may hold a Set record of `key`, which a Delete record of
+    /// it at `before` would hide. Each such segment is sealed: the newest
+    /// segment is never older than one being cleaned.
     fn kept_set_of(
         &self,
         segments: &[Arc<Segment<F::File>>],
         chosen: &[u64],
         before: u64,
         key: &[u8],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<u64>, Error> {
         for segment in segments
             .iter()
             .filter(|s| s.base < before && !chosen.contains(&s.base))
         {
             if self.sets_of(segment)?.may_hold(key) {
-                return Ok(true);
+                return Ok(Some(segment.base));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// The filter of the keys sealed `segment` holds a Set record for,

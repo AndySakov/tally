@@ -3,11 +3,12 @@
 //! in records are offsets into the whole log, and `Segment` translates them
 //! to offsets in its file, past the file's header.
 
+use std::collections::BTreeSet;
 use std::fs::TryLockError;
 use std::io::{self, Read};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::filter::Filter;
 use crate::fs::sealed::Sealed;
@@ -139,8 +140,8 @@ pub(crate) struct Segment<L> {
     dead: AtomicU64,
     /// Of those, the Delete records a compaction copied here because an
     /// older segment may hold a Set they hide: cleaning this segment again
-    /// would copy them again, until an older one is cleaned.
-    carried: AtomicU64,
+    /// would copy them again, until one of those segments is cleaned.
+    carried: Mutex<Carried>,
     /// The keys it holds a Set record for, once a compaction has asked.
     /// Only ever built for a sealed segment, which no longer changes.
     pub sets: OnceLock<Filter>,
@@ -153,7 +154,7 @@ impl<L> Segment<L> {
             file,
             len: AtomicU64::new(len),
             dead: AtomicU64::new(0),
-            carried: AtomicU64::new(0),
+            carried: Mutex::default(),
             sets: OnceLock::new(),
         }
     }
@@ -190,13 +191,33 @@ impl<L> Segment<L> {
 
     /// The dead bytes cleaning it would give back.
     pub fn reclaimable(&self) -> u64 {
-        self.dead()
-            .saturating_sub(self.carried.load(Ordering::Relaxed))
+        self.dead().saturating_sub(self.carried().bytes)
     }
 
-    pub fn set_carried(&self, bytes: u64) {
-        self.carried.store(bytes, Ordering::Relaxed);
+    /// Delete records of `bytes` were copied here for the Sets they may
+    /// hide in the segments based at `against`.
+    pub fn set_carried(&self, bytes: u64, against: BTreeSet<u64>) {
+        *self.carried() = Carried { bytes, against };
     }
+
+    /// Counts the Delete records copied here as reclaimable again once one
+    /// of the segments they may hide Sets in is among `cleaned`.
+    pub fn uncarry(&self, cleaned: &[u64]) {
+        let mut carried = self.carried();
+        if carried.against.iter().any(|base| cleaned.contains(base)) {
+            *carried = Carried::default();
+        }
+    }
+
+    fn carried(&self) -> MutexGuard<'_, Carried> {
+        self.carried.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Default)]
+struct Carried {
+    bytes: u64,
+    against: BTreeSet<u64>,
 }
 
 impl<L> Sealed for Segment<L> {}
