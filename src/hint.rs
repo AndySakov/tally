@@ -153,12 +153,12 @@ pub(crate) fn trailer(file: &impl LogFile) -> Result<Trailer, Invalid> {
     })
 }
 
-/// Checks the checksum alone, for a reader that can't throw away what it
-/// did with the entries if `read_entries` fails at the end.
-pub(crate) fn check(file: &impl LogFile) -> Result<(), Invalid> {
+/// Whether the checksum matches, read before any entry is used, by a
+/// reader that can't undo what it did with them.
+pub(crate) fn checksum_matches(file: &impl LogFile) -> io::Result<bool> {
     let size = file.size()?;
     if size < PREFIX_LEN + TRAILER_LEN {
-        return Err(Invalid::new("too short"));
+        return Ok(false);
     }
     let crc_at = size - 8;
     let mut reader = file.reader_at(0).take(crc_at);
@@ -173,10 +173,7 @@ pub(crate) fn check(file: &impl LogFile) -> Result<(), Invalid> {
     }
     let mut stored = [0u8; 8];
     file.read_exact_at(&mut stored, crc_at)?;
-    if u64::from_le_bytes(stored) != checksum.finalize() {
-        return Err(Invalid::new("checksum mismatch"));
-    }
-    Ok(())
+    Ok(u64::from_le_bytes(stored) == checksum.finalize())
 }
 
 /// Checks each entry's fields and passes them to `entry` with its key and
@@ -450,23 +447,29 @@ mod tests {
     }
 
     #[test]
-    fn check_takes_a_whole_hint_and_no_one_byte_change() {
+    fn the_checksum_matches_a_whole_hint_and_no_one_byte_change() {
         let fs = MemFs::new();
         let path = Path::new("/hint");
         let bytes = write(&[set(b"a", 2), fields(Kind::Delete, b"bc", 0)], 22 + 21);
-        fs.put(path, &bytes);
-        assert_eq!(check(&fs.open_existing(path).unwrap()), Ok(()));
+        let matches = |bytes: &[u8]| {
+            fs.put(path, bytes);
+            checksum_matches(&fs.open_existing(path).unwrap()).unwrap()
+        };
+        assert!(matches(&bytes));
         for i in 0..bytes.len() {
             let mut bad = bytes.clone();
             bad[i] ^= 0x01;
-            fs.put(path, &bad);
-            let file = fs.open_existing(path).unwrap();
-            assert_eq!(
-                check(&file),
-                Err(Invalid::new("checksum mismatch")),
-                "byte {i}"
-            );
+            assert!(!matches(&bad), "byte {i}");
         }
+        assert!(!matches(&bytes[..28]), "shorter than a prefix and trailer");
+    }
+
+    #[test]
+    fn an_unreadable_hint_says_why() {
+        assert_eq!(
+            Invalid::from(io::Error::other("injected")),
+            Invalid("unreadable: injected".into())
+        );
     }
 
     #[test]

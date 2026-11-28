@@ -1,6 +1,7 @@
 //! Compaction (DESIGN.md, Compaction).
 
 use std::collections::BTreeSet;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -52,6 +53,13 @@ fn each_record<L: LogFile>(
         &mut |_, _| {},
         &mut each,
     )
+}
+
+/// A hint whose checksum matched failing to read back: an io error.
+fn unreadable(hint::Invalid(why): hint::Invalid) -> Error {
+    Error::Io(io::Error::other(format!(
+        "rereading a compaction's hint: {why}"
+    )))
 }
 
 /// How much `compact` buffers before each write.
@@ -378,29 +386,23 @@ impl<F: Fs> Store<F> {
         hint_file: &F::File,
         moved: &[u64],
     ) -> Result<(), Error> {
-        let unreadable = |hint::Invalid(why)| {
-            log::warn!(
-                "rereading the hint of the compaction at {}: {why}",
-                output.base
-            );
-            Error::Corruption {
-                offset: output.base,
-                reason: CorruptionReason::CompactionHint,
-            }
+        let corrupt = || Error::Corruption {
+            offset: output.base,
+            reason: CorruptionReason::CompactionHint,
         };
-        hint::check(hint_file).map_err(unreadable)?;
+        if !hint::checksum_matches(hint_file)? {
+            return Err(corrupt());
+        }
         let trailer = hint::trailer(hint_file).map_err(unreadable)?;
         if trailer.count != moved.len() as u64 {
-            return Err(unreadable(hint::Invalid::new("not one entry per copy")));
+            return Err(corrupt());
         }
         let mut old = moved.iter();
-        let mut unmatched = false;
         hint::read_entries(hint_file, trailer, |fields, key, offset| {
             if fields.kind != Kind::Set {
                 return;
             }
             let Some(&from) = old.next() else {
-                unmatched = true;
                 return;
             };
             let entry = Entry::new(output.base + offset, fields);
@@ -409,9 +411,6 @@ impl<F: Fs> Store<F> {
             }
         })
         .map_err(unreadable)?;
-        if unmatched || old.next().is_some() {
-            return Err(unreadable(hint::Invalid::new("not one entry per copy")));
-        }
         Ok(())
     }
 

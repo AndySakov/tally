@@ -1082,10 +1082,25 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
     }
     assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
 
+    store.clean(&store.writer(), &[1966]).unwrap();
+    let reclaimable = |base: u64| {
+        let segments = store.segments();
+        segments
+            .iter()
+            .find(|s| s.base == base)
+            .unwrap()
+            .reclaimable()
+    };
+    assert_eq!(
+        reclaimable(1735),
+        0,
+        "cleaning a newer segment frees nothing the Deletes hide"
+    );
+
     put(&store, b"k", b"new");
     assert_eq!(
         segment_bases(tmp.path()),
-        [1504, 1735, 1945, 1966, 1987, 2010],
+        [1504, 1735, 1945, 1987, 2008, 2031],
         "a=1 at 0 went with the rest of its segment"
     );
     let reclaimable: u64 = store.segments().iter().map(|s| s.reclaimable()).sum();
@@ -1133,6 +1148,25 @@ fn cleaning_a_delete_carries_it_when_the_older_set_is_only_in_a_hint() {
     drop(store);
     let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
     assert_eq!(read(&store, b"a"), None);
+}
+
+#[test]
+fn cleaning_a_delete_carries_it_when_the_older_segments_hint_is_damaged() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    let hint = tmp.path().join(hint_name(0));
+    let mut bytes = fs::read(&hint).unwrap();
+    bytes[5] ^= 1;
+    fs::write(&hint, bytes).unwrap();
+
+    store.clean(&store.writer(), &[42]).unwrap();
+
+    assert_eq!(
+        segment_records(tmp.path(), 83),
+        encoded_at(83, &[delete_record(b"a")]),
+        "the filter of segment 0 comes from its records"
+    );
 }
 
 #[test]
@@ -2683,7 +2717,11 @@ fn compaction_that_drops_a_delete_fsyncs_after_each_removal() {
     store.set(key(b"c"), value(b"1")).unwrap();
     let before = fs.dir_syncs();
     store.compact().unwrap();
-    assert_eq!(fs.dir_syncs() - before, 1 + 4);
+    assert_eq!(
+        fs.dir_syncs() - before,
+        1 + 4,
+        "one after the copy's rename, then one after each of the four removals"
+    );
 }
 
 #[test]
@@ -2725,6 +2763,46 @@ fn a_compaction_whose_hint_reads_back_damaged_moves_no_key() {
 }
 
 #[test]
+fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // One more Set entry than it holds, under a checksum that matches.
+    fs.tamper(&Path::new("/db").join(hint_name(63)), |offset, bytes| {
+        if offset == 0 {
+            let at = bytes.len() - 24;
+            bytes[at] += 1;
+            let crc_at = bytes.len() - 8;
+            let crc = crc_fast::checksum(crc_fast::CrcAlgorithm::Crc64Nvme, &bytes[..crc_at]);
+            bytes[crc_at..].copy_from_slice(&crc.to_le_bytes());
+        }
+    });
+    let err = store.compact().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 63,
+                reason: CorruptionReason::CompactionHint
+            }
+        ),
+        "{err:?}"
+    );
+    let dead: Vec<(u64, u64)> = store
+        .segments()
+        .iter()
+        .map(|s| (s.base, s.dead()))
+        .collect();
+    assert_eq!(
+        dead,
+        [(0, 0), (21, 0), (42, 0), (63, 63)],
+        "every key on its old record"
+    );
+}
+
+#[test]
 fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
@@ -2758,8 +2836,9 @@ fn a_compaction_whose_second_removal_fails_loses_nothing_to_a_power_cut() {
     for k in [b"a", b"b", b"c"] {
         store.set(key(k), value(b"1")).unwrap();
     }
-    // The first segment's absent hint and the segment itself.
-    fs.fail_removes_after(2);
+    // The first segment's absent hint, the segment, the second's absent
+    // hint; then the second segment's own removal fails.
+    fs.fail_removes_after(3);
     let err = store.compact().unwrap_err();
     assert!(matches!(err, Error::Io(_)), "{err:?}");
     assert_eq!(

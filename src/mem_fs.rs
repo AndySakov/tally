@@ -15,12 +15,13 @@
 //! lands what does and fails with `StorageFull`, as a full disk does, and
 //! truncating a file frees what it cut. `fail_truncates` makes every
 //! truncate fail, changing nothing, and `fail_dir_syncs_after(n)` every
-//! directory sync after the next `n`. `fail_syncs` makes every file sync fail the way Linux does: the
-//! pending changes never reach the disk, even after a later sync, while
-//! reads still see them; `fail_syncs_after(n)` does so after the next `n`.
-//! `fail_removes_after(n)` makes every remove after the next `n` fail,
-//! changing nothing. `tamper`
-//! changes what a write to one path lands, as a bad disk would.
+//! directory sync after the next `n`. `fail_syncs` makes every file sync
+//! fail the way Linux does: the pending changes never reach the disk, even
+//! after a later sync, while reads still see them; `fail_syncs_after(n)`
+//! does so after the next `n`. `fail_removes_after(n)` makes every remove
+//! after the next `n` fail, changing nothing. `tamper` changes what a
+//! write to one path lands, as a bad disk would. `dir_syncs` counts the
+//! directory syncs that succeeded.
 //!
 //! Every mutation and sync counts as a step. `cut_before(n)` snapshots the
 //! disk just before step `n` runs, as if power failed there, and the run

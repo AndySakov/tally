@@ -40,9 +40,10 @@ pub enum CorruptionReason {
     /// A segment file's header has the wrong checksum or names another
     /// base. Reported at the segment's base.
     SegmentHeader,
-    /// The hint a compaction just wrote reads back damaged, or listing other
-    /// copies than it made. Reported at the copy's base; the store keeps
-    /// the old segments and the copy, and the index points at the old ones.
+    /// The hint a compaction just wrote reads back with a bad checksum, or
+    /// listing another number of copies than it made. Reported at the
+    /// copy's base. The store keeps the old segments and the copy, with the
+    /// index on the old ones, so there is nothing to repair.
     CompactionHint,
 }
 
