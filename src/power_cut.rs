@@ -18,7 +18,7 @@ use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
 use crate::store::{LOG_FILE_NAME, Phase};
-use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
+use crate::{AutoCompact, Key, Options, Repaired, SideFile, Store, Value};
 
 const DIR: &str = "/db";
 
@@ -314,7 +314,10 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
                     Some(Repaired {
                         offset: 22,
                         dropped: moved.len() as u64,
-                        side_file: side_path.clone(),
+                        side_file: Some(SideFile {
+                            path: side_path.clone(),
+                            unreadable: vec![],
+                        }),
                     }),
                     "{context}"
                 );
@@ -442,11 +445,10 @@ fn what_open_reads_survives_a_power_cut() {
     }
 }
 
-/// A hint for more log than there is gets removed. If that removal were
-/// not durable, writes that grow the log past the hint's length would make
-/// it look valid again after a power cut.
+/// What `repair` does to a segment cut short of its hint is durable when
+/// it returns: after a power cut, `open` reads the segment as it is.
 #[test]
-fn a_removed_hint_stays_removed_after_a_power_cut() {
+fn a_hint_repair_removes_stays_removed_after_a_power_cut() {
     let dir = Path::new(DIR);
     let rolls_at_40 = Options {
         auto_compact: None,
@@ -454,15 +456,9 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
     };
     let fs = MemFs::new();
     let store = Store::open_in(fs.clone(), dir, rolls_at_40).unwrap();
-    store
-        .set(key(1), Value::try_from(&b"hi"[..]).unwrap())
-        .unwrap();
-    store
-        .set(key(2), Value::try_from(&b"2"[..]).unwrap())
-        .unwrap();
-    store
-        .set(key(4), Value::try_from(&b"4"[..]).unwrap())
-        .unwrap();
+    for (k, v) in [(1, &b"hi"[..]), (2, b"2"), (4, b"4")] {
+        store.set(key(k), Value::try_from(v).unwrap()).unwrap();
+    }
     drop(store);
     drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());
     let hint = fs.read(&dir.join(hint_name(0))).unwrap();
@@ -475,19 +471,21 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
         &log[..FILE_HEADER_LEN as usize + 23],
     );
     fs.put(&dir.join(hint_name(0)), &hint);
-    let store = Store::open_in(fs.clone(), dir, Options::default()).unwrap();
-    store
-        .set(key(3), Value::try_from(&b"3"[..]).unwrap())
-        .unwrap();
-    drop(store);
-    assert_eq!(fs.read(&dir.join(log_name(0))).unwrap().len(), log.len());
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 23,
+            dropped: 22,
+            side_file: None
+        })
+    );
 
     let disk = fs.disk();
     for cut in disk.cuts() {
         let store = Store::open_in(MemFs::after(&disk, cut), dir, Options::default()).unwrap();
         assert_eq!(
             read_state(&store),
-            State::from([(1, b"hi".to_vec()), (3, b"3".to_vec())]),
+            State::from([(1, b"hi".to_vec())]),
             "{cut:?}"
         );
     }

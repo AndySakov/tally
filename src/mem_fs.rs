@@ -17,10 +17,12 @@
 //! truncate fail, changing nothing, and `fail_dir_syncs_after(n)` every
 //! directory sync after the next `n`. `skip_dir_syncs` makes every
 //! directory sync return `Ok` and make nothing durable, as Linux may on a
-//! new descriptor after an earlier sync of the directory failed. `fail_syncs` makes every file sync
-//! fail the way Linux does: the pending changes never reach the disk, even
-//! after a later sync, while reads still see them; `fail_syncs_after(n)`
-//! does so after the next `n`. `fail_removes_after(n)` makes every remove
+//! new descriptor after an earlier sync of the directory failed.
+//! `fail_syncs` makes every file sync fail the way Linux does: the pending
+//! changes never reach the disk, even after a later sync, while reads
+//! still see them; `fail_syncs_after(n)` does so after the next `n`, and
+//! `fail_one_sync_after(n)` fails only
+//! the one after the next `n`. `fail_removes_after(n)` makes every remove
 //! after the next `n` fail, changing nothing. `tamper` changes what a
 //! write to one path lands, as a bad disk would. `dir_syncs` counts the
 //! directory syncs that succeeded.
@@ -321,6 +323,8 @@ struct State {
     free: Option<u64>,
     /// File syncs that succeed before every later one fails.
     syncs_left: Option<usize>,
+    /// Only the first sync `syncs_left` fails does.
+    fail_one_sync: bool,
     /// Directory syncs that succeed before every later one fails.
     dir_syncs_left: Option<usize>,
     skip_dir_syncs: bool,
@@ -329,6 +333,9 @@ struct State {
     /// Removes that go ahead before every later one fails.
     removes_left: Option<usize>,
     tamper: Option<(PathBuf, Tamper)>,
+    /// Reads of these bytes of the file at this path fail, and whether a
+    /// read that also covers other bytes fails whole.
+    unreadable: Option<(PathBuf, std::ops::Range<u64>, bool)>,
 }
 
 /// Changes the bytes a write at an offset lands.
@@ -356,12 +363,14 @@ impl MemFs {
             snapshot: None,
             free: None,
             syncs_left: None,
+            fail_one_sync: false,
             dir_syncs_left: None,
             skip_dir_syncs: false,
             dir_syncs: 0,
             fail_truncates: false,
             removes_left: None,
             tamper: None,
+            unreadable: None,
         })))
     }
 
@@ -397,11 +406,21 @@ impl MemFs {
     }
 
     pub(crate) fn fail_syncs(&self, fail: bool) {
-        self.0.borrow_mut().syncs_left = fail.then_some(0);
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = fail.then_some(0);
+        state.fail_one_sync = false;
     }
 
     pub(crate) fn fail_syncs_after(&self, n: usize) {
-        self.0.borrow_mut().syncs_left = Some(n);
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = Some(n);
+        state.fail_one_sync = false;
+    }
+
+    pub(crate) fn fail_one_sync_after(&self, n: usize) {
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = Some(n);
+        state.fail_one_sync = true;
     }
 
     pub(crate) fn fail_removes_after(&self, n: usize) {
@@ -412,6 +431,26 @@ impl MemFs {
     /// at `path`, given the write's offset.
     pub(crate) fn tamper(&self, path: &Path, tamper: Tamper) {
         self.0.borrow_mut().tamper = Some((path.to_path_buf(), tamper));
+    }
+
+    /// From now on, reads of `range` of the file at `path` fail, as a bad
+    /// sector does; a read that starts before it returns the bytes up to it.
+    pub(crate) fn fail_reads(&self, path: &Path, range: std::ops::Range<u64>) {
+        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range, false));
+    }
+
+    /// As `fail_reads`, but any read that touches `range` fails whole, as
+    /// on a disk that fails a request for one bad sector in it.
+    pub(crate) fn fail_whole_reads(&self, path: &Path, range: std::ops::Range<u64>) {
+        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range, true));
+    }
+
+    /// The bad range of inode `ino`, if it has one, and whether reads that
+    /// touch it fail whole.
+    fn unreadable(&self, ino: usize) -> Option<(std::ops::Range<u64>, bool)> {
+        let state = self.0.borrow();
+        let (path, range, whole) = state.unreadable.as_ref()?;
+        (state.disk.files.get(path) == Some(&ino)).then(|| (range.clone(), *whole))
     }
 
     pub(crate) fn fail_dir_syncs(&self, fail: bool) {
@@ -624,6 +663,12 @@ impl LogFile for MemFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        if let Some((bad, _)) = self.fs.unreadable(self.ino)
+            && offset < bad.end
+            && bad.start < offset + buf.len() as u64
+        {
+            return Err(io::Error::other("injected read failure"));
+        }
         self.fs.with_inode(self.ino, |inode| {
             let start = offset as usize;
             let src = inode
@@ -689,7 +734,12 @@ impl LogFile for MemFile {
         let failed = {
             let mut state = self.fs.0.borrow_mut();
             match &mut state.syncs_left {
-                Some(0) => true,
+                Some(0) => {
+                    if state.fail_one_sync {
+                        state.syncs_left = None;
+                    }
+                    true
+                }
                 Some(left) => {
                     *left -= 1;
                     false
@@ -723,10 +773,24 @@ struct MemReader<'a> {
 
 impl Read for MemReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut most = buf.len();
+        if let Some((bad, whole)) = self.file.fs.unreadable(self.file.ino) {
+            let size = self
+                .file
+                .fs
+                .with_inode(self.file.ino, |inode| inode.data.len() as u64);
+            let end = (self.offset + most as u64).min(size);
+            if bad.contains(&self.offset) || whole && self.offset < bad.end && bad.start < end {
+                return Err(io::Error::other("injected read failure"));
+            }
+            if self.offset < bad.start {
+                most = most.min((bad.start - self.offset) as usize);
+            }
+        }
         let n = self.file.fs.with_inode(self.file.ino, |inode| {
             let start = (self.offset as usize).min(inode.data.len());
             let src = &inode.data[start..];
-            let n = src.len().min(buf.len());
+            let n = src.len().min(most);
             buf[..n].copy_from_slice(&src[..n]);
             n
         });

@@ -2,6 +2,7 @@ use std::fs::TryLockError;
 use std::io::{self, ErrorKind};
 #[cfg(any(test, fuzzing))]
 use std::ops::Deref;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock, TryLockError as TryLock};
@@ -9,6 +10,7 @@ use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::index::{Entry, Index};
+use crate::manifest;
 use crate::options::{AutoCompact, Options};
 use crate::record::{HEADER_LEN, Record, decode_header, decode_payload};
 use crate::segment::{Segment, create, log_name};
@@ -27,25 +29,39 @@ pub(crate) use background::Phase;
 use commit::Queue;
 #[cfg(any(test, fuzzing))]
 pub(crate) use commit::Write;
-use open::{load, open_segments};
+use open::{Opened, load, open_segments};
 use scan::scan;
 
 /// The one-file log of tally before segments, which this version refuses.
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 
-/// What `Store::repair` moved out of the log.
+/// What `Store::repair` took out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Repaired {
     /// Offset of the first bad record, where its segment now ends, or the
-    /// base of a segment whose file header was bad, which is now empty.
+    /// base of a segment whose file header was bad, which is now empty, or
+    /// the end of a segment cut short of what its hint lists.
     pub offset: u64,
-    /// Bytes moved out of the log: everything from `offset` to the end of
-    /// its segment, or the whole file of a segment whose header was bad.
+    /// Bytes taken out of the log: everything from `offset` to the end of
+    /// its segment, or the whole file of a segment whose header was bad, or
+    /// what the hint lists past where a segment cut short now ends.
     pub dropped: u64,
-    /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
-    /// store directory.
-    pub side_file: PathBuf,
+    /// Where those bytes were saved, or `None` when they were already gone:
+    /// a segment cut short of its hint.
+    pub side_file: Option<SideFile>,
+}
+
+/// The file `Store::repair` saved the bytes it moved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SideFile {
+    /// `tally.log.corrupt-<offset>` in the store directory.
+    pub path: PathBuf,
+    /// Where in the file the bytes that failed to read are, in the 4 KiB
+    /// blocks of the segment's file. The file holds zeros there.
+    pub unreadable: Vec<Range<u64>>,
 }
 
 /// An open store: the log's segments plus an in-memory index of every live
@@ -186,6 +202,10 @@ impl Store {
     /// `tally.lock`: a second `open` of the same directory fails with
     /// `Locked` until this `Store` is dropped.
     ///
+    /// A segment `tally.manifest` lists that is not in `dir` fails `open`
+    /// with `SegmentMissing` corruption at its base, changing nothing
+    /// (DESIGN.md, Manifest).
+    ///
     /// A torn tail of the newest segment is saved to a side file unless it
     /// is all zeros, then truncated, fsynced and logged as a warning before
     /// `open` returns. Any other bad record `open` reads fails it with its
@@ -216,9 +236,13 @@ impl Store {
     /// the side file and the directory, then truncates the segment at the
     /// record and fsyncs it. A segment whose file header is damaged, or cut
     /// short in a sealed segment, goes to the side file whole and is
-    /// replaced by an empty one. Unsupported records are an error, not
-    /// something to repair: a newer tally can read them. Fails with
-    /// `Locked` while a `Store` is open.
+    /// replaced by an empty one. A segment shorter than its hint says has
+    /// lost records no side file can save: the hint is removed, and the
+    /// next `open` reads the segment as it is. Unsupported records are an
+    /// error, not something to repair: a newer tally can read them. So are
+    /// a missing segment and a damaged manifest: put the file back, or
+    /// remove `tally.manifest` to open without it. Fails with `Locked`
+    /// while a `Store` is open.
     ///
     /// If the side file already exists and is the start of what would be
     /// moved, a crashed earlier run left it, and it is rewritten. Otherwise
@@ -367,7 +391,8 @@ impl<F: Fs> Store<F> {
     /// overwritten values and Delete records stop taking space.
     ///
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, points the index at the copies, then
+    /// into a new segment with a hint, lists it in the manifest in place of
+    /// the old segments, points the index at the copies, then
     /// removes the old segments oldest first, fsyncing the directory after
     /// each if it dropped a Delete record, else once after the last. Until
     /// then the old segments are untouched, so any failure while copying
@@ -375,7 +400,7 @@ impl<F: Fs> Store<F> {
     /// it reads, so a corrupt record stops compaction with its offset rather
     /// than being copied. Reads and writes go on while it runs; it waits
     /// for an automatic compaction running on the store's thread. A failed
-    /// directory fsync poisons the store.
+    /// directory fsync or manifest write poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         self.inner.compact()
     }
@@ -426,7 +451,10 @@ impl<F: Fs> Inner<F> {
         };
         let lock_file = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&lock_file)?;
-        let mut segments = open_segments(&fs, dir)?;
+        let Opened {
+            mut segments,
+            listed,
+        } = open_segments(&fs, dir)?;
         if segments.is_empty() {
             segments.push(create(&fs, &dir.join(log_name(0)), 0)?);
         }
@@ -434,6 +462,10 @@ impl<F: Fs> Inner<F> {
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let index = load(&fs, dir, &mut segments)?;
+        if !listed {
+            let bases: Vec<u64> = segments.iter().map(|s| s.base).collect();
+            manifest::write(&fs, dir, &bases)?;
+        }
         let store = Inner {
             fs,
             dir: dir.to_path_buf(),

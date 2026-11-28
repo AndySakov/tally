@@ -7,6 +7,7 @@ pub mod fs;
 mod hint;
 mod index;
 mod kv;
+mod manifest;
 #[cfg(any(test, fuzzing))]
 mod mem_fs;
 #[cfg(any(test, fuzzing))]
@@ -22,7 +23,7 @@ pub use batch::Batch;
 pub use error::{CorruptionReason, Error, Field, UnsupportedReason};
 pub use kv::{Key, MAX_KEY_LEN, MAX_VALUE_LEN, Value};
 pub use options::{AutoCompact, Options};
-pub use store::{Repaired, Store};
+pub use store::{Repaired, SideFile, Store};
 
 /// The codec and the model, for the fuzz targets in `fuzz/`. Only built under cargo-fuzz.
 #[cfg(fuzzing)]

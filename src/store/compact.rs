@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 #[cfg(test)]
 use super::Phase;
 use super::{
-    Compacting, Inner, Reserved, remove_if_present,
+    Compacting, Inner, Reserved, Segments, remove_if_present,
     scan::{Scanned, scan_into},
     segment_of,
 };
@@ -17,6 +17,7 @@ use crate::filter::Filter;
 use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::Entry;
+use crate::manifest;
 use crate::options::AutoCompact;
 use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
@@ -35,6 +36,8 @@ struct Copied<L: LogFile> {
     /// The bytes of the Delete records written after the copies, which are
     /// dead.
     carried: u64,
+    /// The bases of the kept segments those Delete records may hide Sets in.
+    carried_against: BTreeSet<u64>,
     /// Whether it left behind a Delete record of a key that isn't live, which
     /// may hide a Set in an older segment being cleaned.
     dropped_delete: bool,
@@ -169,6 +172,7 @@ impl<F: Fs> Inner<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         } = match copied {
             Ok(copied) => copied,
@@ -196,11 +200,18 @@ impl<F: Fs> Inner<F> {
             release();
             return Err(self.poison(err));
         }
+        // A write that poisoned the store failed a directory fsync, and
+        // Linux need not tell this one, so the copy's name may not be
+        // durable: the manifest must not list it.
+        if let Err(err) = self.writable() {
+            release();
+            return Err(err);
+        }
         output.set_len_written(written);
         output.add_dead(carried);
-        output.set_carried(carried);
+        output.set_carried(carried, carried_against);
         let output = Arc::new(output);
-        {
+        let listed = {
             let mut writing = self.writer();
             // Without a write since `choose`, the copy is the last segment
             // and takes the next ones, in place of the last if that was
@@ -213,9 +224,22 @@ impl<F: Fs> Inner<F> {
                 .collect();
             let at = next.partition_point(|s| s.base < base);
             next.insert(at, Arc::clone(&output));
-            self.replace_segments(&writing, next);
+            // The copy's name is durable before the manifest lists it, and
+            // the manifest no longer lists the cleaned segments before any
+            // goes. Under the writer lock, so it lists every segment a write
+            // started.
+            let bases: Vec<u64> = next
+                .iter()
+                .map(|s| s.base)
+                .filter(|base| !chosen.contains(base))
+                .collect();
             *writing.reserved = None;
-        }
+            if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
+                return Err(self.poison(err));
+            }
+            self.replace_segments(&writing, next);
+            self.segments()
+        };
         #[cfg(test)]
         self.between(Phase::Copied);
         // Written only now: nothing orders writes to two files, and a hint
@@ -226,6 +250,14 @@ impl<F: Fs> Inner<F> {
             .map_err(Error::from)
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
+            {
+                // The cleaned segments stay in use, so they are listed again.
+                let _writing = self.writer();
+                let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
+                if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
+                    self.poison(unlisted);
+                }
+            }
             let _ = remove_if_present(&self.fs, &hint_path);
             if let Err(unread) = self.repoint_by_records(&output, written, &moved) {
                 self.poison(unread);
@@ -235,15 +267,16 @@ impl<F: Fs> Inner<F> {
         }
         #[cfg(test)]
         self.between(Phase::Repointed);
-        self.remove_cleaned(&chosen, Some(base), dropped_delete)
+        self.remove_cleaned(&chosen, Some(listed), dropped_delete)
     }
 
-    /// Removes the `chosen` segments, whose live records are all in the
-    /// copy at `copy` if there is one.
+    /// Removes the `chosen` segments, whose live records are all in a copy
+    /// if they had any. `listed` is the list as the manifest last had it
+    /// without them, if it has since the compaction began.
     fn remove_cleaned(
         &self,
         chosen: &[u64],
-        copy: Option<u64>,
+        listed: Option<Segments<F::File>>,
         dropped_delete: bool,
     ) -> Result<bool, Error> {
         let segments = self.segments();
@@ -258,6 +291,7 @@ impl<F: Fs> Inner<F> {
             // Out of the list in one step, so a write past `stop_percent`
             // does not wait for their removals.
             let writing = self.writer();
+            self.writable()?;
             let kept: Vec<_> = self
                 .segments()
                 .iter()
@@ -265,9 +299,13 @@ impl<F: Fs> Inner<F> {
                 .cloned()
                 .collect();
             for segment in &kept {
-                if segment.base > chosen[0] && Some(segment.base) != copy {
-                    // What its Deletes hide may be among what goes.
-                    segment.set_carried(0);
+                segment.uncarry(chosen);
+            }
+            // A segment started since would have listed them again.
+            if listed.is_none_or(|listed| !Arc::ptr_eq(&listed, &self.segments())) {
+                let bases: Vec<u64> = kept.iter().map(|s| s.base).collect();
+                if let Err(err) = manifest::write(&self.fs, &self.dir, &bases) {
+                    return Err(self.poison(err));
                 }
             }
             self.replace_segments(&writing, kept);
@@ -327,6 +365,7 @@ impl<F: Fs> Inner<F> {
         let mut hint = hint::Writer::new(hint_file);
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = BTreeSet::new();
+        let mut carried_against = BTreeSet::new();
         let mut dropped_delete = false;
         let mut buffer = Vec::new();
         let mut written = 0u64;
@@ -357,10 +396,12 @@ impl<F: Fs> Inner<F> {
                     }
                     IndexOp::Delete { key } => {
                         if !self.index.contains(key) {
-                            if self.kept_set_of(segments, chosen, input.base, key)? {
-                                carry.insert(Key::try_from(*key).expect("a key"));
-                            } else {
-                                dropped_delete = true;
+                            match self.kept_set_of(segments, chosen, input.base, key)? {
+                                Some(against) => {
+                                    carry.insert(Key::try_from(*key).expect("a key"));
+                                    carried_against.insert(against);
+                                }
+                                None => dropped_delete = true,
                             }
                         }
                     }
@@ -390,30 +431,31 @@ impl<F: Fs> Inner<F> {
             written,
             moved,
             carried,
+            carried_against,
             dropped_delete,
         })
     }
 
-    /// Whether a segment older than `before` that is not being cleaned may
-    /// hold a Set record of `key`, which a Delete record of it at `before`
-    /// would hide. Each such segment is sealed: the newest segment is never
-    /// older than one being cleaned.
+    /// The base of the oldest segment older than `before` that is not being
+    /// cleaned and may hold a Set record of `key`, which a Delete record of
+    /// it at `before` would hide. Each such segment is sealed: the newest
+    /// segment is never older than one being cleaned.
     fn kept_set_of(
         &self,
         segments: &[Arc<Segment<F::File>>],
         chosen: &[u64],
         before: u64,
         key: &[u8],
-    ) -> Result<bool, Error> {
+    ) -> Result<Option<u64>, Error> {
         for segment in segments
             .iter()
             .filter(|s| s.base < before && !chosen.contains(&s.base))
         {
             if self.sets_of(segment)?.may_hold(key) {
-                return Ok(true);
+                return Ok(Some(segment.base));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// The filter of the keys sealed `segment` holds a Set record for,
