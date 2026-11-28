@@ -2,7 +2,7 @@
 
 A crash-safe, log-structured key-value store in Rust, written from scratch. A write returns `Ok` only after its
 record is fsynced. No acknowledged write was lost in 1,000 runs killed with `kill -9`, or in a simulated power
-cut before every disk operation of a workload, across 584,293 possible disk states.
+cut before every disk operation of a workload, across 1,210,896 possible disk states.
 
 ## Status
 
@@ -101,8 +101,8 @@ Each layer below was checked by breaking the code on purpose and watching it fai
   one. Every way the disk could be left is checked: any prefix of each file's unsynced writes, the next one torn,
   zeroed or landing its end without its start, one file's writes landing while another's don't, and any of the directory changes since the last directory sync, in any order that keeps each name's
   changes in order. `open` must then return every acknowledged write, and recovery is itself cut at every step.
-  The same is done for `repair`. A single directory fsync after
-  removing all of a compaction's cleaned segments, instead of one after each, fails it: a deleted key comes back.
+  The same is done for `repair`. When a compaction drops a Delete record, a single directory fsync after removing
+  all of its cleaned segments, instead of one after each, fails it: a deleted key comes back.
 - **Kill test** (`tests/kill.rs`): the test binary runs itself as a child, applies a seeded sequence of sets,
   deletes, batches, reopens and compactions with 16 KiB segments, and is killed after 0 to 40 ms, three times per
   run on the same directory. Every other run, four threads share the store, each with keys of its own. Every acknowledged operation must survive. CI runs 1,000 runs on Linux. Making `set` update the
@@ -142,8 +142,9 @@ report success for data that never reached the disk.
 The log is a run of segment files, each named for the log offset of its first record and starting with a header
 that names its format and base, so offsets in the index and in errors address the whole log. Compaction copies the
 live records of the segments it cleans into a new segment, under a temporary name until the copies are durable,
-with a hint file of its keys, then deletes the cleaned segments oldest first, fsyncing the directory
-after each. A Delete record is copied forward only while an older, kept segment may still hold a value it hides,
+with a hint file of its keys, then deletes the cleaned segments oldest first. If it dropped a Delete record, it
+fsyncs the directory after each removal, so the Delete never outlives the value it hides, and otherwise once after
+all of them. A Delete record is copied forward only while an older, kept segment may still hold a value it hides,
 which a filter of each segment's keys answers. The new segment is durable before the first old one goes, so a crash
 at any point leaves the same live data. The lock lives on a separate `tally.lock`, which no compaction removes.
 

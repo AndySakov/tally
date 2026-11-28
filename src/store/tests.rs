@@ -1030,11 +1030,38 @@ fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
         segment_records(tmp.path(), 83),
         encoded_at(83, &[delete_record(b"a")])
     );
+    assert_eq!(
+        store.commits.load(Ordering::Relaxed),
+        4,
+        "the Delete is in the copy, not an append of its own"
+    );
+    assert_eq!(store.dead(), 21 + 20, "a=1 at 0 and the Delete");
     drop(store);
 
     let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
     assert_eq!(read(&store, b"a"), None, "a=1 at 0 stays hidden");
     assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_copy_of_live_sets_and_a_carried_delete_reopens_from_its_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = one_record_per_segment(tmp.path());
+    store.clean(&store.writer(), &[21, 42]).unwrap();
+    assert_eq!(segment_bases(tmp.path()), [0, 62, 83]);
+    assert_eq!(
+        segment_records(tmp.path(), 83),
+        encoded_at(83, &[set_record(b"b", b"2"), delete_record(b"a")])
+    );
+    assert_eq!(store.dead(), 21 + 20);
+    drop(store);
+
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert!(tmp.path().join(hint_name(83)).exists());
+    assert_eq!(read(&store, b"a"), None);
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"2"[..]));
+    assert_eq!(store.dead(), 21 + 20);
     store.verify().unwrap();
 }
 
@@ -1605,34 +1632,36 @@ fn open_after_compact_reads_keys_from_the_hint_not_the_log() {
 #[test]
 fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(
-        tmp.path(),
-        Options {
-            auto_compact: None,
-            ..Options::default()
-        },
-    )
-    .unwrap();
-    let mut batch = Batch::new();
+    let store = Store::open_with(tmp.path(), segmented(100_000)).unwrap();
+    let k = |i: u32| key(format!("k{i}").as_bytes());
+    let mut sets = Batch::new();
     for i in 0..3000u32 {
-        batch.set(
-            key(format!("k{i}").as_bytes()),
-            value(&vec![b'v'; 1 + i as usize % 7]),
-        );
+        sets.set(k(i), value(&vec![b'v'; 1 + i as usize % 7]));
     }
-    store.write(batch).unwrap();
-    store.compact().unwrap();
+    store.write(sets).unwrap();
+    let mut changes = Batch::new();
+    for i in 0..3000u32 {
+        match i % 3 {
+            0 => {
+                changes.delete(k(i));
+            }
+            1 => {
+                changes.set(k(i), value(b"w"));
+            }
+            _ => {}
+        }
+    }
+    store.write(changes).unwrap();
+    put(&store, b"next", b"segment");
     drop(store);
+    drop(Store::open_with(tmp.path(), segmented(100_000)).unwrap());
 
     let fs = OsFs;
-    let [base] = segment_bases(tmp.path())[..] else {
-        panic!("compaction leaves one segment");
-    };
-    let file = fs.open_existing(&tmp.path().join(hint_name(base))).unwrap();
+    let file = fs.open_existing(&tmp.path().join(hint_name(0))).unwrap();
     let segment = Segment::new(
-        base,
-        fs.open_existing(&tmp.path().join(log_name(base))).unwrap(),
-        log_bytes(tmp.path()).len() as u64,
+        0,
+        fs.open_existing(&tmp.path().join(log_name(0))).unwrap(),
+        segment_records(tmp.path(), 0).len() as u64,
     );
     let mut one = Index::new();
     let (len_one, _) = read_hint(&file, &segment, &mut one, WINDOW, u64::MAX).unwrap();
@@ -1640,13 +1669,19 @@ fn a_hint_read_on_many_threads_gives_the_index_one_thread_does() {
     let (len_many, _) = read_hint(&file, &segment, &mut many, 100, 0).unwrap();
 
     assert_eq!((len_one, len_many), (segment.end(), segment.end()));
-    assert_eq!(many.len(), 3000);
+    assert_eq!(many.len(), 2000);
     for i in 0..3000u32 {
         let k = format!("k{i}");
         assert_eq!(many.get(k.as_bytes()), one.get(k.as_bytes()), "{k}");
     }
-    let store = Store::open(tmp.path()).unwrap();
-    store.verify().unwrap();
+
+    let mut damaged = std::fs::read(tmp.path().join(hint_name(0))).unwrap();
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 1;
+    let damaged_path = tmp.path().join("damaged");
+    std::fs::write(&damaged_path, damaged).unwrap();
+    let damaged = fs.open_existing(&damaged_path).unwrap();
+    assert!(read_hint(&damaged, &segment, &mut Index::new(), 100, 0).is_err());
 }
 
 /// 150,000 records, three windows: sets, overwrites, deletes and
@@ -2537,6 +2572,24 @@ fn an_open_whose_compaction_poisons_the_store_fails() {
     );
     let store = open_on(&fs, options);
     assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"2"[..]));
+}
+
+#[test]
+fn compaction_with_no_delete_left_behind_fsyncs_its_removals_once() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // One after the copy's rename, one after removing all three segments.
+    fs.fail_dir_syncs_after(2);
+    store.compact().unwrap();
+    fs.fail_dir_syncs(false);
+    drop(store);
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
 }
 
 #[test]

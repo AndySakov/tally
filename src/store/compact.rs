@@ -16,7 +16,7 @@ use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::Entry;
 use crate::options::AutoCompact;
-use crate::record::{Fields, IndexOp, Kind, Op, Place, move_header};
+use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
 use crate::{Error, Key};
 
@@ -28,12 +28,14 @@ struct Copied<L: LogFile> {
     hint: hint::Writer<L>,
     /// The bytes copied.
     written: u64,
-    /// Where each record copied was, in the order copied.
+    /// Where each Set record copied was, in the order copied.
     moved: Vec<u64>,
-    /// The keys of the Delete records that must outlive their segment:
-    /// the key isn't live, and a kept segment older than it may hold a Set
-    /// of it.
-    carry: BTreeSet<Key>,
+    /// The bytes of the Delete records written after the copies, which are
+    /// dead.
+    carried: u64,
+    /// Whether it left behind a Delete record of a key that isn't live, which
+    /// may hide a Set in an older segment being cleaned.
+    dropped_delete: bool,
 }
 
 /// Calls `each` with every record of `segment` from `start` to its end, a
@@ -93,11 +95,12 @@ impl<F: Fs> Store<F> {
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
     /// into a new segment with a hint, points the index at the copies, then
     /// removes the old segments oldest first, fsyncing the directory after
-    /// each. Until then the old segments are untouched, so any failure while
-    /// copying returns the error and leaves the store as it was. Checks
-    /// every record it reads, so a corrupt record stops compaction with its
-    /// offset rather than being copied. Reads go on while it runs; writes
-    /// wait for it. A failed directory fsync poisons the store.
+    /// each if it dropped a Delete record, else once after the last. Until
+    /// then the old segments are untouched, so any failure while copying
+    /// returns the error and leaves the store as it was. Checks every record
+    /// it reads, so a corrupt record stops compaction with its offset rather
+    /// than being copied. Reads go on while it runs; writes wait for it. A
+    /// failed directory fsync poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         let writing = self.writer();
         self.writable()?;
@@ -136,7 +139,8 @@ impl<F: Fs> Store<F> {
             hint,
             written,
             moved,
-            carry,
+            carried,
+            dropped_delete,
         } = match copied {
             Ok(copied) => copied,
             Err(err) => {
@@ -149,6 +153,7 @@ impl<F: Fs> Store<F> {
             return Err(self.poison(err));
         }
         output.set_len_written(written);
+        output.add_dead(carried);
         let output = Arc::new(output);
         let mut next = segments.to_vec();
         if next.last().is_some_and(|s| s.base == base) {
@@ -181,13 +186,10 @@ impl<F: Fs> Store<F> {
                 segment.set_dead(segment.len());
             }
         }
-        if !carry.is_empty() {
-            let deletes: Vec<Op> = carry.into_iter().map(|key| Op::Delete { key }).collect();
-            let dead = deletes.iter().map(|op| op.fields().record_len()).sum();
-            self.append(writing, &deletes.iter().collect::<Vec<_>>())?;
-            self.active().add_dead(dead);
-        }
-        for &base in chosen {
+        // A Delete left behind must not outlive the Set it hides, so then
+        // each removal is made durable before the next, oldest first. Without
+        // one, the removals may land in any order.
+        for (i, &base) in chosen.iter().enumerate() {
             remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
             self.fs.remove(&self.dir.join(log_name(base)))?;
             let kept = self
@@ -197,7 +199,9 @@ impl<F: Fs> Store<F> {
                 .cloned()
                 .collect();
             self.replace_segments(writing, kept);
-            if let Err(err) = self.fs.sync_dir(&self.dir) {
+            if (dropped_delete || i + 1 == chosen.len())
+                && let Err(err) = self.fs.sync_dir(&self.dir)
+            {
                 return Err(self.poison(err));
             }
         }
@@ -206,9 +210,11 @@ impl<F: Fs> Store<F> {
 
     /// Writes each live record of the `chosen` segments to a new segment at
     /// `copy_path`, based where the log ends, and its key and lengths to a
-    /// hint at `hint_path`, and fsyncs the copy. One buffered pass per
-    /// segment: reading the dead records in between costs less than a
-    /// positioned read per live one.
+    /// hint at `hint_path`, then a Delete record of each key that must stay
+    /// deleted: it isn't live, and a kept segment older than one of its
+    /// Delete records may hold a Set of it. Then fsyncs the copy. One
+    /// buffered pass per segment: reading the dead records in between costs
+    /// less than a positioned read per live one.
     fn copy_live(
         &self,
         segments: &[Arc<Segment<F::File>>],
@@ -223,6 +229,7 @@ impl<F: Fs> Store<F> {
         let mut hint = hint::Writer::new(hint_file);
         let mut moved = Vec::with_capacity(self.index.len());
         let mut carry = BTreeSet::new();
+        let mut dropped_delete = false;
         let mut buffer = Vec::new();
         let mut written = 0u64;
         for input in segments.iter().filter(|s| chosen.contains(&s.base)) {
@@ -231,7 +238,7 @@ impl<F: Fs> Store<F> {
                     IndexOp::Set { key } => {
                         if self
                             .index
-                            .get(key.as_bytes())
+                            .get(key)
                             .is_some_and(|entry| entry.offset == read.offset)
                         {
                             moved.push(read.offset);
@@ -239,7 +246,7 @@ impl<F: Fs> Store<F> {
                                 place: Place::Top,
                                 ..read.header.fields()
                             };
-                            hint.push(fields, key.as_bytes())?;
+                            hint.push(fields, key)?;
                             move_header(read.header_bytes, base + written + buffer.len() as u64);
                             buffer.extend_from_slice(read.header_bytes);
                             buffer.extend_from_slice(read.payload);
@@ -251,16 +258,30 @@ impl<F: Fs> Store<F> {
                         }
                     }
                     IndexOp::Delete { key } => {
-                        if !self.index.contains(key.as_bytes())
-                            && self.kept_set_of(segments, chosen, input.base, key)?
-                        {
-                            carry.insert(Key::try_from(key.as_bytes()).expect("a key"));
+                        if !self.index.contains(key) {
+                            if self.kept_set_of(segments, chosen, input.base, key)? {
+                                carry.insert(Key::try_from(*key).expect("a key"));
+                            } else {
+                                dropped_delete = true;
+                            }
                         }
                     }
                     IndexOp::Batch { .. } => {}
                 }
                 Ok(())
             })?;
+        }
+        let mut carried = 0;
+        for key in carry {
+            let op = Op::Delete { key };
+            hint.push(op.fields(), op.key().as_bytes())?;
+            encode_op(
+                &op,
+                Place::Top,
+                base + written + buffer.len() as u64,
+                &mut buffer,
+            );
+            carried += op.fields().record_len();
         }
         output.write_all_at(&buffer, base + written)?;
         written += buffer.len() as u64;
@@ -270,7 +291,8 @@ impl<F: Fs> Store<F> {
             hint,
             written,
             moved,
-            carry,
+            carried,
+            dropped_delete,
         })
     }
 
@@ -283,13 +305,13 @@ impl<F: Fs> Store<F> {
         segments: &[Arc<Segment<F::File>>],
         chosen: &[u64],
         before: u64,
-        key: &Key,
+        key: &[u8],
     ) -> Result<bool, Error> {
         for segment in segments
             .iter()
             .filter(|s| s.base < before && !chosen.contains(&s.base))
         {
-            if self.sets_of(segment)?.may_hold(key.as_bytes()) {
+            if self.sets_of(segment)?.may_hold(key) {
                 return Ok(true);
             }
         }
@@ -327,7 +349,7 @@ impl<F: Fs> Store<F> {
         }
         each_record(segment, from, |read| {
             if let IndexOp::Set { key } = read.op {
-                keys.add(key.as_bytes());
+                keys.add(key);
             }
             Ok(())
         })?;
@@ -337,6 +359,7 @@ impl<F: Fs> Store<F> {
     /// Points each key `copy_live` copied at its copy in `output`, as the
     /// output's durable hint lists them, if the key still points at the old
     /// record `moved` holds the offset of. A copy left unpointed is dead.
+    /// The Delete records after the copies change nothing.
     fn repoint(
         &self,
         output: &Segment<F::File>,
@@ -352,6 +375,9 @@ impl<F: Fs> Store<F> {
         let mut old = moved.iter();
         let mut unmatched = false;
         hint::read_entries(hint_file, trailer, |fields, key, offset| {
+            if fields.kind != Kind::Set {
+                return;
+            }
             let Some(&from) = old.next() else {
                 unmatched = true;
                 return;
