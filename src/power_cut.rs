@@ -6,7 +6,6 @@
 //! Unlike the kill test this sees fsync: a write that was never synced is
 //! gone after the cut, so a missing `sync` fails here.
 
-use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -14,14 +13,13 @@ use std::thread;
 
 use crate::fs::{Fs, LogFile};
 use crate::mem_fs::{Cut, Disk, MemFs};
-use crate::record::{self, Place, Record, encode};
+use crate::model::{self, Op, State};
+use crate::record::{Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
-use crate::store::{LOG_FILE_NAME, Write};
-use crate::{AutoCompact, Batch, Key, Options, Repaired, Store, Value};
+use crate::store::LOG_FILE_NAME;
+use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
-
-type State = BTreeMap<u8, Vec<u8>>;
 
 /// Compacts whenever half the log is dead, however small, so the workload
 /// compacts inside writes and recovery as well as when asked.
@@ -30,23 +28,6 @@ fn options() -> Options {
         auto_compact: AutoCompact::new(50, 0),
         segment_bytes: 64,
     }
-}
-
-#[derive(Debug, Clone)]
-enum Op {
-    Set(u8, Vec<u8>),
-    Delete(u8),
-    Reopen,
-    Compact,
-    /// Sets (`Some`) and deletes (`None`), as one batch.
-    Batch(Vec<(u8, Option<Vec<u8>>)>),
-    /// Sets, deletes and batches written as one group, as writes from
-    /// several threads at once are (DESIGN.md, Group commit).
-    Group(Vec<Op>),
-}
-
-fn key(k: u8) -> Key {
-    Key::try_from(&[b'k', k][..]).unwrap()
 }
 
 fn workload() -> Vec<Op> {
@@ -73,58 +54,18 @@ fn workload() -> Vec<Op> {
         Compact,
         Set(4, vec![b'y'; 40]),
         Group(vec![
-            Set(5, b"g5".to_vec()),
-            Delete(4),
-            Delete(0),
-            Batch(vec![(6, Some(b"g6".to_vec())), (5, None)]),
-            Set(4, b"g4".to_vec()),
+            vec![(5, Some(b"g5".to_vec()))],
+            vec![(4, None)],
+            vec![(0, None)],
+            vec![(6, Some(b"g6".to_vec())), (5, None)],
+            vec![(4, Some(b"g4".to_vec()))],
         ]),
         Batch(vec![(6, None), (4, Some(b"four".to_vec())), (2, None)]),
     ]
 }
 
-fn apply(state: &mut State, op: &Op) {
-    match op {
-        Op::Set(k, v) => {
-            state.insert(*k, v.clone());
-        }
-        Op::Delete(k) => {
-            state.remove(k);
-        }
-        Op::Batch(ops) => {
-            for (k, v) in ops {
-                match v {
-                    Some(v) => state.insert(*k, v.clone()),
-                    None => state.remove(k),
-                };
-            }
-        }
-        Op::Group(ops) => {
-            for op in ops {
-                apply(state, op);
-            }
-        }
-        Op::Reopen | Op::Compact => {}
-    }
-}
-
-fn record(k: u8, v: &Option<Vec<u8>>) -> record::Op {
-    match v {
-        Some(v) => record::Op::Set {
-            key: key(k),
-            value: Value::try_from(&v[..]).unwrap(),
-        },
-        None => record::Op::Delete { key: key(k) },
-    }
-}
-
-fn group_write(op: &Op) -> Write {
-    match op {
-        Op::Set(k, v) => Write::One(record(*k, &Some(v.clone()))),
-        Op::Delete(k) => Write::One(record(*k, &None)),
-        Op::Batch(ops) => Write::Batch(ops.iter().map(|(k, v)| record(*k, v)).collect()),
-        _ => unreachable!("a group holds only writes"),
-    }
+fn key(k: u8) -> Key {
+    model::key(0, k)
 }
 
 fn read_state(store: &Store<MemFs>) -> State {
@@ -157,34 +98,12 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
     ends.push(fs.steps());
     let mut state = State::new();
     for op in workload() {
-        match &op {
-            Op::Set(k, v) => store
-                .set(key(*k), Value::try_from(&v[..]).unwrap())
-                .unwrap(),
-            Op::Delete(k) => store.delete(key(*k)).unwrap(),
-            Op::Reopen => {
-                drop(store);
-                store = Store::open_in(fs.clone(), dir, options()).unwrap();
-            }
-            Op::Compact => store.compact().unwrap(),
-            Op::Batch(ops) => {
-                let mut batch = Batch::new();
-                for (k, v) in ops {
-                    match v {
-                        Some(v) => batch.set(key(*k), Value::try_from(&v[..]).unwrap()),
-                        None => batch.delete(key(*k)),
-                    };
-                }
-                store.write(batch).unwrap();
-            }
-            Op::Group(ops) => {
-                let writes: Vec<Write> = ops.iter().map(group_write).collect();
-                for result in store.commit(&writes) {
-                    result.unwrap();
-                }
-            }
+        if let Op::Reopen = op {
+            drop(store);
+            store = Store::open_in(fs.clone(), dir, options()).unwrap();
+        } else {
+            model::run(&store, 0, &mut state, &op);
         }
-        apply(&mut state, &op);
         states.push(state.clone());
         ends.push(fs.steps());
     }
@@ -496,7 +415,7 @@ fn a_removed_hint_stays_removed_after_a_power_cut() {
         .set(key(2), Value::try_from(&b"2"[..]).unwrap())
         .unwrap();
     store
-        .set(key(9), Value::try_from(&b"9"[..]).unwrap())
+        .set(key(4), Value::try_from(&b"4"[..]).unwrap())
         .unwrap();
     drop(store);
     drop(Store::open_in(fs.clone(), dir, rolls_at_40).unwrap());

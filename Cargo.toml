@@ -10,6 +10,9 @@ log = "0.4.35"
 siphasher = "1.0.4"
 xorf = { version = "0.13.0", default-features = false, features = ["binary-fuse"] }
 
+[target.'cfg(fuzzing)'.dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+
 [dev-dependencies]
 criterion = "0.8.2"
 proptest = "1.12.0"

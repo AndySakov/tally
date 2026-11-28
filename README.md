@@ -107,9 +107,9 @@ Each layer below was checked by breaking the code on purpose and watching it fai
   deletes, batches, reopens and compactions with 16 KiB segments, and is killed after 0 to 40 ms, three times per
   run on the same directory. Every other run, four threads share the store, each with keys of its own. Every acknowledged operation must survive. CI runs 1,000 runs on Linux. Making `set` update the
   index without writing the record fails it.
-- **Model test** (`tests/model.rs`): random sets, gets, deletes, batches and reopens against a `HashMap`, with
-  100-byte segments and, in half the cases, automatic compaction with no floor, checking every read after each step.
-  A second test runs four threads on one store, each against its own `HashMap`, with compactions between them. The same broken
+- **Model test** (`src/model.rs`): random sets, gets, deletes, batches, groups, compactions and reopens against a
+  `BTreeMap`, with 100-byte segments and, in half the cases, automatic compaction with no floor, checking every read
+  and the log's length. A second test runs four threads on one store, each against its own map, with compactions between them. The same broken
   `set` fails it, and so does dropping the Delete records compaction must keep.
 - **Fuzzing** (`fuzz/`): `decode` on arbitrary bytes at arbitrary offsets, `open` on cut, changed and zeroed logs, `hint` on damaged hint files, and
   `ops` as a coverage-guided model test on the in-memory disk.
@@ -122,7 +122,7 @@ fuzzes each target for 60 seconds on every pull request.
 ```sh
 cargo test
 TALLY_KILL_RUNS=1000 cargo test --test kill
-PROPTEST_CASES=2000 cargo test --test model
+PROPTEST_CASES=2000 cargo test model::
 cargo +nightly fuzz run open
 cargo bench
 ```

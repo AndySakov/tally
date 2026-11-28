@@ -310,7 +310,7 @@ impl<F: Fs> Store<F> {
 
     /// Writes `writes` as one group and returns each one's result, in order,
     /// then compacts if that is due.
-    #[cfg(test)]
+    #[cfg(any(test, fuzzing))]
     pub(crate) fn commit(&self, writes: &[Write]) -> Vec<Result<(), Error>> {
         let mut out = None;
         self.commit_then(writes, |results| out = Some(results));

@@ -262,6 +262,7 @@ dependencies = [
 name = "tally"
 version = "0.1.0"
 dependencies = [
+ "arbitrary",
  "crc-fast",
  "crc32c",
  "log",
