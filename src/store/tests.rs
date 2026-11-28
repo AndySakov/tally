@@ -3441,136 +3441,6 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
     );
 }
 
-#[test]
-fn a_sealed_segment_cut_short_of_its_hint_on_a_record_boundary_is_corruption() {
-    let fs = MemFs::new();
-    let dir = Path::new("/db");
-    let store = open_on(&fs, segmented(24));
-    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
-        store.set(key(k), value(v)).unwrap();
-    }
-    drop(store);
-    assert!(
-        fs.read(&dir.join(log_name(42))).is_some(),
-        "a=1, b=2 at 0; c=3 at 42"
-    );
-    drop(open_on(&fs, segmented(24)));
-    let first = dir.join(log_name(0));
-    let bytes = fs.read(&first).unwrap();
-    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
-
-    let err = Store::open_in(fs.clone(), dir, segmented(24))
-        .map(|_| ())
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            Error::Corruption {
-                offset: 21,
-                reason: CorruptionReason::CutShort
-            }
-        ),
-        "{err:?}"
-    );
-    assert!(
-        fs.read(&dir.join(hint_name(0))).is_some(),
-        "the evidence stays"
-    );
-}
-
-#[test]
-fn repair_removes_the_hint_of_a_segment_cut_short_of_it_and_keeps_every_other_record() {
-    let fs = MemFs::new();
-    let dir = Path::new("/db");
-    let store = open_on(&fs, segmented(24));
-    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
-        store.set(key(k), value(v)).unwrap();
-    }
-    drop(store);
-    drop(open_on(&fs, segmented(24)));
-    let first = dir.join(log_name(0));
-    let bytes = fs.read(&first).unwrap();
-    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
-
-    assert_eq!(
-        Store::repair_in(&fs, dir).unwrap(),
-        Some(Repaired {
-            offset: 21,
-            dropped: 21,
-            side_file: None
-        })
-    );
-    assert_eq!(fs.read(&dir.join(hint_name(0))), None);
-    assert_eq!(Store::repair_in(&fs, dir).unwrap(), None, "once is enough");
-
-    let store = open_on(&fs, segmented(24));
-    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
-    assert_eq!(get_on(&store, b"b"), None);
-    assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
-    store.verify().unwrap();
-    drop(store);
-    assert!(
-        fs.read(&dir.join(hint_name(0))).is_some(),
-        "open writes it again"
-    );
-}
-
-/// How many compactions, over `n` writes, copy nothing but carried Delete
-/// records, once two copies carry Deletes that hide Sets in a segment
-/// no compaction cleans.
-fn carried_rewrites(dead_percent: u8, n: usize) -> usize {
-    let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
-    let a = |i: u8| [b'a', b'0' + i];
-    let (mut sets, mut first, mut second) = (Batch::new(), Batch::new(), Batch::new());
-    for i in 0..10 {
-        sets.set(key(&a(i)), value(b"1"));
-        if i < 5 {
-            first.delete(key(&a(i)));
-        } else {
-            second.delete(key(&a(i)));
-        }
-    }
-    sets.set(key(b"k"), value(&[b'v'; 1000]));
-    store.write(sets).unwrap();
-    store.write(first).unwrap();
-    store.write(second).unwrap();
-    put(&store, b"c", b"3");
-    let bases = segment_bases(tmp.path());
-    store.clean(&store.writer(), &[bases[1]]).unwrap();
-    store.clean(&store.writer(), &[bases[2]]).unwrap();
-    drop(store);
-    let options = Options {
-        auto_compact: AutoCompact::new(dead_percent, 0),
-        segment_bytes: 1,
-    };
-    let store = Store::open_with(tmp.path(), options).unwrap();
-    let mut seen: std::collections::BTreeSet<u64> = segment_bases(tmp.path()).into_iter().collect();
-    let mut rewrites = 0;
-    for i in 0..n {
-        put(&store, b"z", format!("{i}").as_bytes());
-        for s in store.segments().iter() {
-            if seen.insert(s.base) && s.len() > 0 && s.dead() == s.len() && s.reclaimable() == 0 {
-                rewrites += 1;
-            }
-        }
-    }
-    for i in 0..10 {
-        assert_eq!(read(&store, &a(i)), None);
-    }
-    assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
-    rewrites
-}
-
-#[test]
-fn copies_of_carried_deletes_do_not_clean_each_other_again_and_again() {
-    assert_eq!(
-        [carried_rewrites(30, 200), carried_rewrites(40, 200)],
-        [1, 2],
-        "after the reopen, which forgets what is carried, and never again"
-    );
-}
-
 /// a=1 at 0, b at 21 with a value of 5,000 2s, so its record spans two
 /// 4 KiB blocks, and c=3 at 5041, each in a segment of its own; reads of
 /// the byte at log offset 26, in b's record, fail.
@@ -3782,4 +3652,134 @@ fn repair_keeps_a_small_record_that_ends_right_before_a_block_whose_whole_read_f
     assert_eq!(get_on(&store, b"a"), Some(vec![b'1'; 12230]));
     assert_eq!(get_on(&store, b"b"), Some(b"2".to_vec()));
     assert_eq!(get_on(&store, b"c"), None);
+}
+
+/// How many compactions, over `n` writes, copy nothing but carried Delete
+/// records, once two copies carry Deletes that hide Sets in a segment
+/// no compaction cleans.
+fn carried_rewrites(dead_percent: u8, n: usize) -> usize {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    let a = |i: u8| [b'a', b'0' + i];
+    let (mut sets, mut first, mut second) = (Batch::new(), Batch::new(), Batch::new());
+    for i in 0..10 {
+        sets.set(key(&a(i)), value(b"1"));
+        if i < 5 {
+            first.delete(key(&a(i)));
+        } else {
+            second.delete(key(&a(i)));
+        }
+    }
+    sets.set(key(b"k"), value(&[b'v'; 1000]));
+    store.write(sets).unwrap();
+    store.write(first).unwrap();
+    store.write(second).unwrap();
+    put(&store, b"c", b"3");
+    let bases = segment_bases(tmp.path());
+    store.clean(&store.writer(), &[bases[1]]).unwrap();
+    store.clean(&store.writer(), &[bases[2]]).unwrap();
+    drop(store);
+    let options = Options {
+        auto_compact: AutoCompact::new(dead_percent, 0),
+        segment_bytes: 1,
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    let mut seen: std::collections::BTreeSet<u64> = segment_bases(tmp.path()).into_iter().collect();
+    let mut rewrites = 0;
+    for i in 0..n {
+        put(&store, b"z", format!("{i}").as_bytes());
+        for s in store.segments().iter() {
+            if seen.insert(s.base) && s.len() > 0 && s.dead() == s.len() && s.reclaimable() == 0 {
+                rewrites += 1;
+            }
+        }
+    }
+    for i in 0..10 {
+        assert_eq!(read(&store, &a(i)), None);
+    }
+    assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
+    rewrites
+}
+
+#[test]
+fn copies_of_carried_deletes_do_not_clean_each_other_again_and_again() {
+    assert_eq!(
+        [carried_rewrites(30, 200), carried_rewrites(40, 200)],
+        [1, 2],
+        "after the reopen, which forgets what is carried, and never again"
+    );
+}
+
+#[test]
+fn a_sealed_segment_cut_short_of_its_hint_on_a_record_boundary_is_corruption() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    assert!(
+        fs.read(&dir.join(log_name(42))).is_some(),
+        "a=1, b=2 at 0; c=3 at 42"
+    );
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
+
+    let err = Store::open_in(fs.clone(), dir, segmented(24))
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Corruption {
+                offset: 21,
+                reason: CorruptionReason::CutShort
+            }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        fs.read(&dir.join(hint_name(0))).is_some(),
+        "the evidence stays"
+    );
+}
+
+#[test]
+fn repair_removes_the_hint_of_a_segment_cut_short_of_it_and_keeps_every_other_record() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 21]);
+
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 21,
+            dropped: 21,
+            side_file: None
+        })
+    );
+    assert_eq!(fs.read(&dir.join(hint_name(0))), None);
+    assert_eq!(Store::repair_in(&fs, dir).unwrap(), None, "once is enough");
+
+    let store = open_on(&fs, segmented(24));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(get_on(&store, b"b"), None);
+    assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    store.verify().unwrap();
+    drop(store);
+    assert!(
+        fs.read(&dir.join(hint_name(0))).is_some(),
+        "open writes it again"
+    );
 }
