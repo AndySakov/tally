@@ -3027,8 +3027,8 @@ fn a_compaction_whose_hint_fails_and_whose_copy_reads_back_damaged_poisons_the_s
             *bytes.last_mut().unwrap() ^= 1;
         }
     });
-    // The copy's header and the copy; then its hint's fails.
-    fs.fail_syncs_after(2);
+    // The copy's header, the copy and the manifest; then its hint's fails.
+    fs.fail_one_sync_after(3);
     let err = store.compact().unwrap_err();
     fs.fail_syncs(false);
     assert!(matches!(err, Error::Io(_)), "{err:?}");
