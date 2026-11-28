@@ -45,11 +45,11 @@ pub struct Repaired {
     /// the end of a segment cut short of what its hint lists.
     pub offset: u64,
     /// Bytes taken out of the log: everything from `offset` to the end of
-    /// its segment, or the whole file of a segment whose header was bad, or
-    /// what the hint lists past where a segment cut short now ends.
+    /// its segment, or the whole file of a segment whose header was bad,
+    /// plus what the hint lists past where a segment cut short now ends.
     pub dropped: u64,
-    /// Where those bytes were saved, or `None` when they were already gone:
-    /// a segment cut short of its hint.
+    /// Where those bytes were saved, or `None` when they were all already
+    /// gone: a segment cut short of its hint on a record boundary.
     pub side_file: Option<SideFile>,
 }
 
@@ -237,8 +237,8 @@ impl Store {
     /// record and fsyncs it. A segment whose file header is damaged, or cut
     /// short in a sealed segment, goes to the side file whole and is
     /// replaced by an empty one. A segment shorter than its hint says has
-    /// lost records no side file can save: the hint is removed, and the
-    /// next `open` reads the segment as it is. Unsupported records are an
+    /// lost records no side file can save: the hint is removed, and a
+    /// record the cut tore is repaired as a corrupt one. Unsupported records are an
     /// error, not something to repair: a newer tally can read them. So are
     /// a missing segment and a damaged manifest: put the file back, or
     /// remove `tally.manifest` to open without it. Fails with `Locked`
