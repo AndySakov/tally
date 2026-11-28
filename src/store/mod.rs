@@ -1,5 +1,6 @@
 use std::fs::TryLockError;
 use std::io::{self, ErrorKind};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -30,6 +31,7 @@ pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 
 /// What `Store::repair` moved out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Repaired {
     /// Offset of the first bad record, where its segment now ends, or the
     /// base of a segment whose file header was bad, which is now empty.
@@ -37,9 +39,19 @@ pub struct Repaired {
     /// Bytes moved out of the log: everything from `offset` to the end of
     /// its segment, or the whole file of a segment whose header was bad.
     pub dropped: u64,
-    /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
-    /// store directory.
-    pub side_file: PathBuf,
+    /// Where those bytes were saved.
+    pub side_file: SideFile,
+}
+
+/// The file `Store::repair` saved the bytes it moved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SideFile {
+    /// `tally.log.corrupt-<offset>` in the store directory.
+    pub path: PathBuf,
+    /// Where in the file the bytes that failed to read are, in the 4 KiB
+    /// blocks of the segment's file. The file holds zeros there.
+    pub unreadable: Vec<Range<u64>>,
 }
 
 /// An open store: the log's segments plus an in-memory index of every live
