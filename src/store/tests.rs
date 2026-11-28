@@ -3783,3 +3783,41 @@ fn repair_removes_the_hint_of_a_segment_cut_short_of_it_and_keeps_every_other_re
         "open writes it again"
     );
 }
+
+#[test]
+fn one_repair_of_a_segment_cut_short_of_its_hint_inside_a_record_lets_open_succeed() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(24));
+    for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3")] {
+        store.set(key(k), value(v)).unwrap();
+    }
+    drop(store);
+    drop(open_on(&fs, segmented(24)));
+    let first = dir.join(log_name(0));
+    let bytes = fs.read(&first).unwrap();
+    fs.put(&first, &bytes[..FILE_HEADER_LEN as usize + 30]);
+
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: 21,
+            dropped: 21,
+            side_file: Some(SideFile {
+                path: dir.join("tally.log.corrupt-21"),
+                unreadable: vec![],
+            }),
+        })
+    );
+    assert_eq!(
+        fs.read(&dir.join("tally.log.corrupt-21")).unwrap(),
+        bytes[FILE_HEADER_LEN as usize + 21..FILE_HEADER_LEN as usize + 30]
+    );
+    assert_eq!(fs.read(&dir.join(hint_name(0))), None);
+
+    let store = open_on(&fs, segmented(24));
+    assert_eq!(get_on(&store, b"a").as_deref(), Some(&b"1"[..]));
+    assert_eq!(get_on(&store, b"b"), None);
+    assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+    store.verify().unwrap();
+}
