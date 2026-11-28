@@ -3465,3 +3465,107 @@ fn a_compaction_poisoned_by_a_concurrent_roll_removes_nothing() {
         }
     }
 }
+
+#[test]
+fn a_leader_past_the_slow_threshold_sleeps_before_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = Options {
+        auto_compact: AutoCompact::new(50, 0).and_then(|a| a.with_stalls(50, 60)),
+        ..Options::default()
+    };
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    half_dead(&store);
+    at.recv_timeout(PATIENCE).expect("a compaction starts");
+    let started = Instant::now();
+    store.throttle();
+    let slept = started.elapsed();
+    go.send(()).unwrap();
+    assert!(slept >= Duration::from_millis(1), "50% dead: {slept:?}");
+    assert_eq!(store.stalls.load(Ordering::Relaxed), 0, "under the stop");
+}
+
+/// Holds the store's first compaction at `phase` until the returned sender
+/// sends, then panics there.
+fn panic_compaction_at(store: &Store, phase: Phase) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (at_tx, at_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+    store.on_phase(move |_, now| {
+        if now == phase {
+            hold(&at_tx).send(()).unwrap();
+            let _ = hold(&go_rx).recv();
+            panic!("while a write waits for compaction");
+        }
+    });
+    (at_rx, go_tx)
+}
+
+/// Brings the log to the stop threshold of `auto(50, 0)` while `at` hears a
+/// compaction is held, then writes b=6 on another thread, and returns its
+/// result once `release` has let the compaction go. That thread is left
+/// behind if the write never returns, so the test fails instead of hanging.
+fn stall_then(
+    store: &Arc<Store>,
+    at: &mpsc::Receiver<()>,
+    release: impl FnOnce(),
+) -> Result<(), Error> {
+    half_dead(store);
+    at.recv_timeout(PATIENCE).expect("a compaction starts");
+    put(store, b"a", b"5");
+    let (done_tx, done) = mpsc::channel();
+    let writer = Arc::clone(store);
+    thread::spawn(move || done_tx.send(writer.set(key(b"b"), value(b"6"))).unwrap());
+    eventually("stalled", || store.stalls.load(Ordering::Relaxed) == 1);
+    release();
+    done.recv_timeout(PATIENCE)
+        .expect("the stalled write returns")
+}
+
+#[test]
+fn a_write_waiting_for_compaction_fails_once_the_compaction_thread_panics() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_with(tmp.path(), auto(50, 0)).unwrap());
+    let (at, go) = panic_compaction_at(&store, Phase::Reserved);
+    let stalled = stall_then(&store, &at, || go.send(()).unwrap());
+    assert!(matches!(stalled, Err(Error::Poisoned)), "{stalled:?}");
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"4"[..]));
+}
+
+#[test]
+fn a_write_waiting_for_compaction_goes_on_once_automatic_compaction_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_with(tmp.path(), auto(50, 0)).unwrap());
+    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    let stalled = stall_then(&store, &at, || {
+        // The last byte of b=4, which the compaction is about to copy.
+        let first = OpenOptions::new()
+            .write(true)
+            .open(tmp.path().join(log_name(0)))
+            .unwrap();
+        first.write_all_at(b"X", FILE_HEADER_LEN + 83).unwrap();
+        go.send(()).unwrap();
+    });
+    stalled.unwrap();
+    assert!(store.auto_failed.load(Ordering::Relaxed));
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"6"[..]));
+    assert_eq!(segment_bases(tmp.path()), [0, 168]);
+}
+
+#[test]
+fn a_failed_automatic_compaction_on_its_thread_keeps_the_write_and_stays_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    store.set(key(b"a"), value(b"hi")).unwrap();
+    store.set(key(b"b"), value(b"2")).unwrap();
+    write_log_at(tmp.path(), 21, b"X");
+    store.set(key(b"b"), value(b"3")).unwrap();
+    store.set(key(b"b"), value(b"4")).unwrap();
+    assert!(!store.auto_failed.load(Ordering::Relaxed), "42 of 85 dead");
+
+    store.set(key(b"b"), value(b"5")).unwrap();
+    eventually("turned off", || store.auto_failed.load(Ordering::Relaxed));
+    store.set(key(b"b"), value(b"6")).unwrap();
+    assert_eq!(log_bytes(tmp.path()).len(), 127, "nothing compacted");
+    assert_eq!(store.get(&key(b"b")).unwrap(), Some(value(b"6")));
+}
