@@ -15,6 +15,7 @@ use crate::filter::Filter;
 use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::Entry;
+use crate::manifest;
 use crate::options::AutoCompact;
 use crate::record::{Fields, IndexOp, Kind, Op, Place, encode_op, move_header};
 use crate::segment::{Segment, compact_name, create, hint_name, log_name};
@@ -102,14 +103,15 @@ impl<F: Fs> Store<F> {
     /// overwritten values and Delete records stop taking space.
     ///
     /// Cleans every segment (DESIGN.md, Compaction): copies the live records
-    /// into a new segment with a hint, points the index at the copies, then
+    /// into a new segment with a hint, lists it in the manifest in place of
+    /// the old segments, points the index at the copies, then
     /// removes the old segments oldest first, fsyncing the directory after
     /// each if it dropped a Delete record, else once after the last. Until
     /// then the old segments are untouched, so any failure while copying
     /// returns the error and leaves the store as it was. Checks every record
     /// it reads, so a corrupt record stops compaction with its offset rather
     /// than being copied. Reads go on while it runs; writes wait for it. A
-    /// failed directory fsync poisons the store.
+    /// failed directory fsync or manifest write poisons the store.
     pub fn compact(&self) -> Result<(), Error> {
         let writing = self.writer();
         self.writable()?;
@@ -159,9 +161,6 @@ impl<F: Fs> Store<F> {
                 return Err(err);
             }
         };
-        if let Err(err) = self.fs.sync_dir(&self.dir) {
-            return Err(self.poison(err));
-        }
         output.set_len_written(written);
         output.add_dead(carried);
         output.set_carried(carried, carried_against);
@@ -171,6 +170,20 @@ impl<F: Fs> Store<F> {
             next.pop();
         }
         next.push(Arc::clone(&output));
+        // The copy's name is durable before the manifest lists it, and the
+        // manifest no longer lists the cleaned segments before any goes.
+        let listed: Vec<u64> = next
+            .iter()
+            .map(|s| s.base)
+            .filter(|base| !chosen.contains(base))
+            .collect();
+        if let Err(err) = self
+            .fs
+            .sync_dir(&self.dir)
+            .and_then(|()| manifest::write(&self.fs, &self.dir, &listed))
+        {
+            return Err(self.poison(err));
+        }
         self.replace_segments(writing, next);
         // Written only now: nothing orders writes to two files, and a hint
         // must never reach the disk before the copies it lists.
@@ -180,6 +193,11 @@ impl<F: Fs> Store<F> {
             .map_err(Error::from)
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
+            // The cleaned segments stay in use, so they are listed again.
+            let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
+            if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
+                self.poison(unlisted);
+            }
             let _ = remove_if_present(&self.fs, &hint_path);
             if let Err(unread) = self.repoint_by_records(&output, &moved) {
                 self.poison(unread);

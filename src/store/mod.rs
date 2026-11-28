@@ -8,6 +8,7 @@ use std::thread;
 
 use crate::fs::{Fs, LogFile, OsFs};
 use crate::index::{Entry, Index};
+use crate::manifest;
 use crate::options::{AutoCompact, Options};
 use crate::record::{HEADER_LEN, Record, decode_header, decode_payload};
 use crate::segment::{Segment, create, log_name};
@@ -22,7 +23,7 @@ mod scan;
 use commit::Queue;
 #[cfg(any(test, fuzzing))]
 pub(crate) use commit::Write;
-use open::{load, open_segments};
+use open::{Opened, load, open_segments};
 use scan::scan;
 
 /// The one-file log of tally before segments, which this version refuses.
@@ -137,6 +138,10 @@ impl Store {
     /// `tally.lock`: a second `open` of the same directory fails with
     /// `Locked` until this `Store` is dropped.
     ///
+    /// A segment `tally.manifest` lists that is not in `dir` fails `open`
+    /// with `SegmentMissing` corruption at its base, changing nothing
+    /// (DESIGN.md, Manifest).
+    ///
     /// A torn tail of the newest segment is saved to a side file unless it
     /// is all zeros, then truncated, fsynced and logged as a warning before
     /// `open` returns. Any other bad record `open` reads fails it with its
@@ -167,9 +172,11 @@ impl Store {
     /// short in a sealed segment, goes to the side file whole and is
     /// replaced by an empty one. A segment shorter than its hint says has
     /// lost records no side file can save: the hint is removed, and the
-    /// next `open` reads the segment as it is. Unsupported records are an error, not
-    /// something to repair: a newer tally can read them. Fails with
-    /// `Locked` while a `Store` is open.
+    /// next `open` reads the segment as it is. Unsupported records are an
+    /// error, not something to repair: a newer tally can read them. So are
+    /// a missing segment and a damaged manifest: put the file back, or
+    /// remove `tally.manifest` to open without it. Fails with `Locked`
+    /// while a `Store` is open.
     ///
     /// If the side file already exists and is the start of what would be
     /// moved, a crashed earlier run left it, and it is rewritten. Otherwise
@@ -251,7 +258,10 @@ impl<F: Fs> Store<F> {
         };
         let lock_file = fs.open_or_create(&dir.join(LOCK_FILE_NAME))?;
         lock(&lock_file)?;
-        let mut segments = open_segments(&fs, dir)?;
+        let Opened {
+            mut segments,
+            listed,
+        } = open_segments(&fs, dir)?;
         if segments.is_empty() {
             segments.push(create(&fs, &dir.join(log_name(0)), 0)?);
         }
@@ -259,6 +269,10 @@ impl<F: Fs> Store<F> {
         fs.sync_dir(dir)?;
         fs.sync_dir(parent)?;
         let index = load(&fs, dir, &mut segments)?;
+        if !listed {
+            let bases: Vec<u64> = segments.iter().map(|s| s.base).collect();
+            manifest::write(&fs, dir, &bases)?;
+        }
         let store = Store {
             fs,
             dir: dir.to_path_buf(),

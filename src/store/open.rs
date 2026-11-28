@@ -13,6 +13,7 @@ use super::{
 use crate::fs::{Fs, LogFile};
 use crate::hint;
 use crate::index::{Entry, Index};
+use crate::manifest::{self, NEW_MANIFEST_NAME};
 use crate::record::{HEADER_LEN, Kind};
 use crate::segment::{
     FILE_HEADER_LEN, FileHeader, Segment, check_file_header, hint_name, log_name,
@@ -24,11 +25,12 @@ use crate::{CorruptionReason, Error, UnsupportedReason};
 const SHORTEST_RECORD: u64 = HEADER_LEN as u64 + 1;
 
 /// Opens every segment in `dir`, in log order, after removing hints whose
-/// segment is gone and copies a compaction left unfinished. Refuses a
-/// directory another version of tally wrote, and segments that overlap.
+/// segment is gone, copies a compaction left unfinished, and a manifest
+/// never renamed in. Refuses a directory another version of tally wrote,
+/// a segment the manifest lists that is gone, and segments that overlap.
 /// A newest segment whose header a crash cut short is started again: no
 /// record was written to it before its header was fsynced.
-pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::File>>, Error> {
+pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>, Error> {
     let names = fs.list(dir)?;
     if names.iter().any(|n| n == LOG_FILE_NAME) {
         return Err(Error::Unsupported {
@@ -38,10 +40,21 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::
     }
     let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
     bases.sort_unstable();
+    let listed = manifest::read(fs, dir)?;
+    if let Some(&missing) = listed
+        .iter()
+        .flatten()
+        .find(|base| bases.binary_search(base).is_err())
+    {
+        return Err(Error::Corruption {
+            offset: missing,
+            reason: CorruptionReason::SegmentMissing,
+        });
+    }
     let mut changed = false;
     for name in &names {
         let orphan = parse_hint_name(name).is_some_and(|base| bases.binary_search(&base).is_err());
-        if orphan || parse_compact_name(name).is_some() {
+        if orphan || parse_compact_name(name).is_some() || name == NEW_MANIFEST_NAME {
             fs.remove(&dir.join(name))?;
             changed = true;
         }
@@ -76,7 +89,16 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Vec<Segment<F::
         let len = file.size()? - FILE_HEADER_LEN;
         segments.push(Segment::new(base, file, len));
     }
-    Ok(segments)
+    Ok(Opened {
+        segments,
+        listed: listed.as_deref() == Some(&bases[..]),
+    })
+}
+
+pub(super) struct Opened<L> {
+    pub(super) segments: Vec<Segment<L>>,
+    /// Whether the manifest lists exactly these segments.
+    pub(super) listed: bool,
 }
 
 /// Builds the index from every segment in order: from its hint and the

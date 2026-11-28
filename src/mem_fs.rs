@@ -18,7 +18,8 @@
 //! directory sync after the next `n`. `fail_syncs` makes every file sync
 //! fail the way Linux does: the pending changes never reach the disk, even
 //! after a later sync, while reads still see them; `fail_syncs_after(n)`
-//! does so after the next `n`. `fail_removes_after(n)` makes every remove
+//! does so after the next `n`, and `fail_one_sync_after(n)` fails only
+//! the one after the next `n`. `fail_removes_after(n)` makes every remove
 //! after the next `n` fail, changing nothing. `tamper` changes what a
 //! write to one path lands, as a bad disk would. `dir_syncs` counts the
 //! directory syncs that succeeded.
@@ -319,6 +320,8 @@ struct State {
     free: Option<u64>,
     /// File syncs that succeed before every later one fails.
     syncs_left: Option<usize>,
+    /// Only the first sync `syncs_left` fails does.
+    fail_one_sync: bool,
     /// Directory syncs that succeed before every later one fails.
     dir_syncs_left: Option<usize>,
     dir_syncs: u64,
@@ -356,6 +359,7 @@ impl MemFs {
             snapshot: None,
             free: None,
             syncs_left: None,
+            fail_one_sync: false,
             dir_syncs_left: None,
             dir_syncs: 0,
             fail_truncates: false,
@@ -397,11 +401,21 @@ impl MemFs {
     }
 
     pub(crate) fn fail_syncs(&self, fail: bool) {
-        self.0.borrow_mut().syncs_left = fail.then_some(0);
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = fail.then_some(0);
+        state.fail_one_sync = false;
     }
 
     pub(crate) fn fail_syncs_after(&self, n: usize) {
-        self.0.borrow_mut().syncs_left = Some(n);
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = Some(n);
+        state.fail_one_sync = false;
+    }
+
+    pub(crate) fn fail_one_sync_after(&self, n: usize) {
+        let mut state = self.0.borrow_mut();
+        state.syncs_left = Some(n);
+        state.fail_one_sync = true;
     }
 
     pub(crate) fn fail_removes_after(&self, n: usize) {
@@ -708,7 +722,12 @@ impl LogFile for MemFile {
         let failed = {
             let mut state = self.fs.0.borrow_mut();
             match &mut state.syncs_left {
-                Some(0) => true,
+                Some(0) => {
+                    if state.fail_one_sync {
+                        state.syncs_left = None;
+                    }
+                    true
+                }
                 Some(left) => {
                     *left -= 1;
                     false
