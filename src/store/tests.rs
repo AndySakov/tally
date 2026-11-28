@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -839,8 +840,8 @@ fn compact_leaves_the_log_its_hint_and_the_lock_file() {
 #[test]
 fn keys_sharing_a_hash_read_as_corruption_never_as_each_others_value() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut store = Store::open(tmp.path()).unwrap();
-    store.index = Index::weak();
+    let mut store = Store::open_in(OsFs, tmp.path(), Options::default()).unwrap();
+    Arc::get_mut(&mut store.inner).unwrap().index = Index::weak();
     store.set(key(b"a"), value(b"1")).unwrap();
     store.set(key(b"b"), value(b"2")).unwrap();
 
@@ -1024,7 +1025,7 @@ fn one_record_per_segment(dir: &Path) -> Store {
 fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
-    store.clean(&store.writer(), &[42]).unwrap();
+    store.clean(&store.compacting(), |_| vec![42]).unwrap();
     assert_eq!(segment_bases(tmp.path()), [0, 21, 62, 83]);
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1047,7 +1048,7 @@ fn cleaning_a_delete_while_an_older_segment_has_its_key_carries_it() {
 #[test]
 fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), segmented(1)).unwrap();
     let a = |i: u8| [b'a', b'0' + i];
     let mut sets = Batch::new();
     let mut deletes = Batch::new();
@@ -1060,7 +1061,7 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
     store.write(deletes).unwrap();
     put(&store, b"c", b"3");
     assert_eq!(segment_bases(tmp.path()), [0, 1267, 1504]);
-    store.clean(&store.writer(), &[1267]).unwrap();
+    store.clean(&store.compacting(), |_| vec![1267]).unwrap();
     assert_eq!(segment_bases(tmp.path()), [0, 1504, 1525]);
     drop(store);
 
@@ -1069,7 +1070,7 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
         auto_compact: AutoCompact::new(25, 0),
         segment_bytes: 1,
     };
-    let store = Store::open_with(tmp.path(), options).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), options).unwrap();
     put(&store, b"d", b"4");
     put(&store, b"e", b"5");
     assert_eq!(
@@ -1082,7 +1083,7 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
     }
     assert_eq!(read(&store, b"k").as_deref(), Some(&[b'v'; 1000][..]));
 
-    store.clean(&store.writer(), &[1966]).unwrap();
+    store.clean(&store.compacting(), |_| vec![1966]).unwrap();
     let reclaimable = |base: u64| {
         let segments = store.segments();
         segments
@@ -1115,7 +1116,7 @@ fn a_copy_of_carried_deletes_is_not_cleaned_again_while_they_are_needed() {
 fn a_copy_of_live_sets_and_a_carried_delete_reopens_from_its_hint() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
-    store.clean(&store.writer(), &[21, 42]).unwrap();
+    store.clean(&store.compacting(), |_| vec![21, 42]).unwrap();
     assert_eq!(segment_bases(tmp.path()), [0, 62, 83]);
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1139,7 +1140,7 @@ fn cleaning_a_delete_carries_it_when_the_older_set_is_only_in_a_hint() {
     let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
     assert!(tmp.path().join(hint_name(0)).exists());
 
-    store.clean(&store.writer(), &[42]).unwrap();
+    store.clean(&store.compacting(), |_| vec![42]).unwrap();
 
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1160,7 +1161,7 @@ fn cleaning_a_delete_carries_it_when_the_older_segments_hint_is_damaged() {
     bytes[5] ^= 1;
     fs::write(&hint, bytes).unwrap();
 
-    store.clean(&store.writer(), &[42]).unwrap();
+    store.clean(&store.compacting(), |_| vec![42]).unwrap();
 
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1173,7 +1174,7 @@ fn cleaning_a_delete_carries_it_when_the_older_segments_hint_is_damaged() {
 fn cleaning_a_delete_while_older_kept_segments_lack_its_key_drops_it() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
-    store.clean(&store.writer(), &[0, 42]).unwrap();
+    store.clean(&store.compacting(), |_| vec![0, 42]).unwrap();
     assert_eq!(segment_bases(tmp.path()), [21, 62, 83]);
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1193,7 +1194,9 @@ fn cleaning_a_delete_while_older_kept_segments_lack_its_key_drops_it() {
 fn cleaning_a_delete_with_every_older_segment_drops_it() {
     let tmp = tempfile::tempdir().unwrap();
     let store = one_record_per_segment(tmp.path());
-    store.clean(&store.writer(), &[0, 21, 42]).unwrap();
+    store
+        .clean(&store.compacting(), |_| vec![0, 21, 42])
+        .unwrap();
     assert_eq!(segment_bases(tmp.path()), [62, 83]);
     assert_eq!(
         segment_records(tmp.path(), 83),
@@ -1262,7 +1265,7 @@ fn automatic_compaction_leaves_segments_without_dead_bytes() {
         auto_compact: AutoCompact::new(50, 0),
         segment_bytes: 1,
     };
-    let store = Store::open_with(tmp.path(), options).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), options).unwrap();
     put(&store, b"a", b"1");
     put(&store, b"b", b"2");
     put(&store, b"b", b"3");
@@ -1275,7 +1278,7 @@ fn automatic_compaction_leaves_segments_without_dead_bytes() {
     assert_eq!(segment_records(tmp.path(), 83), b"");
     assert_eq!(store.dead(), 20);
     drop(store);
-    let store = Store::open_with(tmp.path(), options).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), options).unwrap();
     assert_eq!(read(&store, b"a").as_deref(), Some(&b"1"[..]));
     assert_eq!(read(&store, b"b"), None);
 }
@@ -2377,7 +2380,7 @@ fn auto(dead_percent: u8, min_log_bytes: u64) -> Options {
 #[test]
 fn a_write_that_leaves_half_the_log_dead_compacts_it() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 0)).unwrap();
     store.set(key(b"a"), value(b"1")).unwrap();
     store.set(key(b"b"), value(b"2")).unwrap();
     store.set(key(b"a"), value(b"3")).unwrap();
@@ -2400,7 +2403,7 @@ fn a_write_that_leaves_half_the_log_dead_compacts_it() {
 #[test]
 fn a_delete_counts_its_own_record_as_dead_too() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 0)).unwrap();
     store.set(key(b"a"), value(b"hi")).unwrap();
     store.set(key(b"b"), value(b"2")).unwrap();
     store.delete(key(b"a")).unwrap();
@@ -2413,7 +2416,7 @@ fn a_delete_counts_its_own_record_as_dead_too() {
 #[test]
 fn a_log_below_the_minimum_size_is_not_compacted() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), auto(50, 43)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 43)).unwrap();
     store.set(key(b"a"), value(b"1")).unwrap();
     store.set(key(b"a"), value(b"2")).unwrap();
     assert_eq!(log_bytes(tmp.path()).len(), 42);
@@ -2480,7 +2483,7 @@ fn open_counts_the_dead_bytes_already_in_the_log() {
     store.set(key(b"a"), value(b"3")).unwrap();
     drop(store);
 
-    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 0)).unwrap();
     assert_eq!(log_bytes(tmp.path()).len(), 63, "21 of 63 dead");
     store.set(key(b"b"), value(b"4")).unwrap();
     assert_eq!(
@@ -2492,7 +2495,7 @@ fn open_counts_the_dead_bytes_already_in_the_log() {
 #[test]
 fn a_failed_automatic_compaction_keeps_the_write_and_stays_off() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 0)).unwrap();
     store.set(key(b"a"), value(b"hi")).unwrap();
     store.set(key(b"b"), value(b"2")).unwrap();
     write_log_at(tmp.path(), 21, b"X");
@@ -3065,7 +3068,7 @@ fn a_thread_that_panics_holding_the_writer_lock_poisons_the_store() {
 #[test]
 fn a_group_that_writes_nothing_does_not_compact() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let store = Store::open_in(OsFs, tmp.path(), auto(50, 0)).unwrap();
     store.auto_failed.store(true, Ordering::Relaxed);
     put(&store, b"a", b"1");
     put(&store, b"a", b"2");
@@ -3157,7 +3160,7 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
         .unwrap();
     file.write_all_at(b"9", FILE_HEADER_LEN + 20).unwrap();
 
-    let err = store.clean(&store.writer(), &[21]).unwrap_err();
+    let err = store.clean(&store.compacting(), |_| vec![21]).unwrap_err();
 
     assert!(
         matches!(
@@ -3169,4 +3172,243 @@ fn compaction_reports_damage_in_a_kept_segment_at_its_own_offset() {
         ),
         "{err:?}"
     );
+}
+
+// compaction alongside writes
+
+/// Holds the store's first compaction at `phase` until the returned sender
+/// sends or is dropped; the receiver hears when it gets there.
+fn hold_compaction_at<F: Fs>(
+    store: &Store<F>,
+    phase: Phase,
+) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+    let (at_tx, at_rx) = mpsc::channel();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+    let held = AtomicBool::new(false);
+    store.on_phase(move |_, now| {
+        if now == phase && !held.swap(true, Ordering::Relaxed) {
+            hold(&at_tx).send(()).unwrap();
+            let _ = hold(&go_rx).recv();
+        }
+    });
+    (at_rx, go_tx)
+}
+
+/// Long enough for anything that is going to happen to happen, on a loaded
+/// machine; only a failing test waits this long.
+const PATIENCE: Duration = Duration::from_secs(60);
+
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + PATIENCE;
+    while !done() {
+        assert!(Instant::now() < deadline, "never {what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// a=1 at 0, b=2 at 21, a=3 at 42 and b=4 at 63: 42 of 84 bytes dead, so
+/// compaction at 50% is due.
+fn half_dead(store: &Store) {
+    put(store, b"a", b"1");
+    put(store, b"b", b"2");
+    put(store, b"a", b"3");
+    put(store, b"b", b"4");
+}
+
+#[test]
+fn a_write_does_not_wait_for_a_running_automatic_compaction() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    thread::scope(|scope| {
+        scope.spawn(|| half_dead(&store));
+        at.recv_timeout(PATIENCE).expect("a compaction starts");
+        let (done_tx, done) = mpsc::channel();
+        let store = &store;
+        scope.spawn(move || {
+            put(store, b"c", b"5");
+            done_tx.send(()).unwrap();
+        });
+        let returned = done.recv_timeout(PATIENCE);
+        go.send(()).unwrap();
+        returned.expect("the write returns while the compaction is held");
+    });
+    drop(store);
+    assert_eq!(
+        segment_bases(tmp.path()),
+        [84, 168],
+        "the write went past the 84 bytes reserved for the copies"
+    );
+    assert_eq!(
+        segment_records(tmp.path(), 84),
+        encoded_at(84, &[set_record(b"a", b"3"), set_record(b"b", b"4")])
+    );
+    assert_eq!(
+        segment_records(tmp.path(), 168),
+        encoded_at(168, &[set_record(b"c", b"5")])
+    );
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    assert_eq!(read(&store, b"c").as_deref(), Some(&b"5"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn writes_wait_past_the_stop_threshold_until_compaction_catches_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = auto(50, 0);
+    assert_eq!(options.auto_compact.unwrap().stop_percent(), 60);
+    let store = Store::open_with(tmp.path(), options).unwrap();
+    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    half_dead(&store);
+    at.recv_timeout(PATIENCE).expect("a compaction starts");
+    // 50% dead: under the stop, so it is written, at 168. It makes a=3
+    // dead too: 63 of 105, 60%.
+    put(&store, b"a", b"5");
+    assert_eq!(store.stalls.load(Ordering::Relaxed), 0);
+    thread::scope(|scope| {
+        let (done_tx, done) = mpsc::channel();
+        let store = &store;
+        scope.spawn(move || {
+            put(store, b"b", b"6");
+            done_tx.send(()).unwrap();
+        });
+        eventually("stalled", || store.stalls.load(Ordering::Relaxed) == 1);
+        assert_eq!(
+            done.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
+            "nothing but the held compaction can bring the log under 60%"
+        );
+        go.send(()).unwrap();
+        done.recv_timeout(PATIENCE)
+            .expect("the write goes on once compaction catches up");
+    });
+    assert_eq!(store.stalls.load(Ordering::Relaxed), 1);
+    drop(store);
+    assert_eq!(segment_bases(tmp.path()), [84, 168]);
+    assert_eq!(
+        segment_records(tmp.path(), 84),
+        encoded_at(84, &[set_record(b"b", b"4")]),
+        "a=3 died before the copy was made"
+    );
+    assert_eq!(
+        segment_records(tmp.path(), 168),
+        encoded_at(168, &[set_record(b"a", b"5"), set_record(b"b", b"6")])
+    );
+}
+
+#[test]
+fn a_panic_on_the_compaction_thread_poisons_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    store.on_phase(|_, phase| {
+        if phase == Phase::Copied {
+            panic!("halfway through a compaction");
+        }
+    });
+    half_dead(&store);
+    eventually("poisoned", || store.writable().is_err());
+    assert!(matches!(
+        store.set(key(b"c"), value(b"5")),
+        Err(Error::Poisoned)
+    ));
+    assert!(matches!(store.compact(), Err(Error::Poisoned)));
+    assert_eq!(read(&store, b"a").as_deref(), Some(&b"3"[..]));
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"4"[..]));
+    drop(store);
+
+    assert_eq!(segment_bases(tmp.path()), [0, 84], "both, saying the same");
+    let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+    assert_eq!(read(&store, b"a").as_deref(), Some(&b"3"[..]));
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"4"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn dropping_the_store_lets_its_compaction_finish_and_frees_the_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    let (at, go) = hold_compaction_at(&store, Phase::Reserved);
+    half_dead(&store);
+    at.recv_timeout(PATIENCE).expect("a compaction starts");
+    thread::scope(|scope| {
+        scope.spawn(move || drop(store));
+        go.send(()).unwrap();
+    });
+    assert_eq!(segment_bases(tmp.path()), [84]);
+    let store = Store::open_with(tmp.path(), auto(50, 0)).unwrap();
+    assert_eq!(read(&store, b"a").as_deref(), Some(&b"3"[..]));
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"4"[..]));
+}
+
+/// Calls `write` with the store once, when a compaction reaches `phase`.
+fn write_once_at(
+    store: &Store,
+    phase: Phase,
+    write: impl Fn(&Inner<OsFs>) + Send + Sync + 'static,
+) {
+    let done = AtomicBool::new(false);
+    store.on_phase(move |inner, now| {
+        if now == phase && !done.swap(true, Ordering::Relaxed) {
+            write(inner);
+        }
+    });
+}
+
+#[test]
+fn a_write_during_a_compaction_starts_a_segment_past_the_copies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = one_record_per_segment(tmp.path());
+    write_once_at(&store, Phase::Reserved, |inner| {
+        inner.set(key(b"d"), value(b"4")).unwrap();
+    });
+    // The four segments hold 83 bytes, so the copies may take 83 to 166.
+    store.compact().unwrap();
+    put(&store, b"e", b"5");
+    assert_eq!(segment_bases(tmp.path()), [83, 166, 187]);
+    assert_eq!(
+        segment_records(tmp.path(), 83),
+        encoded_at(83, &[set_record(b"b", b"2"), set_record(b"c", b"3")])
+    );
+    assert_eq!(
+        segment_records(tmp.path(), 166),
+        encoded_at(166, &[set_record(b"d", b"4")])
+    );
+    assert_eq!(store.dead(), 0);
+    drop(store);
+    let store = Store::open_with(tmp.path(), segmented(1)).unwrap();
+    assert_eq!(read(&store, b"a"), None);
+    assert_eq!(read(&store, b"d").as_deref(), Some(&b"4"[..]));
+    store.verify().unwrap();
+}
+
+#[test]
+fn a_key_overwritten_after_its_copy_is_made_keeps_the_new_value() {
+    let tmp = tempfile::tempdir().unwrap();
+    drop(one_record_per_segment(tmp.path()));
+    let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+    write_once_at(&store, Phase::Copied, |inner| {
+        inner.set(key(b"b"), value(b"9")).unwrap();
+    });
+    store.compact().unwrap();
+    assert_eq!(segment_bases(tmp.path()), [83]);
+    assert_eq!(
+        segment_records(tmp.path(), 83),
+        encoded_at(
+            83,
+            &[
+                set_record(b"b", b"2"),
+                set_record(b"c", b"3"),
+                set_record(b"b", b"9"),
+            ]
+        ),
+        "with no write before it was in the list, the copy took the write"
+    );
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"9"[..]));
+    assert_eq!(store.dead(), 21, "the copy of b=2 is dead");
+    drop(store);
+    let store = Store::open_with(tmp.path(), segmented(1 << 20)).unwrap();
+    assert_eq!(read(&store, b"b").as_deref(), Some(&b"9"[..]));
+    assert_eq!(store.dead(), 21);
+    store.verify().unwrap();
 }

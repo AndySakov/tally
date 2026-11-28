@@ -9,6 +9,7 @@
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::fs::{Fs, LogFile};
@@ -16,7 +17,7 @@ use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
-use crate::store::LOG_FILE_NAME;
+use crate::store::{LOG_FILE_NAME, Phase};
 use crate::{AutoCompact, Key, Options, Repaired, Store, Value};
 
 const DIR: &str = "/db";
@@ -70,6 +71,20 @@ fn workload() -> Vec<Op> {
     ]
 }
 
+/// Writes made at each phase of a compaction, as writes land while the
+/// store's thread compacts: past the offsets reserved for its copies,
+/// before the index points at them, and before the old segments go.
+fn during_compaction() -> Vec<(Phase, Vec<model::Change>)> {
+    vec![
+        (
+            Phase::Reserved,
+            vec![(2, Some(b"two during".to_vec())), (5, Some(b"5".to_vec()))],
+        ),
+        (Phase::Copied, vec![(1, None), (0, Some(b"0".to_vec()))]),
+        (Phase::Repointed, vec![(3, Some(b"three".to_vec()))]),
+    ]
+}
+
 fn key(k: u8) -> Key {
     model::key(0, k)
 }
@@ -113,6 +128,31 @@ fn cut_workload(step: u64) -> Option<(Disk, Vec<State>)> {
         states.push(state.clone());
         ends.push(fs.steps());
     }
+    // Each write during the compaction is an operation of its own; the
+    // compaction around them changes no key.
+    let during = Arc::new(Mutex::new((state.clone(), Vec::new())));
+    {
+        let during = Arc::clone(&during);
+        let writes = during_compaction();
+        store.on_phase(move |inner, phase| {
+            let Some((_, changes)) = writes.iter().find(|(at, _)| *at == phase) else {
+                return;
+            };
+            let mut during = during.lock().unwrap();
+            let (state, done) = &mut *during;
+            model::run(inner, 0, state, &Op::Batch(changes.clone()));
+            done.push((state.clone(), inner.fs().steps()));
+        });
+    }
+    model::run(&store, 0, &mut state, &Op::Compact);
+    let (state, done) = during.lock().unwrap().clone();
+    assert_eq!(done.len(), 3, "a write at every phase");
+    for (during, end) in done {
+        states.push(during);
+        ends.push(end);
+    }
+    states.push(state.clone());
+    ends.push(fs.steps());
 
     if step == fs.steps() + 1 {
         return Some((fs.disk(), vec![state]));
