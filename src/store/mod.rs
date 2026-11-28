@@ -29,18 +29,21 @@ use scan::scan;
 pub(crate) const LOG_FILE_NAME: &str = "tally.log";
 pub(crate) const LOCK_FILE_NAME: &str = "tally.lock";
 
-/// What `Store::repair` moved out of the log.
+/// What `Store::repair` took out of the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Repaired {
     /// Offset of the first bad record, where its segment now ends, or the
-    /// base of a segment whose file header was bad, which is now empty.
+    /// base of a segment whose file header was bad, which is now empty, or
+    /// the end of a segment cut short of what its hint lists.
     pub offset: u64,
-    /// Bytes moved out of the log: everything from `offset` to the end of
-    /// its segment, or the whole file of a segment whose header was bad.
+    /// Bytes taken out of the log: everything from `offset` to the end of
+    /// its segment, or the whole file of a segment whose header was bad, or
+    /// what the hint lists past where a segment cut short now ends.
     pub dropped: u64,
-    /// Where those bytes were saved.
-    pub side_file: SideFile,
+    /// Where those bytes were saved, or `None` when they were already gone:
+    /// a segment cut short of its hint.
+    pub side_file: Option<SideFile>,
 }
 
 /// The file `Store::repair` saved the bytes it moved to.
@@ -162,7 +165,9 @@ impl Store {
     /// the side file and the directory, then truncates the segment at the
     /// record and fsyncs it. A segment whose file header is damaged, or cut
     /// short in a sealed segment, goes to the side file whole and is
-    /// replaced by an empty one. Unsupported records are an error, not
+    /// replaced by an empty one. A segment shorter than its hint says has
+    /// lost records no side file can save: the hint is removed, and the
+    /// next `open` reads the segment as it is. Unsupported records are an error, not
     /// something to repair: a newer tally can read them. Fails with
     /// `Locked` while a `Store` is open.
     ///

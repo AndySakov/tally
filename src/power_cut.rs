@@ -274,10 +274,10 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
                     Some(Repaired {
                         offset: 22,
                         dropped: moved.len() as u64,
-                        side_file: SideFile {
+                        side_file: Some(SideFile {
                             path: side_path.clone(),
                             unreadable: vec![],
-                        },
+                        }),
                     }),
                     "{context}"
                 );
