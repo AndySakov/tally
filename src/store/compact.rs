@@ -237,8 +237,11 @@ impl<F: Fs> Inner<F> {
         }
         // A Delete left behind must not outlive the Set it hides, so then
         // each removal is made durable before the next, oldest first. Without
-        // one, the removals may land in any order.
+        // one, the removals may land in any order. A write that poisoned the
+        // store meanwhile failed a directory fsync, and Linux need not tell
+        // a later one on a new descriptor, so none of them is durable.
         for (i, &base) in chosen.iter().enumerate() {
+            self.writable()?;
             remove_if_present(&self.fs, &self.dir.join(hint_name(base)))?;
             self.fs.remove(&self.dir.join(log_name(base)))?;
             {
@@ -257,6 +260,7 @@ impl<F: Fs> Inner<F> {
                 return Err(self.poison(err));
             }
         }
+        self.writable()?;
         Ok(true)
     }
 

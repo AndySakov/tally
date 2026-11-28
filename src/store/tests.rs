@@ -3412,3 +3412,56 @@ fn a_key_overwritten_after_its_copy_is_made_keeps_the_new_value() {
     assert_eq!(store.dead(), 21);
     store.verify().unwrap();
 }
+
+/// A write that starts a segment while a compaction runs, and whose
+/// directory fsync fails, poisons the store. The compaction's own
+/// directory fsyncs come after that failure on new descriptors, which Linux
+/// need not tell about it, so it must not go on to remove segments.
+#[test]
+fn a_compaction_poisoned_by_a_concurrent_roll_removes_nothing() {
+    for phase in [Phase::Reserved, Phase::Copied] {
+        let fs = MemFs::new();
+        let store = open_on(&fs, segmented(1));
+        store.set(key(b"a"), value(b"1")).unwrap();
+        store.set(key(b"b"), value(b"2")).unwrap();
+        store.delete(key(b"a")).unwrap();
+        store.set(key(b"c"), value(b"3")).unwrap();
+        let rolled = Arc::new(Mutex::new(None));
+        {
+            let rolled = Arc::clone(&rolled);
+            store.on_phase(move |inner, now| {
+                if now == phase {
+                    inner.fs().fail_dir_syncs(true);
+                    *hold(&rolled) = Some(inner.set(key(b"d"), value(b"4")));
+                    inner.fs().fail_dir_syncs(false);
+                    inner.fs().skip_dir_syncs(true);
+                }
+            });
+        }
+        let compacted = store.compact();
+        let rolled = hold(&rolled).take().expect("a write during the compaction");
+        assert!(
+            matches!(&rolled, Err(Error::Io(io)) if io.to_string() == "injected directory fsync failure"),
+            "{phase:?}: {rolled:?}"
+        );
+        assert!(
+            matches!(compacted, Err(Error::Poisoned)),
+            "{phase:?}: {compacted:?}"
+        );
+        for base in [0, 21, 42, 62] {
+            assert!(
+                fs.read(&Path::new("/db").join(log_name(base))).is_some(),
+                "{phase:?}: segment {base} is still there"
+            );
+        }
+        drop(store);
+        let disk = fs.disk();
+        for cut in disk.cuts() {
+            let store = open_on(&MemFs::after(&disk, cut), segmented(1));
+            assert_eq!(get_on(&store, b"a"), None, "{phase:?}: {cut:?}");
+            assert_eq!(get_on(&store, b"b").as_deref(), Some(&b"2"[..]));
+            assert_eq!(get_on(&store, b"c").as_deref(), Some(&b"3"[..]));
+            assert_eq!(get_on(&store, b"d"), None);
+        }
+    }
+}
