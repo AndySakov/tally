@@ -1,5 +1,6 @@
 use std::fs::TryLockError;
 use std::io::{self, ErrorKind};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, RwLock};
@@ -40,6 +41,9 @@ pub struct Repaired {
     /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
     /// store directory.
     pub side_file: PathBuf,
+    /// Where in `side_file` the bytes that failed to read are, in 4 KiB
+    /// blocks. The side file holds zeros there.
+    pub unreadable: Vec<Range<u64>>,
 }
 
 /// An open store: the log's segments plus an in-memory index of every live

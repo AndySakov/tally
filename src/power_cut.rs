@@ -275,6 +275,7 @@ fn a_power_cut_during_repair_never_loses_a_byte() {
                         offset: 22,
                         dropped: moved.len() as u64,
                         side_file: side_path.clone(),
+                        unreadable: vec![],
                     }),
                     "{context}"
                 );

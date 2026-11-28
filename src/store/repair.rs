@@ -1,6 +1,7 @@
 //! `repair` (DESIGN.md, Recovery).
 
 use std::io::{self, ErrorKind, Read};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -9,12 +10,27 @@ use super::{
 };
 use crate::fs::{Fs, LogFile};
 use crate::index::Index;
+use crate::record::IndexOp;
 use crate::segment::{compact_name, create, hint_name, log_name};
 use crate::{CorruptionReason, Error};
 
-/// Whether `side` holds a prefix of `file`'s bytes from `offset` to `len`,
-/// as a repair that crashed partway through copying them leaves it: each
-/// byte is the one it copies, or zero where that write never landed.
+/// What `repair` reads at a time, and fills with zeros if the read fails.
+const BLOCK: u64 = 4096;
+
+/// Reads `buf.len()` bytes of `file` at `at`, or fills `buf` with zeros
+/// and returns false if they fail to read.
+fn read_or_zeros(file: &impl LogFile, buf: &mut [u8], at: u64) -> bool {
+    let read = file.read_exact_at(buf, at).is_ok();
+    if !read {
+        buf.fill(0);
+    }
+    read
+}
+
+/// Whether `side` holds a prefix of what `copy_readable` writes for
+/// `file`'s bytes from `offset` to `len`, as a repair that crashed partway
+/// through copying them leaves it: each byte is the one it copies, or zero
+/// where that write never landed.
 fn starts_tail(
     side: &impl LogFile,
     file: &impl LogFile,
@@ -25,26 +41,47 @@ fn starts_tail(
     if side_len > len - offset {
         return Ok(false);
     }
-    let mut ours = side.reader_at(0).take(side_len);
-    let mut theirs = file.reader_at(offset).take(side_len);
-    let mut a = vec![0u8; 64 * 1024];
-    let mut b = vec![0u8; 64 * 1024];
-    loop {
-        let n = match ours.read(&mut a) {
-            Ok(0) => return Ok(true),
-            Ok(n) => n,
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        };
-        theirs.read_exact(&mut b[..n])?;
-        if a[..n]
+    let mut ours = vec![0u8; BLOCK as usize];
+    let mut theirs = vec![0u8; BLOCK as usize];
+    for at in (0..side_len).step_by(BLOCK as usize) {
+        let ours = &mut ours[..(side_len - at).min(BLOCK) as usize];
+        side.read_exact_at(ours, at)?;
+        let theirs = &mut theirs[..(len - offset - at).min(BLOCK) as usize];
+        read_or_zeros(file, theirs, offset + at);
+        if ours
             .iter()
-            .zip(&b[..n])
+            .zip(&*theirs)
             .any(|(&ours, &theirs)| ours != 0 && ours != theirs)
         {
             return Ok(false);
         }
     }
+    Ok(true)
+}
+
+/// Appends the bytes of `file` from `offset` to `len` to the empty `side`,
+/// a block at a time, with zeros for each block that fails to read, and
+/// returns where in `side` those are.
+fn copy_readable(
+    file: &impl LogFile,
+    offset: u64,
+    len: u64,
+    side: &impl LogFile,
+) -> io::Result<Vec<Range<u64>>> {
+    let mut buf = vec![0u8; BLOCK as usize];
+    let mut unreadable: Vec<Range<u64>> = Vec::new();
+    for at in (0..len - offset).step_by(BLOCK as usize) {
+        let block = &mut buf[..(len - offset - at).min(BLOCK) as usize];
+        let end = at + block.len() as u64;
+        if !read_or_zeros(file, block, offset + at) {
+            match unreadable.last_mut() {
+                Some(last) if last.end == at => last.end = end,
+                _ => unreadable.push(at..end),
+            }
+        }
+        side.write_all_at(block, at)?;
+    }
+    Ok(unreadable)
 }
 
 /// Appends everything `reader` yields to `file`, in chunks.
@@ -72,7 +109,8 @@ fn corrupt_name(dir: &Path, offset: u64) -> PathBuf {
 /// Copies the bytes of `file` from `offset` to `len` to `side_file`, fsyncs
 /// it, removes the hint of the segment at `base`, and fsyncs the
 /// directory, so the bytes are durable outside the log before they leave
-/// it.
+/// it. Returns where in `side_file` the bytes that failed to read are,
+/// as zeros.
 fn move_aside<F: Fs>(
     fs: &F,
     dir: &Path,
@@ -81,7 +119,7 @@ fn move_aside<F: Fs>(
     offset: u64,
     len: u64,
     base: u64,
-) -> Result<(), Error> {
+) -> Result<Vec<Range<u64>>, Error> {
     let side = match fs.open_existing(side_file) {
         Ok(existing) => {
             if !starts_tail(&existing, file, offset, len)? {
@@ -93,11 +131,11 @@ fn move_aside<F: Fs>(
         Err(err) => return Err(err.into()),
     };
     side.set_len(0)?;
-    copy_to_end(file.reader_at(offset).take(len - offset), &side)?;
+    let unreadable = copy_readable(file, offset, len, &side)?;
     side.sync()?;
     remove_if_present(fs, &dir.join(hint_name(base)))?;
     fs.sync_dir(dir)?;
-    Ok(())
+    Ok(unreadable)
 }
 
 /// Repairs a sealed segment at `base` whose file header is damaged or cut
@@ -109,7 +147,14 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
     let file = fs.open_existing(&path)?;
     let len = file.size()?;
     let side_file = corrupt_name(dir, base);
-    move_aside(fs, dir, &side_file, &file, 0, len, base)?;
+    let unreadable = move_aside(fs, dir, &side_file, &file, 0, len, base)?;
+    if !unreadable.is_empty() {
+        log::warn!(
+            "repair could not read bytes {unreadable:?} of {}: saved them as zeros in {}",
+            path.display(),
+            side_file.display()
+        );
+    }
     let empty = dir.join(compact_name(base));
     create(fs, &empty, base)?;
     fs.rename(&empty, &path)?;
@@ -118,6 +163,7 @@ fn repair_file_header<F: Fs>(fs: &F, dir: &Path, base: u64) -> Result<Repaired, 
         offset: base,
         dropped: len,
         side_file,
+        unreadable,
     })
 }
 
@@ -136,17 +182,36 @@ impl<F: Fs> Store<F> {
         let mut bad = None;
         for (i, segment) in segments.iter().enumerate() {
             let newest = i + 1 == segments.len();
+            // Where the record or batch the scan reads next starts: an I/O
+            // error falls in it.
+            let mut reading = segment.base;
+            let mut batch_end = 0;
             match scan(
                 segment,
                 &mut index,
                 segment.base,
                 segment.end(),
                 newest,
-                &mut |_| Ok(()),
+                &mut |scanned| {
+                    let end = scanned.offset + scanned.header.record_len();
+                    match *scanned.op {
+                        IndexOp::Batch { body_len } if body_len > 0 => {
+                            reading = scanned.offset;
+                            batch_end = end + body_len;
+                        }
+                        _ if end >= batch_end => reading = end,
+                        _ => {}
+                    }
+                    Ok(())
+                },
             ) {
                 Ok(_) => {}
                 Err(Error::Corruption { offset, .. }) => {
                     bad = Some((segment, offset));
+                    break;
+                }
+                Err(Error::Io(_)) => {
+                    bad = Some((segment, reading));
                     break;
                 }
                 Err(err) => return Err(err),
@@ -157,13 +222,24 @@ impl<F: Fs> Store<F> {
         };
         let len = segment.end();
         let side_file = corrupt_name(dir, offset);
-        move_aside(fs, dir, &side_file, segment, offset, len, segment.base)?;
+        let unreadable = move_aside(fs, dir, &side_file, segment, offset, len, segment.base)?;
+        if !unreadable.is_empty() {
+            let in_log: Vec<_> = unreadable
+                .iter()
+                .map(|r| offset + r.start..offset + r.end)
+                .collect();
+            log::warn!(
+                "repair could not read log offsets {in_log:?}: saved them as zeros in {}",
+                side_file.display()
+            );
+        }
         segment.set_len(offset)?;
         segment.sync()?;
         Ok(Some(Repaired {
             offset,
             dropped: len - offset,
             side_file,
+            unreadable,
         }))
     }
 }

@@ -326,6 +326,8 @@ struct State {
     /// Removes that go ahead before every later one fails.
     removes_left: Option<usize>,
     tamper: Option<(PathBuf, Tamper)>,
+    /// Reads of these bytes of the file at this path fail.
+    unreadable: Option<(PathBuf, std::ops::Range<u64>)>,
 }
 
 /// Changes the bytes a write at an offset lands.
@@ -358,6 +360,7 @@ impl MemFs {
             fail_truncates: false,
             removes_left: None,
             tamper: None,
+            unreadable: None,
         })))
     }
 
@@ -408,6 +411,19 @@ impl MemFs {
     /// at `path`, given the write's offset.
     pub(crate) fn tamper(&self, path: &Path, tamper: Tamper) {
         self.0.borrow_mut().tamper = Some((path.to_path_buf(), tamper));
+    }
+
+    /// From now on, reads of `range` of the file at `path` fail, as a bad
+    /// sector does; a read that starts before it returns the bytes up to it.
+    pub(crate) fn fail_reads(&self, path: &Path, range: std::ops::Range<u64>) {
+        self.0.borrow_mut().unreadable = Some((path.to_path_buf(), range));
+    }
+
+    /// The bad range of inode `ino`, if it has one.
+    fn unreadable(&self, ino: usize) -> Option<std::ops::Range<u64>> {
+        let state = self.0.borrow();
+        let (path, range) = state.unreadable.as_ref()?;
+        (state.disk.files.get(path) == Some(&ino)).then(|| range.clone())
     }
 
     pub(crate) fn fail_dir_syncs(&self, fail: bool) {
@@ -613,6 +629,12 @@ impl LogFile for MemFile {
     }
 
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+        if let Some(bad) = self.fs.unreadable(self.ino)
+            && offset < bad.end
+            && bad.start < offset + buf.len() as u64
+        {
+            return Err(io::Error::other("injected read failure"));
+        }
         self.fs.with_inode(self.ino, |inode| {
             let start = offset as usize;
             let src = inode
@@ -712,10 +734,19 @@ struct MemReader<'a> {
 
 impl Read for MemReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut most = buf.len();
+        if let Some(bad) = self.file.fs.unreadable(self.file.ino) {
+            if bad.contains(&self.offset) {
+                return Err(io::Error::other("injected read failure"));
+            }
+            if self.offset < bad.start {
+                most = most.min((bad.start - self.offset) as usize);
+            }
+        }
         let n = self.file.fs.with_inode(self.file.ino, |inode| {
             let start = (self.offset as usize).min(inode.data.len());
             let src = &inode.data[start..];
-            let n = src.len().min(buf.len());
+            let n = src.len().min(most);
             buf[..n].copy_from_slice(&src[..n]);
             n
         });
