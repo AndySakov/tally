@@ -30,13 +30,14 @@ const SHORTEST_RECORD: u64 = HEADER_LEN as u64 + 1;
 /// a segment the manifest lists that is gone, and segments that overlap.
 /// A newest segment whose header a crash cut short is started again: no
 /// record was written to it before its header was fsynced.
-pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>, Error> {
+pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>, NotOpened> {
     let names = fs.list(dir)?;
     if names.iter().any(|n| n == LOG_FILE_NAME) {
         return Err(Error::Unsupported {
             offset: 0,
             reason: UnsupportedReason::OtherFormat,
-        });
+        }
+        .into());
     }
     let mut bases: Vec<u64> = names.iter().filter_map(|n| parse_log_name(n)).collect();
     bases.sort_unstable();
@@ -49,7 +50,8 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>
         return Err(Error::Corruption {
             offset: missing,
             reason: CorruptionReason::SegmentMissing,
-        });
+        }
+        .into());
     }
     let mut changed = false;
     for name in &names {
@@ -65,11 +67,15 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>
     let mut segments: Vec<Segment<F::File>> = Vec::with_capacity(bases.len());
     for (i, &base) in bases.iter().enumerate() {
         let file = fs.open_existing(&dir.join(log_name(base)))?;
-        let corrupt = |reason| Error::Corruption {
-            offset: base,
-            reason,
+        let corrupt = |reason| {
+            NotOpened::from(Error::Corruption {
+                offset: base,
+                reason,
+            })
         };
-        match check_file_header(&file, base)? {
+        let header =
+            check_file_header(&file, base).map_err(|err| NotOpened::UnreadableHeader(base, err))?;
+        match header {
             FileHeader::Valid => {}
             FileHeader::Torn if i + 1 == bases.len() => start_file(&file, base)?,
             FileHeader::Torn => return Err(corrupt(CorruptionReason::CutShort)),
@@ -78,7 +84,8 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>
                 return Err(Error::Unsupported {
                     offset: base,
                     reason: UnsupportedReason::OtherFormat,
-                });
+                }
+                .into());
             }
         }
         if let Some(before) = segments.last()
@@ -93,6 +100,34 @@ pub(super) fn open_segments<F: Fs>(fs: &F, dir: &Path) -> Result<Opened<F::File>
         segments,
         listed: listed.as_deref() == Some(&bases[..]),
     })
+}
+
+/// Why `open_segments` failed. `open` reports either as its `Error`.
+pub(super) enum NotOpened {
+    /// The file header of the segment at this base failed to read.
+    UnreadableHeader(u64, io::Error),
+    Failed(Error),
+}
+
+impl From<Error> for NotOpened {
+    fn from(err: Error) -> NotOpened {
+        NotOpened::Failed(err)
+    }
+}
+
+impl From<io::Error> for NotOpened {
+    fn from(err: io::Error) -> NotOpened {
+        NotOpened::Failed(err.into())
+    }
+}
+
+impl From<NotOpened> for Error {
+    fn from(err: NotOpened) -> Error {
+        match err {
+            NotOpened::UnreadableHeader(_, err) => err.into(),
+            NotOpened::Failed(err) => err,
+        }
+    }
 }
 
 pub(super) struct Opened<L> {

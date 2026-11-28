@@ -3494,6 +3494,74 @@ fn repair_moves_an_unreadable_sector_aside_as_zeros() {
     assert_eq!(get_on(&store, b"c"), Some(b"3".to_vec()));
 }
 
+/// a=1 at 0, b at 21 with a value of 5,000 2s, and c=3 at 5041, each in a
+/// segment of its own; reads of the file header of the segment at `base`
+/// fail. Checks that `open` fails with an I/O error, then that one repair
+/// moves that whole file aside as `side_bytes`, the first `unreadable`
+/// bytes of it as zeros, and that `open` then serves `survivors`.
+fn repair_an_unreadable_header(
+    base: u64,
+    side_bytes: &[u8],
+    unreadable: u64,
+    survivors: [Option<Vec<u8>>; 3],
+) {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1));
+    store.set(key(b"a"), value(b"1")).unwrap();
+    store.set(key(b"b"), value(&[b'2'; 5000])).unwrap();
+    store.set(key(b"c"), value(b"3")).unwrap();
+    drop(store);
+    let path = dir.join(log_name(base));
+    fs.fail_reads(&path, 0..FILE_HEADER_LEN);
+    assert!(matches!(
+        Store::open_in(fs.clone(), dir, segmented(1)),
+        Err(Error::Io(_))
+    ));
+
+    let side_file = dir.join(format!("tally.log.corrupt-{base}"));
+    assert_eq!(
+        Store::repair_in(&fs, dir).unwrap(),
+        Some(Repaired {
+            offset: base,
+            dropped: side_bytes.len() as u64,
+            side_file: Some(SideFile {
+                path: side_file.clone(),
+                unreadable: vec![Range {
+                    start: 0,
+                    end: unreadable
+                }],
+            }),
+        })
+    );
+    assert_eq!(fs.read(&side_file).unwrap(), side_bytes);
+    assert_eq!(fs.read(&path).unwrap(), segment_file(base, b""));
+    assert_eq!(Store::repair_in(&fs, dir).unwrap(), None);
+    let store = open_on(&fs, segmented(1));
+    assert_eq!([b"a", b"b", b"c"].map(|k| get_on(&store, k)), survivors);
+    store.verify().unwrap();
+}
+
+#[test]
+fn one_repair_of_an_unreadable_sealed_segment_header_lets_open_succeed() {
+    repair_an_unreadable_header(
+        21,
+        &[&[0; 4096][..], &[b'2'; 941]].concat(),
+        4096,
+        [Some(b"1".to_vec()), None, Some(b"3".to_vec())],
+    );
+}
+
+#[test]
+fn one_repair_of_an_unreadable_newest_segment_header_lets_open_succeed() {
+    repair_an_unreadable_header(
+        5041,
+        &[0; 38],
+        38,
+        [Some(b"1".to_vec()), Some(vec![b'2'; 5000]), None],
+    );
+}
+
 #[test]
 fn repair_over_an_unreadable_sector_rewrites_only_zeros_where_it_failed() {
     let dir = Path::new("/db");
