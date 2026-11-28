@@ -89,7 +89,7 @@ A parity file is **usable** when its magic and version hold, the trailer's check
 
 ### When it is written
 
-One seal hook, in `roll()`, where the seal-hints branch writes the sealed segment's hint trailer: when a write starts a new segment, the one it seals gets its parity, under the writer lock, before the group that rolled is appended. That group, and those queued behind it, wait about 0.1 s (see Costs). A compaction's output is sealed through the same `roll()`, by the seal-compaction branch, which lands first; compaction itself has no parity code.
+One `seal(segment)` function, called everywhere a segment stops being the active one: in `roll()`, when a write starts a new segment, and in compaction, when its copy becomes the last segment and the one that was active is sealed without a roll. The seal-hints branch adds it, with the hint's trailer and rename; parity's encode goes in the same function, under the writer lock. The group that sealed, and those queued behind it, wait about 0.1 s (see Costs). Compaction has no parity code of its own.
 
 `open` backfills only segments it already reads in full: a sealed segment with no hint, or read past its hint, gets its parity after that full, checked read, from a second read of the bytes just scanned: the scan reads in order and the encoder in strides, so they do not share one. A segment with a bad record gets no parity, a warning is logged, and `open` goes on as it does today. Sealed segments that `open` reads from their hints are left alone, so the first `open` after an upgrade does not read and encode the whole store. They, and a segment whose seal crashed after its hint and before its parity, wait for an explicit pass, `Store::protect()`, which reads each sealed segment without usable parity in full, checks every record, and writes its parity. `protect` is idempotent and holds the writer lock. The parity of the newest segment, which can grow, is removed by `open`.
 
@@ -142,7 +142,7 @@ Unchanged. A bad record is a `Corruption` error, as today, and the error's docum
 
 - Cleaned segments lose their parity with their hints: removed before the segment, in step 6's removals and directory fsyncs. Parity whose segment is gone is removed by `open`.
 - Compaction still stops at a corrupt record with its offset. It never restores.
-- The output gets parity when it is sealed. Today it takes new writes, so after `compact()` every live record would sit in one active segment that parity never covers. The seal-compaction branch seals the output at once, through `roll()`, so it gets parity from the seal hook like any other segment.
+- The output gets parity when it is sealed, through `seal()` like any other segment. A write that lands during a background compaction starts a segment past the copy, which seals the copy. When no write overlaps the compaction, the copy becomes the active segment and stays without parity until it fills or a later compaction cleans it: after a `compact()` on an idle store, its live records are not covered until then. Sealing every copy at once was measured and dropped: it saved no copying once compaction ran on its own thread, and before that it left hundreds of small sealed segments.
 
 ### Hints
 
@@ -181,14 +181,14 @@ Not measured: a full copy's write, `open`'s read of the parity tables, the state
 
 ## Decisions
 
-1. **A compaction's output is sealed at once**, so it gets parity at seal. The seal-compaction branch does it, and lands before parity.
+1. **A compaction's output gets parity when `seal()` seals it**, not at once. A copy no write overlapped stays active, without parity, until it is sealed.
 2. **k = 64, m = 4**, as constants in code, with S and the rest derived from `file_len` and the version, never stored.
 3. **An off switch**, `Options::parity: bool`, default on, for stores on ZFS or a checksummed mirror. Off writes no new parity: not at seal, not in `open`'s backfill, not in `protect`. Existing parity is still used by `repair` and removed with its segments.
 4. **`repair` returns a plain `Repaired`**, not an `Option`: `Repaired { restored: Vec<Restored>, moved: Option<Moved> }`, where no restores and no move means nothing was needed. One way to say nothing, not two.
-5. **Parity is encoded on the write path in v1**, in the `roll()` hook under the writer lock. The build PR first measures it under a cold page cache and for a 1.3 GB compaction output.
+5. **Parity is encoded on the write path in v1**, in `seal()` under the writer lock. The build PR first measures it under a cold page cache and for a 1.3 GB compaction output.
 6. **`verify` fails on damaged parity**, with `Corruption { offset: base, reason: Parity }`. Missing parity stays `Ok`.
 7. **Power cut:** the build measures the state count with parity on before deciding whether parity goes in the main workload or one of its own.
-8. **Build order:** the two bug fixes under Follow-ups first, each in its own PR, then seal-compaction, then parity.
+8. **Build order:** the two bug fixes under Follow-ups first, each in its own PR (both merged), then seal-hints with its `seal()` function, then parity.
 
 ## Follow-ups, outside this change (built first, see Decisions)
 
