@@ -41,8 +41,8 @@ pub struct Repaired {
     /// Where those bytes were saved: `tally.log.corrupt-<offset>` in the
     /// store directory.
     pub side_file: PathBuf,
-    /// Where in `side_file` the bytes that failed to read are, in 4 KiB
-    /// blocks. The side file holds zeros there.
+    /// Where in `side_file` the bytes that failed to read are, in the 4 KiB
+    /// blocks of the segment's file. The side file holds zeros there.
     pub unreadable: Vec<Range<u64>>,
 }
 

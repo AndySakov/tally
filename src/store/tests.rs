@@ -3177,13 +3177,13 @@ fn repair_moves_an_unreadable_sector_aside_as_zeros() {
             side_file: dir.join("tally.log.corrupt-21"),
             unreadable: vec![Range {
                 start: 0,
-                end: 4096
+                end: 4079
             }],
         })
     );
     assert_eq!(
         fs.read(&dir.join("tally.log.corrupt-21")).unwrap(),
-        [&[0; 4096][..], &[b'2'; 924]].concat()
+        [&[0; 4079][..], &[b'2'; 941]].concat()
     );
     assert_eq!(Store::repair_in(&fs, dir).unwrap(), None);
     let store = open_on(&fs, segmented(1));
@@ -3196,19 +3196,19 @@ fn repair_moves_an_unreadable_sector_aside_as_zeros() {
 fn repair_over_an_unreadable_sector_rewrites_only_zeros_where_it_failed() {
     let dir = Path::new("/db");
     let side = dir.join("tally.log.corrupt-21");
-    let crashed = [&[0; 4096][..], &[b'2'; 100]].concat();
+    let crashed = [&[0; 4079][..], &[b'2'; 100]].concat();
     let fs = store_with_an_unreadable_sector();
     fs.put(&side, &crashed);
     assert_eq!(
         Store::repair_in(&fs, dir).unwrap().map(|r| r.unreadable),
         Some(vec![Range {
             start: 0,
-            end: 4096
+            end: 4079
         }])
     );
     assert_eq!(
         fs.read(&side).unwrap(),
-        [&[0; 4096][..], &[b'2'; 924]].concat()
+        [&[0; 4079][..], &[b'2'; 941]].concat()
     );
 
     let saved_before_the_sector_went_bad = [&[0; 5][..], &[b'b'; 1]].concat();
@@ -3297,7 +3297,7 @@ fn repair_cuts_at_the_record_holding_a_sector_whose_whole_read_fails() {
             5041,
             5041,
             vec![Range {
-                start: 4096,
+                start: 3134,
                 end: 5041
             }]
         )
