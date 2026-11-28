@@ -184,7 +184,14 @@ Not measured: a full copy's write, `open`'s read of the parity tables, the state
 1. **A compaction's output gets parity when `seal()` seals it**, not at once. A copy no write overlapped stays active, without parity, until it is sealed.
 2. **k = 64, m = 4**, as constants in code, with S and the rest derived from `file_len` and the version, never stored.
 3. **An off switch**, `Options::parity: bool`, default on, for stores on ZFS or a checksummed mirror. Off writes no new parity: not at seal, not in `open`'s backfill, not in `protect`. Existing parity is still used by `repair` and removed with its segments.
-4. **`repair` returns a plain `Repaired`**, not an `Option`: `Repaired { restored: Vec<Restored>, moved: Option<Moved> }`, where no restores and no move means nothing was needed. One way to say nothing, not two.
+4. **`repair` keeps returning `Result<Option<Repaired>, Error>`**, and `None` still means nothing needed doing. Parity changes `Repaired`, extending the shape repair has today (`offset`, `dropped`, `side_file: Option<SideFile>`):
+
+   ```rust
+   #[non_exhaustive] pub struct Repaired { pub restored: Vec<Range<u64>>, pub cut: Option<Cut> }
+   #[non_exhaustive] pub struct Cut { pub offset: u64, pub dropped: u64, pub side_file: Option<SideFile> }
+   ```
+
+   `restored` holds the log-offset ranges rewritten from parity, empty if none. `cut` is what was still moved aside or was already gone, `None` when parity restored everything. A `Repaired` always has `restored` non-empty or `cut` set: tally is its only constructor, since both structs are `#[non_exhaustive]`, and a debug assertion checks it. Moving `offset`, `dropped` and `side_file` under `Cut` breaks callers once, which is fine before 1.0. This lands with the parity code, not before.
 5. **Parity is encoded on the write path in v1**, in `seal()` under the writer lock. The build PR first measures it under a cold page cache and for a 1.3 GB compaction output.
 6. **`verify` fails on damaged parity**, with `Corruption { offset: base, reason: Parity }`. Missing parity stays `Ok`.
 7. **Power cut:** the build measures the state count with parity on before deciding whether parity goes in the main workload or one of its own.
