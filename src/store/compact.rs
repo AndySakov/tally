@@ -190,6 +190,11 @@ impl<F: Fs> Store<F> {
             .map_err(Error::from)
             .and_then(|file| self.repoint(&output, &file, &moved));
         if let Err(err) = repointed {
+            // The cleaned segments stay in use, so they are listed again.
+            let kept: Vec<u64> = self.segments().iter().map(|s| s.base).collect();
+            if let Err(unlisted) = manifest::write(&self.fs, &self.dir, &kept) {
+                self.poison(unlisted);
+            }
             let _ = remove_if_present(&self.fs, &hint_path);
             self.count_dead(writing);
             return Err(err);

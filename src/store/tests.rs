@@ -1319,7 +1319,7 @@ fn segments_that_overlap_are_refused() {
     ));
 }
 
-fn assert_segment_missing(opened: Result<Store, Error>, base: u64) {
+fn assert_segment_missing<F: Fs>(opened: Result<Store<F>, Error>, base: u64) {
     let err = opened.err().expect("open fails");
     assert!(
         matches!(
@@ -2962,6 +2962,52 @@ fn a_compaction_whose_hint_counts_other_copies_moves_no_key() {
 }
 
 #[test]
+fn a_compaction_whose_hint_fails_lists_the_segments_it_keeps() {
+    let fs = MemFs::new();
+    let dir = Path::new("/db");
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    fs.fail_one_sync_after(3);
+    store.compact().unwrap_err();
+    assert_eq!(manifest::read(&fs, dir).unwrap(), Some(vec![0, 21, 42, 63]));
+    store.set(key(b"d"), value(b"1")).unwrap();
+    drop(store);
+
+    fs.remove(&dir.join(log_name(21))).unwrap();
+    assert_segment_missing(Store::open_in(fs.clone(), dir, segmented(1)), 21);
+}
+
+#[test]
+fn a_compaction_that_cannot_list_the_segments_it_keeps_poisons_the_store() {
+    let fs = MemFs::new();
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        store.set(key(k), value(b"1")).unwrap();
+    }
+    // The copy's header, the copy and the manifest; then the hint's and
+    // the manifest's again fail.
+    fs.fail_syncs_after(3);
+    store.compact().unwrap_err();
+    fs.fail_syncs(false);
+    assert!(matches!(
+        store.set(key(b"d"), value(b"1")),
+        Err(Error::Poisoned)
+    ));
+    drop(store);
+
+    let store = open_on(&fs, segmented(1));
+    for k in [b"a", b"b", b"c"] {
+        assert_eq!(get_on(&store, k).as_deref(), Some(&b"1"[..]));
+    }
+    assert_eq!(
+        manifest::read(&fs, Path::new("/db")).unwrap(),
+        Some(vec![0, 21, 42, 63])
+    );
+}
+
+#[test]
 fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
     let fs = MemFs::new();
     let store = open_on(&fs, segmented(1));
@@ -2969,7 +3015,7 @@ fn a_compaction_whose_hint_fsync_fails_keeps_both_and_stays_writable() {
         store.set(key(k), value(b"1")).unwrap();
     }
     // The copy's header, the copy and the manifest; then its hint's fails.
-    fs.fail_syncs_after(3);
+    fs.fail_one_sync_after(3);
     let err = store.compact().unwrap_err();
     fs.fail_syncs(false);
     assert!(matches!(err, Error::Io(_)), "{err:?}");
