@@ -15,10 +15,13 @@
 //! lands what does and fails with `StorageFull`, as a full disk does, and
 //! truncating a file frees what it cut. `fail_truncates` makes every
 //! truncate fail, changing nothing, and `fail_dir_syncs_after(n)` every
-//! directory sync after the next `n`. `fail_syncs` makes every file sync
-//! fail the way Linux does: the pending changes never reach the disk, even
-//! after a later sync, while reads still see them; `fail_syncs_after(n)`
-//! does so after the next `n`, and `fail_one_sync_after(n)` fails only
+//! directory sync after the next `n`. `skip_dir_syncs` makes every
+//! directory sync return `Ok` and make nothing durable, as Linux may on a
+//! new descriptor after an earlier sync of the directory failed.
+//! `fail_syncs` makes every file sync fail the way Linux does: the pending
+//! changes never reach the disk, even after a later sync, while reads
+//! still see them; `fail_syncs_after(n)` does so after the next `n`, and
+//! `fail_one_sync_after(n)` fails only
 //! the one after the next `n`. `fail_removes_after(n)` makes every remove
 //! after the next `n` fail, changing nothing. `tamper` changes what a
 //! write to one path lands, as a bad disk would. `dir_syncs` counts the
@@ -324,6 +327,7 @@ struct State {
     fail_one_sync: bool,
     /// Directory syncs that succeed before every later one fails.
     dir_syncs_left: Option<usize>,
+    skip_dir_syncs: bool,
     dir_syncs: u64,
     fail_truncates: bool,
     /// Removes that go ahead before every later one fails.
@@ -361,6 +365,7 @@ impl MemFs {
             syncs_left: None,
             fail_one_sync: false,
             dir_syncs_left: None,
+            skip_dir_syncs: false,
             dir_syncs: 0,
             fail_truncates: false,
             removes_left: None,
@@ -454,6 +459,10 @@ impl MemFs {
 
     pub(crate) fn fail_dir_syncs_after(&self, n: usize) {
         self.0.borrow_mut().dir_syncs_left = Some(n);
+    }
+
+    pub(crate) fn skip_dir_syncs(&self, skip: bool) {
+        self.0.borrow_mut().skip_dir_syncs = skip;
     }
 
     pub(crate) fn fail_truncates(&self, fail: bool) {
@@ -617,6 +626,9 @@ impl Fs for MemFs {
             None => {}
         }
         state.disk.has_dir(path)?;
+        if state.skip_dir_syncs {
+            return Ok(());
+        }
         state.dir_syncs += 1;
         let disk = &mut state.disk;
         let in_dir = |p: &Path| p.parent() == Some(path);

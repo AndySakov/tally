@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{Store, Writing, hold, segment_of};
+use super::{Inner, Writing, hold, holding};
 use crate::fs::{Fs, LogFile};
 use crate::index::{Entry, Index};
 use crate::manifest;
@@ -59,7 +59,7 @@ const GROUP_MOST_BYTES: usize = 4 << 20;
 /// before it had the results, the store is poisoned and every write in the
 /// group fails with `Poisoned`.
 struct Leader<'a, F: Fs> {
-    store: &'a Store<F>,
+    store: &'a Inner<F>,
     tickets: Vec<u64>,
     results: Option<Vec<Result<(), Error>>>,
 }
@@ -134,13 +134,12 @@ fn takes_effect<'w>(index: &Index, op: &'w Op, live: &mut HashMap<&'w [u8], bool
     true
 }
 
-impl<F: Fs> Store<F> {
-    /// Starts a new, empty segment at the end of the log, and makes its
-    /// name durable, then the manifest listing it, before anything is
-    /// written to it.
-    fn roll(&self, writing: &Writing) -> Result<(), Error> {
+impl<F: Fs> Inner<F> {
+    /// Starts a new, empty segment at `base`, at or past the end of the
+    /// log, and makes its name durable, then the manifest listing it,
+    /// before anything is written to it.
+    pub(super) fn roll(&self, writing: &Writing, base: u64) -> Result<(), Error> {
         let segments = self.segments();
-        let base = segments.last().expect("there is always a segment").end();
         let segment = create(&self.fs, &self.dir.join(log_name(base)), base)?;
         let mut next = segments.to_vec();
         next.push(Arc::new(segment));
@@ -163,13 +162,19 @@ impl<F: Fs> Store<F> {
     /// returns where each landed. One record is written on its own, and
     /// more inside a Batch record, so a crash keeps all of them or none;
     /// the Batch header counts as dead. Starts a new segment first if the
-    /// active one is full, so an append never spans two. A failed write or
+    /// active one is full, so an append never spans two, or past the
+    /// offsets a running compaction reserved if the active one ends where
+    /// they start. A failed write or
     /// fsync is truncated away and the truncation fsynced. A failed fsync
     /// poisons the store, and so does a failed truncation.
     pub(super) fn append(&self, writing: &Writing, ops: &[&Op]) -> Result<Vec<u64>, Error> {
-        let full = self.active().len();
-        if full > 0 && full >= self.segment_bytes {
-            self.roll(writing)?;
+        let active = self.active();
+        match *writing.reserved {
+            Some(reserved) if active.end() == reserved.base => self.roll(writing, reserved.end)?,
+            _ if active.len() > 0 && active.len() >= self.segment_bytes => {
+                self.roll(writing, active.end())?
+            }
+            _ => {}
         }
         let active = self.active();
         let start = active.end();
@@ -215,39 +220,18 @@ impl<F: Fs> Store<F> {
         Ok(offsets)
     }
 
-    /// Appends a Set record, fsyncs, then points the index at it. Then
-    /// compacts if automatic compaction is due, as `open_with` describes.
-    ///
-    /// Writes from several threads share an fsync (DESIGN.md, Group
-    /// commit): a write waits for the group it lands in, and a failure
-    /// fails every write in that group with the same error. A write that
-    /// fails partway is truncated away. A failed fsync, or a failed truncate
-    /// of a failed write, poisons the store: every later write fails with
-    /// `Poisoned` until it is reopened, and reads still work.
-    pub fn set(&self, key: Key, value: Value) -> Result<(), Error> {
+    pub(crate) fn set(&self, key: Key, value: Value) -> Result<(), Error> {
         self.submit(Write::One(Op::Set { key, value }))
     }
 
-    /// Applies every operation in `batch` with one append and one fsync,
-    /// all or nothing: after a crash, `open` finds the whole batch or none
-    /// of it (DESIGN.md, Batches). Operations apply in order, so a delete
-    /// sees the batch's own earlier sets. A delete of a key that isn't live
-    /// at that point writes nothing, as `delete` does, and a batch that
-    /// writes nothing is a no-op. Then compacts if due, as `set` does.
-    /// Failed writes are handled as in `set`.
-    pub fn write(&self, batch: Batch) -> Result<(), Error> {
+    pub(crate) fn write(&self, batch: Batch) -> Result<(), Error> {
         if batch.is_empty() {
             return Ok(());
         }
         self.submit(Write::Batch(batch.ops))
     }
 
-    /// Appends a Delete record, fsyncs, then removes the key from the index.
-    /// Then compacts if automatic compaction is due, as in `set`.
-    ///
-    /// Deleting a key that isn't live is a no-op: nothing is written and it
-    /// returns `Ok`. Failed writes are handled as in `set`.
-    pub fn delete(&self, key: Key) -> Result<(), Error> {
+    pub(crate) fn delete(&self, key: Key) -> Result<(), Error> {
         if !self.index.contains(key.as_bytes()) {
             return Ok(());
         }
@@ -325,16 +309,20 @@ impl<F: Fs> Store<F> {
         out.expect("commit_then hands the results over")
     }
 
-    /// Writes `writes` as one group, hands `done` each one's result in
-    /// order, then compacts if the group wrote something and that is due.
-    /// The results go out first: the writes are durable, and neither a slow
-    /// nor a failed compaction changes that.
+    /// Writes `writes` as one group, after waiting for compaction if it has
+    /// fallen behind, and hands `done` each one's result in order. Then, if
+    /// the group wrote something, wakes the compaction thread if that is
+    /// due, or without one compacts here. The results go out first: the
+    /// writes are durable, and neither a slow nor a failed compaction
+    /// changes that.
     fn commit_then(&self, writes: &[Write], done: impl FnOnce(Vec<Result<(), Error>>)) {
+        self.throttle();
         let writing = self.writer();
         let (results, wrote) = self.write_group(&writing, writes);
+        drop(writing);
         done(results);
         if wrote {
-            let _ = self.compact_if_due(&writing);
+            self.after_group();
         }
     }
 
@@ -368,7 +356,7 @@ impl<F: Fs> Store<F> {
     /// durable at `offset`. A Delete's key must be live. Only the writer
     /// calls it.
     fn indexed(&self, segments: &[Arc<Segment<F::File>>], op: &Op, offset: u64) {
-        let died = |at: u64, len: u64| segments[segment_of(segments, at)].add_dead(len);
+        let died = |at: u64, len: u64| self.died(segments, at, len);
         let key = op.key().as_bytes();
         match op {
             Op::Set { .. } => {
@@ -380,6 +368,21 @@ impl<F: Fs> Store<F> {
                 let old = self.index.remove(key).expect("deleted keys are live");
                 died(old.offset, old.record_len());
                 died(offset, op.fields().record_len());
+            }
+        }
+    }
+
+    /// Adds `len` dead bytes to the segment holding `at`. A compaction
+    /// running alongside may have pointed the record's key at a copy in a
+    /// segment newer than `segments`; and if no list holds it, a compaction
+    /// has removed its segment since, and its dead bytes no longer count.
+    fn died(&self, segments: &[Arc<Segment<F::File>>], at: u64, len: u64) {
+        match holding(segments, at) {
+            Some(segment) => segment.add_dead(len),
+            None => {
+                if let Some(segment) = holding(&self.segments(), at) {
+                    segment.add_dead(len);
+                }
             }
         }
     }

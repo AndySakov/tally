@@ -112,8 +112,8 @@ fn set(c: &mut Criterion) {
         })
     });
 
-    // Overwrites keep half the log dead, so the default trigger compacts
-    // every 1,000 writes and its pauses land in the measurement.
+    // Overwrites keep the log at the default trigger, so the store's
+    // thread compacts every few hundred writes while they go on.
     const KEYS: u64 = 1000;
     let churn = tempfile::tempdir().unwrap();
     let store = Store::open(churn.path()).unwrap();
@@ -129,6 +129,8 @@ fn set(c: &mut Criterion) {
         )
     });
     group.finish();
+    // Lets a running compaction finish, so its copies don't count twice.
+    drop(store);
     let log_len: u64 = fs::read_dir(churn.path())
         .unwrap()
         .map(Result::unwrap)

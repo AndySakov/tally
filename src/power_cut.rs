@@ -9,6 +9,7 @@
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::fs::{Fs, LogFile};
@@ -16,7 +17,7 @@ use crate::mem_fs::{Cut, Disk, MemFs};
 use crate::model::{self, Op, State};
 use crate::record::{Place, Record, encode};
 use crate::segment::{FILE_HEADER_LEN, hint_name, log_name, segment_file};
-use crate::store::LOG_FILE_NAME;
+use crate::store::{LOG_FILE_NAME, Phase};
 use crate::{AutoCompact, Key, Options, Repaired, SideFile, Store, Value};
 
 const DIR: &str = "/db";
@@ -70,6 +71,20 @@ fn workload() -> Vec<Op> {
     ]
 }
 
+/// Writes made at each phase of a compaction, as writes land while the
+/// store's thread compacts: past the offsets reserved for its copies,
+/// before the index points at them, and before the old segments go.
+fn during_compaction() -> Vec<(Phase, Vec<model::Change>)> {
+    vec![
+        (
+            Phase::Reserved,
+            vec![(2, Some(b"two during".to_vec())), (5, Some(b"5".to_vec()))],
+        ),
+        (Phase::Copied, vec![(1, None), (0, Some(b"0".to_vec()))]),
+        (Phase::Repointed, vec![(3, Some(b"three".to_vec()))]),
+    ]
+}
+
 fn key(k: u8) -> Key {
     model::key(0, k)
 }
@@ -85,11 +100,18 @@ fn read_state(store: &Store<MemFs>) -> State {
         .collect()
 }
 
-/// Runs `ops` with power cut before `step`. Returns the disk at the cut and
-/// the states it may hold: every operation finished before the cut, with
-/// the one in progress either applied or not, a group as a whole. One past
-/// the last step is a cut after the workload finished. `None` beyond that.
-fn cut_workload(ops: &[Op], options: Options, step: u64) -> Option<(Disk, Vec<State>)> {
+/// Runs `ops`, then, if `during` is not empty, a compaction that makes its
+/// writes at their phases, with power cut before `step`. Returns the disk at
+/// the cut and the states it may hold: every operation finished before the
+/// cut, with the one in progress either applied or not, a group as a whole.
+/// One past the last step is a cut after the workload finished. `None`
+/// beyond that.
+fn cut_workload(
+    ops: &[Op],
+    during: &[(Phase, Vec<model::Change>)],
+    options: Options,
+    step: u64,
+) -> Option<(Disk, Vec<State>)> {
     let fs = MemFs::new();
     fs.cut_before(step);
     let dir = Path::new(DIR);
@@ -108,6 +130,35 @@ fn cut_workload(ops: &[Op], options: Options, step: u64) -> Option<(Disk, Vec<St
             store = Store::open_in(fs.clone(), dir, options).unwrap();
         } else {
             model::run(&store, 0, &mut state, op);
+        }
+        states.push(state.clone());
+        ends.push(fs.steps());
+    }
+    if !during.is_empty() {
+        // Each write during the compaction is an operation of its own; the
+        // compaction around them changes no key.
+        let phases = during.len();
+        let writes = during.to_vec();
+        let during = Arc::new(Mutex::new((state.clone(), Vec::new())));
+        {
+            let during = Arc::clone(&during);
+            store.on_phase(move |inner, phase| {
+                let Some((_, changes)) = writes.iter().find(|(at, _)| *at == phase) else {
+                    return;
+                };
+                let mut during = during.lock().unwrap();
+                let (state, done) = &mut *during;
+                model::run(inner, 0, state, &Op::Batch(changes.clone()));
+                done.push((state.clone(), inner.fs().steps()));
+            });
+        }
+        model::run(&store, 0, &mut state, &Op::Compact);
+        let (after, done) = during.lock().unwrap().clone();
+        state = after;
+        assert_eq!(done.len(), phases, "a write at every phase");
+        for (during, end) in done {
+            states.push(during);
+            ends.push(end);
         }
         states.push(state.clone());
         ends.push(fs.steps());
@@ -205,7 +256,8 @@ fn no_acknowledged_write_is_lost_to_a_power_cut_at_any_step() {
             scope.spawn(|| {
                 loop {
                     let step = next.fetch_add(1, Ordering::Relaxed);
-                    let Some((snapshot, candidates)) = cut_workload(&workload(), options(), step)
+                    let Some((snapshot, candidates)) =
+                        cut_workload(&workload(), &during_compaction(), options(), step)
                     else {
                         break;
                     };
@@ -327,7 +379,9 @@ fn random_workloads_lose_no_acknowledged_write_to_a_power_cut() {
                             segment_bytes,
                         };
                         let mut step = 1;
-                        while let Some((snapshot, candidates)) = cut_workload(&ops, options, step) {
+                        while let Some((snapshot, candidates)) =
+                            cut_workload(&ops, &[], options, step)
+                        {
                             for cut in snapshot.cuts() {
                                 let context = format!(
                                     "TALLY_POWER_CUT_SEED={seed} TALLY_POWER_CUT_SEEDS=1, \
